@@ -1,11 +1,12 @@
 // ==UserScript==
-// @name         BB 一键下载所有课件
+// @name         BB 一键下载所有课件 (ZIP版)
 // @namespace    http://tampermonkey.net/
-// @version      2.1
-// @description  在 Blackboard 课程内容页一键批量下载课件。需先进入某个课程的文件目录（URL 含 listContent.jsp）才会出现下载按钮。
-// @author       JesperroO
+// @version      1.0
+// @description  在 Blackboard 课程内容页一键批量下载课件，打包为 ZIP 保留文件夹结构。需先进入某个课程的文件目录（URL 含 listContent.jsp）才会出现下载按钮。（基于 JesperroO 原版修改，使用 ZIP 打包保留文件夹结构）
+// @author       berserkross (modified by AI)
 // @match        https://*/webapps/blackboard/content/listContent.jsp*
 // @grant        none
+// @require      https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js
 // ==/UserScript==
 
 (function() {
@@ -54,7 +55,7 @@
         btn.textContent = '🔍 扫描中...';
 
         const baseUrl = window.location.origin;
-        const filesByUrl = new Map(); // url -> { url, displayName, folderPath }，自动去重
+        const filesByUrl = new Map(); // url -> { url, displayName, folderPath }
         const visited = new Set();
         let folderCount = 0;
 
@@ -73,7 +74,7 @@
             const html = await response.text();
             const doc = new DOMParser().parseFromString(html, 'text/html');
 
-            // 提取文件链接及 BB 显示名，以 URL 为 key 去重（保留先发现的路径）
+            // 提取文件链接及 BB 显示名，以 URL 为 key 去重
             doc.querySelectorAll('a[href*="/bbcswebdav/"]').forEach(a => {
                 const href = a.getAttribute('href');
                 if (filesByUrl.has(href)) return;
@@ -107,22 +108,25 @@
         }
 
         await fetchFolder(contentId, '');
-        const fileMap = [...filesByUrl.values()];
+        const fileList = [...filesByUrl.values()];
 
-        if (fileMap.length === 0) {
+        if (fileList.length === 0) {
             alert('未找到任何文件');
             btn.textContent = '📥 一键下载';
             btn.disabled = false;
             return;
         }
 
-        btn.textContent = `📥 下载 0/${fileMap.length}`;
+        // ---------- 打包 ZIP ----------
+        btn.textContent = `📦 打包中 0/${fileList.length}`;
+        const zip = new JSZip();
 
-        // 从 Content-Disposition 或最终 URL 解析真实文件名
+        // 工具函数：安全解码
         function safeDecode(s) {
             try { return decodeURIComponent(s); } catch (e) { return s; }
         }
 
+        // 从 Content-Disposition 或最终 URL 解析真实文件名
         function resolveFilename(item, response) {
             const disposition = response.headers.get('Content-Disposition');
             if (disposition) {
@@ -138,71 +142,100 @@
             return item.displayName;
         }
 
+        // 清理文件名（保留字母数字、汉字、下划线、点、横线，其余替换为下划线）
         function sanitize(name) {
-            return name.replace(/[/\\:*?"<>|]/g, '_').trim();
+            // 替换 Windows 非法字符（不包括斜杠）
+            return name.replace(/[:*?"<>|]/g, '_').trim();
         }
 
-        // 并行下载，最多 3 个同时进行
-        let done = 0, failed = 0;
+        // 清理文件夹名（同样规则，但保留斜杠？这里不保留，因为我们会逐层处理）
+        function sanitizeFolder(name) {
+            return name.replace(/[:*?"<>|]/g, '_').trim();
+        }
 
-        async function attemptDownload(item) {
+        // 构建 ZIP 内路径
+        function buildZipPath(item, fileName) {
+            const parts = [];
+            if (item.folderPath) {
+                // 分割文件夹路径，每层清理
+                const folders = item.folderPath.split('/').filter(Boolean);
+                for (const f of folders) {
+                    parts.push(sanitizeFolder(f));
+                }
+            }
+            parts.push(sanitize(fileName));
+            return parts.join('/');
+        }
+
+        // 下载单个文件并加入 ZIP
+        async function downloadAndAddToZip(item) {
             const fileUrl = `${baseUrl}${item.url}`;
             const response = await fetch(fileUrl, { credentials: 'include' });
             const serverName = resolveFilename(item, response);
-            const prefix = item.folderPath ? sanitize(item.folderPath).replace(/\//g, ' - ') + ' - ' : '';
-            const filename = prefix + sanitize(serverName);
             const blob = await response.blob();
-            const url = window.URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = filename;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            window.URL.revokeObjectURL(url);
+            const zipPath = buildZipPath(item, serverName);
+            zip.file(zipPath, blob);
         }
 
-        async function downloadOne(item) {
+        // 带重试的下载（最多重试一次）
+        async function safeDownload(item) {
             try {
-                await attemptDownload(item);
-                done++;
+                await downloadAndAddToZip(item);
             } catch (e) {
-                // 失败后重试一次
+                // 重试一次
                 try {
                     await new Promise(r => setTimeout(r, 1000));
-                    await attemptDownload(item);
-                    done++;
+                    await downloadAndAddToZip(item);
                 } catch (e2) {
                     console.error(`Failed: ${item.url}`, e2);
-                    failed++;
+                    throw e2; // 向上抛出以便统计失败次数
                 }
             }
-            btn.textContent = `📥 下载中 ${done + failed}/${fileMap.length}`;
         }
 
+        // 并发执行下载（最多 3 个同时）
+        let done = 0, failed = 0;
         async function runConcurrent(tasks, concurrency) {
             const queue = [...tasks];
             const workers = Array(concurrency).fill(null).map(async () => {
                 while (queue.length) {
                     const task = queue.shift();
-                    await task();
-                    // 小延迟避免浏览器拦截连续下载
-                    await new Promise(r => setTimeout(r, 300));
+                    try {
+                        await task();
+                        done++;
+                    } catch {
+                        failed++;
+                    }
+                    btn.textContent = `📦 打包中 ${done + failed}/${fileList.length}`;
+                    // 小延迟避免请求过快
+                    await new Promise(r => setTimeout(r, 200));
                 }
             });
             await Promise.all(workers);
         }
 
-        const tasks = fileMap.map(item => () => downloadOne(item));
-        await runConcurrent(tasks, 3);
+        const downloadTasks = fileList.map(item => () => safeDownload(item));
+        await runConcurrent(downloadTasks, 3);
+
+        btn.textContent = '📦 生成 ZIP...';
+        // 生成 ZIP 并下载
+        const zipBlob = await zip.generateAsync({ type: 'blob' });
+        const downloadLink = document.createElement('a');
+        downloadLink.href = URL.createObjectURL(zipBlob);
+        downloadLink.download = 'course_files.zip';
+        document.body.appendChild(downloadLink);
+        downloadLink.click();
+        document.body.removeChild(downloadLink);
+        URL.revokeObjectURL(downloadLink.href);
 
         btn.textContent = '✅ 完成!';
         setTimeout(() => {
             btn.textContent = '📥 一键下载';
             btn.disabled = false;
-        }, 3000);
+        }, 5000);
 
-        alert(`下载完成！\n成功: ${done}\n失败: ${failed}`);
+        const summary = `下载完成！\n成功: ${done}\n失败: ${failed}\nZIP 文件已下载。`;
+        alert(summary);
     };
 
     document.body.appendChild(btn);
