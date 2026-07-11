@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         BB 一键下载所有课件 (ZIP版)
-// @namespace    http://tampermonkey.net/
+// @namespace    https://github.com/berserkross/bb-bulk-course-downloader
 // @version      1.0
 // @description  在 Blackboard 课程内容页一键批量下载课件，打包为 ZIP 保留文件夹结构。需先进入某个课程的文件目录（URL 含 listContent.jsp）才会出现下载按钮。（基于 JesperroO 原版修改，使用 ZIP 打包保留文件夹结构）
 // @author       berserkross (modified by AI)
