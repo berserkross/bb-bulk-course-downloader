@@ -171,6 +171,10 @@ export function createFsSink({ settings = {}, dirHandle, signal, total = 0, file
   async function download(entries, fetcher, { onProgress, onFileEvent } = {}) {
     const list = Array.from(entries || []);
     const plans = planBatch(list, { preserveTree, files });
+    // 计划数是「到底有没有活干」的第一现场：提交 132 个却计划 0 个，是数据/接线问题，不是下载问题。
+    if (plans.length !== list.length) {
+      console.warn('[bbdl] 计划数与提交数不一致', { entries: list.length, plans: plans.length, concurrency });
+    }
     const totalCount = total || list.length;
     const ok = [];
     const failed = [];
@@ -262,6 +266,13 @@ export function createFsSink({ settings = {}, dirHandle, signal, total = 0, file
     const pending = halted ? listPending(list, ok, failed) : [];
     if (halted) emitFile({ type: 'halt', entryId: '', path: '', name: '', reason: halted, pending: pending.length });
     emit('done', '', '', true);
+    // 提交了文件却一条记录都没产生：这属于落盘层的自相矛盾，宁可报错也不要当成「完成」交上去。
+    // 只有 list 为空时才是合法的空批次（续跑/空选择会走到这里）。
+    if (list.length && !ok.length && !failed.length && !halted && !aborted) {
+      throw new Error(
+        '落盘层没有处理任何文件：提交 ' + list.length + ' 个、计划 ' + plans.length + ' 个、并发 ' + concurrency + '。'
+      );
+    }
     return withHalted(
       { ok, failed, aborted },
       halted ? { reason: halted, pending, pendingCount: pending.length } : null

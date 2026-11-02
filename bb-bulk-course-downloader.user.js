@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BB 课件批量下载
 // @namespace    bb-bulk-course-downloader
-// @version      2.5.0
+// @version      2.5.1
 // @description  扫描 Blackboard 课程内容，勾选后按原始目录结构批量下载课件
 // @updateURL    https://raw.githubusercontent.com/berserkross/bb-bulk-course-downloader/main/bb-bulk-course-downloader.user.js
 // @downloadURL  https://raw.githubusercontent.com/berserkross/bb-bulk-course-downloader/main/bb-bulk-course-downloader.user.js
@@ -1687,6 +1687,9 @@
     async function download(entries, fetcher, { onProgress, onFileEvent } = {}) {
       const list = Array.from(entries || []);
       const plans = planBatch(list, { preserveTree, files: files3 });
+      if (plans.length !== list.length) {
+        console.warn("[bbdl] \u8BA1\u5212\u6570\u4E0E\u63D0\u4EA4\u6570\u4E0D\u4E00\u81F4", { entries: list.length, plans: plans.length, concurrency });
+      }
       const totalCount = total || list.length;
       const ok = [];
       const failed = [];
@@ -1764,6 +1767,11 @@
       const pending = halted ? listPending(list, ok, failed) : [];
       if (halted) emitFile({ type: "halt", entryId: "", path: "", name: "", reason: halted, pending: pending.length });
       emit("done", "", "", true);
+      if (list.length && !ok.length && !failed.length && !halted && !aborted) {
+        throw new Error(
+          "\u843D\u76D8\u5C42\u6CA1\u6709\u5904\u7406\u4EFB\u4F55\u6587\u4EF6\uFF1A\u63D0\u4EA4 " + list.length + " \u4E2A\u3001\u8BA1\u5212 " + plans.length + " \u4E2A\u3001\u5E76\u53D1 " + concurrency + "\u3002"
+        );
+      }
       return withHalted(
         { ok, failed, aborted },
         halted ? { reason: halted, pending, pendingCount: pending.length } : null
