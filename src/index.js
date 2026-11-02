@@ -715,6 +715,14 @@ export function createController(config) {
     if (opts.seedFiles !== false && typeof panel.setFiles === 'function') panel.setFiles(entries);
     // 每批次各一条：只打结构化对象，绝不打 URL（用户靠控制台 [bbdl] 前缀自查）。
     console.info('[bbdl] 开始下载', { sink: sink.kind, entries: entries.length });
+    // 诊断（v2.5.3）：信号在批次开头就已经 aborted 的话，池子会一个 worker 都不启动
+    console.info('[bbdl] 批次开始', {
+      sink: sink.kind,
+      entries: entries.length,
+      dirHandle: Boolean(dirHandle),
+      signalAborted: Boolean(signal && signal.aborted),
+      downloadConcurrency: settings && settings.downloadConcurrency
+    });
     const result = await sink.download(entries, fetcher, {
       onProgress,
       // 原样转发：事件字段由 panel 解释，这里既不裁剪也不改形状。

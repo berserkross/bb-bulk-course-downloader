@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BB 课件批量下载
 // @namespace    bb-bulk-course-downloader
-// @version      2.5.2
+// @version      2.5.3
 // @description  扫描 Blackboard 课程内容，勾选后按原始目录结构批量下载课件
 // @updateURL    https://raw.githubusercontent.com/berserkross/bb-bulk-course-downloader/main/bb-bulk-course-downloader.user.js
 // @downloadURL  https://raw.githubusercontent.com/berserkross/bb-bulk-course-downloader/main/bb-bulk-course-downloader.user.js
@@ -1430,9 +1430,21 @@
   }
   async function runPool(items, concurrency, worker, { signal, control } = {}) {
     const jobs = Array.from(items || []);
+    console.info("[bbdl] pool \u5165\u53E3", {
+      itemsType: typeof items,
+      itemsLen: items && typeof items.length === "number" ? items.length : -1,
+      isArray: Array.isArray(items),
+      jobsLen: jobs.length,
+      concurrency,
+      concurrencyType: typeof concurrency,
+      workerType: typeof worker,
+      controlStopped: Boolean(control && control.stopped),
+      signalAborted: Boolean(signal && signal.aborted)
+    });
     if (!jobs.length) return;
     const width = Math.min(Math.max(1, Math.floor(concurrency) || 1), jobs.length);
     let cursor = 0;
+    console.info("[bbdl] pool \u8D77\u70B9", { width, jobsLen: jobs.length });
     const stopped = () => Boolean(control && control.stopped) || Boolean(signal && signal.aborted);
     async function drain() {
       while (cursor < jobs.length) {
@@ -1443,6 +1455,7 @@
       }
     }
     await Promise.all(Array.from({ length: width }, drain));
+    console.info("[bbdl] pool \u7ED3\u675F", { jobsLen: jobs.length, cursor, width });
   }
 
   // src/sinks/fs.js
@@ -6126,6 +6139,13 @@
       const fetcher = createFetcher2({ signal });
       if (opts.seedFiles !== false && typeof panel.setFiles === "function") panel.setFiles(entries);
       console.info("[bbdl] \u5F00\u59CB\u4E0B\u8F7D", { sink: sink.kind, entries: entries.length });
+      console.info("[bbdl] \u6279\u6B21\u5F00\u59CB", {
+        sink: sink.kind,
+        entries: entries.length,
+        dirHandle: Boolean(dirHandle),
+        signalAborted: Boolean(signal && signal.aborted),
+        downloadConcurrency: settings && settings.downloadConcurrency
+      });
       const result = await sink.download(entries, fetcher, {
         onProgress,
         // 原样转发：事件字段由 panel 解释，这里既不裁剪也不改形状。

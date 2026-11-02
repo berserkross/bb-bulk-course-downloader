@@ -21,9 +21,22 @@ export function createControl() {
 
 export async function runPool(items, concurrency, worker, { signal, control } = {}) {
   const jobs = Array.from(items || []);
+  // 诊断（v2.5.3）：池子收到的东西必须能自证 —— 计划数、实际 job 数、宽度、闸门状态各是两个不同的量
+  console.info('[bbdl] pool 入口', {
+    itemsType: typeof items,
+    itemsLen: items && typeof items.length === 'number' ? items.length : -1,
+    isArray: Array.isArray(items),
+    jobsLen: jobs.length,
+    concurrency,
+    concurrencyType: typeof concurrency,
+    workerType: typeof worker,
+    controlStopped: Boolean(control && control.stopped),
+    signalAborted: Boolean(signal && signal.aborted)
+  });
   if (!jobs.length) return;
   const width = Math.min(Math.max(1, Math.floor(concurrency) || 1), jobs.length);
   let cursor = 0;
+  console.info('[bbdl] pool 起点', { width, jobsLen: jobs.length });
 
   // 停机判定只发生在「取下一个 job」之前：取号与启动之间没有 await，
   // 所以 stopped 一旦置真，不可能再有一个新 job 溜进来。
@@ -39,4 +52,5 @@ export async function runPool(items, concurrency, worker, { signal, control } = 
   }
 
   await Promise.all(Array.from({ length: width }, drain));
+  console.info('[bbdl] pool 结束', { jobsLen: jobs.length, cursor, width });
 }

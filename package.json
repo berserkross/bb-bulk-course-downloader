@@ -1,6 +1,6 @@
 {
   "name": "bb-bulk-course-downloader",
-  "version": "2.5.2",
+  "version": "2.5.3",
   "private": true,
   "type": "module",
   "description": "Tampermonkey userscript: scan a Blackboard Learn course, select files, download preserving folder tree",

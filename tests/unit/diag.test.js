@@ -120,11 +120,12 @@ test('批次诊断：每次下载各一条「开始下载」「批次结束」�
     const h = harness();
     await download(h);
 
-    assert.equal(cap.logs.info.length, 2, '每批次至多一条开始 + 一条结束');
+    assert.equal(cap.logs.info.length, 3, '每批次一条开始 + 一条批次开始 + 一条结束');
     assert.equal(cap.logs.info[0][0], '[bbdl] 开始下载');
     assert.deepEqual(cap.logs.info[0][1], { sink: 'zip', entries: 2 });
-    assert.equal(cap.logs.info[1][0], '[bbdl] 批次结束');
-    assert.deepEqual(cap.logs.info[1][1], { sink: 'zip', ok: 2, failed: 0, aborted: false, halted: false });
+    assert.equal(cap.logs.info[1][0], '[bbdl] 批次开始');
+    assert.equal(cap.logs.info[2][0], '[bbdl] 批次结束');
+    assert.deepEqual(cap.logs.info[2][1], { sink: 'zip', ok: 2, failed: 0, aborted: false, halted: false });
 
     const all = JSON.stringify(cap.logs.info);
     assert.equal(all.includes('http'), false, '诊断日志里不许出现 URL');
@@ -207,7 +208,9 @@ test('零工作量不误伤停机：halted 时不进错误分支', async () => {
     assert.deepEqual(h.panel.texts('fail'), []);
     assert.equal(h.panel.texts('showSummary').length, 1);
     assert.equal(cap.logs.error.length, 0);
-    assert.deepEqual(cap.logs.info[1][1], { sink: 'zip', ok: 0, failed: 0, aborted: false, halted: true });
+    // 批次结束那条按含 halted 字段认领（v2.5.3 起批次开头多了一条 [bbdl] 批次开始）
+    const ended = cap.logs.info.map((call) => call[1]).find((o) => o && Object.prototype.hasOwnProperty.call(o, 'halted'));
+    assert.deepEqual(ended, { sink: 'zip', ok: 0, failed: 0, aborted: false, halted: true });
   } finally {
     cap.restore();
   }
