@@ -618,7 +618,11 @@ export function createController(config) {
       }
     }
 
-    await Promise.all(Array.from({ length: width }, worker));
+    // 显式循环起 worker：宿主页面的 Array.from 可能是 Prototype 的 $A（忽略 mapFn 回调），
+    // 用它建 worker 数组会让整个探测静默空跑 —— 「获取体积」永远未知就是这么来的。
+    const workers = [];
+    for (let i = 0; i < width; i += 1) workers.push(worker());
+    await Promise.all(workers);
     // 整批一条 warn：有失败才打，绝不逐文件刷屏。
     if (report.fail > 0) console.warn('[bbdl] 体积探测失败', { fail: report.fail, reason: report.firstError });
     return report;

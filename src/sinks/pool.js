@@ -19,8 +19,20 @@ export function createControl() {
   return control;
 }
 
+/**
+ * 别用 Array.from(x, mapFn)：Blackboard 的 Original 版式页面会加载 Prototype.js，
+ * 它用 $A 覆盖了 Array.from 且**忽略第二个参数** —— mapFn 永不执行，池子静默空跑。
+ * v2.5.4 修的就是这条：真实课程页 plans=5 / cursor=0 / workers=0，体积探测永远未知。
+ */
+function toList(items) {
+  if (!items) return [];
+  const out = [];
+  for (let i = 0; i < items.length; i += 1) out.push(items[i]);
+  return out;
+}
+
 export async function runPool(items, concurrency, worker, { signal, control } = {}) {
-  const jobs = Array.from(items || []);
+  const jobs = toList(items);
   // 诊断（v2.5.3）：池子收到的东西必须能自证 —— 计划数、实际 job 数、宽度、闸门状态各是两个不同的量
   console.info('[bbdl] pool 入口', {
     itemsType: typeof items,
@@ -51,6 +63,9 @@ export async function runPool(items, concurrency, worker, { signal, control } = 
     }
   }
 
-  await Promise.all(Array.from({ length: width }, drain));
+  // worker 数组用显式循环：Array.from 在宿主页面里可能已不是原生实现（见上）
+  const workers = [];
+  for (let i = 0; i < width; i += 1) workers.push(drain());
+  await Promise.all(workers);
   console.info('[bbdl] pool 结束', { jobsLen: jobs.length, cursor, width });
 }

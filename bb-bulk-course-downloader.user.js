@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BB 课件批量下载
 // @namespace    bb-bulk-course-downloader
-// @version      2.5.3
+// @version      2.5.4
 // @description  扫描 Blackboard 课程内容，勾选后按原始目录结构批量下载课件
 // @updateURL    https://raw.githubusercontent.com/berserkross/bb-bulk-course-downloader/main/bb-bulk-course-downloader.user.js
 // @downloadURL  https://raw.githubusercontent.com/berserkross/bb-bulk-course-downloader/main/bb-bulk-course-downloader.user.js
@@ -1428,8 +1428,14 @@
     };
     return control;
   }
+  function toList(items) {
+    if (!items) return [];
+    const out = [];
+    for (let i = 0; i < items.length; i += 1) out.push(items[i]);
+    return out;
+  }
   async function runPool(items, concurrency, worker, { signal, control } = {}) {
-    const jobs = Array.from(items || []);
+    const jobs = toList(items);
     console.info("[bbdl] pool \u5165\u53E3", {
       itemsType: typeof items,
       itemsLen: items && typeof items.length === "number" ? items.length : -1,
@@ -1454,7 +1460,9 @@
         await worker(job);
       }
     }
-    await Promise.all(Array.from({ length: width }, drain));
+    const workers = [];
+    for (let i = 0; i < width; i += 1) workers.push(drain());
+    await Promise.all(workers);
     console.info("[bbdl] pool \u7ED3\u675F", { jobsLen: jobs.length, cursor, width });
   }
 
@@ -6063,7 +6071,9 @@
           }
         }
       }
-      await Promise.all(Array.from({ length: width }, worker));
+      const workers = [];
+      for (let i = 0; i < width; i += 1) workers.push(worker());
+      await Promise.all(workers);
       if (report.fail > 0) console.warn("[bbdl] \u4F53\u79EF\u63A2\u6D4B\u5931\u8D25", { fail: report.fail, reason: report.firstError });
       return report;
     }
