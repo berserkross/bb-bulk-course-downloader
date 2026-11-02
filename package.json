@@ -1,0 +1,16 @@
+{
+  "name": "bb-bulk-course-downloader",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Tampermonkey userscript: scan a Blackboard Learn course, select files, download preserving folder tree",
+  "scripts": {
+    "build": "node build.mjs",
+    "watch": "node build.mjs --watch",
+    "test": "node --test tests/"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.2",
+    "jsdom": "^25.0.1"
+  }
+}
