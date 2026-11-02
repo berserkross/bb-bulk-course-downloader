@@ -642,6 +642,47 @@ export const CSS = `
   text-decoration: line-through;
 }
 
+/* 顶部预览行：一行六个计数，超出就省略，不许换行把工具栏撑高（换行会让下面的列表跳动）。 */
+.bbdl-toolbar__row--sync {
+  padding-bottom: 4px;
+}
+
+.bbdl-sync {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--bbdl-muted);
+}
+
+/* 疑似删除：折叠条目，只读提示，块内没有任何操作按钮。 */
+.bbdl-stale {
+  margin: 0 14px 6px;
+  color: var(--bbdl-muted);
+  font-size: 12px;
+}
+
+.bbdl-stale__head {
+  cursor: pointer;
+  color: #f0c674;
+  word-break: break-word;
+}
+
+.bbdl-stale__list {
+  margin: 4px 0 0;
+  padding: 0 0 0 18px;
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.bbdl-stale__item {
+  padding: 1px 0;
+  word-break: break-all;
+  color: #9aa4b2;
+}
+
 @media (prefers-color-scheme: light) {
   .bbdl-panel,
   .bbdl-overlay {

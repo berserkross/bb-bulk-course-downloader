@@ -70,6 +70,46 @@ function button(act, text, className) {
   return el;
 }
 
+/** 契约 §7 允许的 skip reason：其余值（含 v1 遗留的 'manifest'）一律归到清单命中。 */
+const SKIP_REASONS = ['disk', 'disk-unverified', 'manifest', 'manifest-unchanged', 'manifest-unknown'];
+
+function nonNegCount(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+}
+
+/**
+ * 清单里的相对路径 → 一行可显示的文本。
+ * 契约 §8 / §9.6：对话框里永不出现 URL query，所以先按 URL 剥掉 scheme/host，再砍掉 ? 与 #。
+ * 正常情况拿到的就是 '第 1 周/讲义.pdf' 这样的相对路径，这一段是兜底而不是主路径。
+ */
+function stalePathText(value) {
+  let text = value == null ? '' : String(value).trim();
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(text)) {
+    try {
+      text = new URL(text, 'http://localhost/').pathname;
+    } catch (err) {
+      text = '';
+    }
+  }
+  text = redactUrlText(text);
+  const cut = text.search(/[?#]/);
+  if (cut >= 0) text = text.slice(0, cut);
+  text = text.replace(/^\/+/, '').trim();
+  return text || '（路径未记录）';
+}
+
+/** 疑似删除列表只保留可显示的相对路径；id 可能是 URL（拿不到 rid 时就是整串下载地址），永不进 DOM。 */
+function normalizeStaleList(raw) {
+  const list = Array.isArray(raw) ? raw : [];
+  const out = [];
+  for (const item of list) {
+    const path = item && typeof item === 'object' ? item.path : item;
+    out.push(stalePathText(path));
+  }
+  return out;
+}
+
 /** 把 index.js 算好的跳过摘要归一化；缺字段一律当「没有可跳过的」处理。 */
 export function normalizeSkipInfo(raw) {
   const info = raw || {};
@@ -79,34 +119,70 @@ export function normalizeSkipInfo(raw) {
     const id = pair[0];
     const hit = pair[1];
     if (!id || !hit) continue;
-    const reason = hit.reason === 'disk' || hit.reason === 'disk-unverified' || hit.reason === 'manifest' ? hit.reason : 'manifest';
+    const reason = SKIP_REASONS.indexOf(hit.reason) >= 0 ? hit.reason : 'manifest';
     const size = typeof hit.size === 'number' && Number.isFinite(hit.size) && hit.size >= 0 ? hit.size : null;
     byId.set(String(id), { reason: reason, size: size });
   }
   let disk = 0;
   let manifest = 0;
   let unverified = 0;
+  let manifestUnchanged = 0;
   byId.forEach(function (hit) {
-    if (hit.reason === 'manifest') manifest += 1;
-    else {
+    if (hit.reason === 'disk' || hit.reason === 'disk-unverified') {
       disk += 1;
       if (hit.reason === 'disk-unverified') unverified += 1;
+      return;
     }
+    manifest += 1;
+    if (hit.reason === 'manifest-unchanged') manifestUnchanged += 1;
   });
   return {
     byId: byId,
     disk: disk,
     manifest: manifest,
     unverified: unverified,
+    manifestUnchanged: manifestUnchanged,
     total: byId.size,
     truncated: !!info.truncated,
-    diskChecked: !!info.diskChecked
+    diskChecked: !!info.diskChecked,
+    // diff 六桶：只读过就给 0，UI 不按「新老摘要」分两套渲染。
+    added: nonNegCount(info.added),
+    changed: nonNegCount(info.changed),
+    moved: nonNegCount(info.moved),
+    unchanged: nonNegCount(info.unchanged),
+    unknown: nonNegCount(info.unknown),
+    stale: nonNegCount(info.stale),
+    scanFailures: nonNegCount(info.scanFailures),
+    staleList: normalizeStaleList(info.staleList)
   };
+}
+
+/** 首次扫描：清单还是空的，五个桶全 0 —— 没有任何版本知识，预览行整行不渲染（也就没有「未变 0」这种噪音）。 */
+function noVersionKnowledge(data) {
+  return data.changed === 0 && data.moved === 0 && data.unchanged === 0 && data.unknown === 0 && data.stale === 0;
+}
+
+/** 顶部预览行：一行六个数。stale 为 0 时不写「疑似删除 0」，其余五个永远是六桶里的原值。 */
+export function syncPreviewText(info) {
+  const data = normalizeSkipInfo(info);
+  if (noVersionKnowledge(data)) return '';
+  const text =
+    '本次扫描：新增 ' + data.added +
+    ' · 变更 ' + data.changed +
+    ' · 改名 ' + data.moved +
+    ' · 未变 ' + data.unchanged +
+    ' · 未知 ' + data.unknown;
+  return data.stale > 0 ? text + ' · 疑似删除 ' + data.stale : text;
 }
 
 /** 复选框文案：数量与「磁盘/清单」两个来源分开写，用户才知道凭什么跳过。 */
 export function skipLabelText(info) {
   const data = normalizeSkipInfo(info);
+  // 本轮确实有版本知识（未变 / 未知 / 疑似删除任一非 0）：改写成同步口径，让用户一眼看出「未变」是多少。
+  // 只改文案，skipExisting 的判定语义与唯一一个开关都不动。
+  if (data.unchanged > 0 || data.unknown > 0 || data.stale > 0) {
+    return '只下载新增与变更（跳过未变 ' + data.unchanged + ' 个）';
+  }
   const parts = [];
   if (data.disk) parts.push('磁盘 ' + data.disk);
   if (data.manifest) parts.push('清单 ' + data.manifest);
@@ -118,17 +194,25 @@ export function skipReasonText(hit) {
   const reason = hit && hit.reason;
   if (reason === 'disk') return '磁盘上已有同名同体积的文件，勾选「跳过已存在的文件」时不下这个。';
   if (reason === 'disk-unverified') return '磁盘上已有同名文件，但体积无法核实，按已存在处理。';
+  if (reason === 'manifest-unchanged') return '下载清单里这条是 done，且上游的版本指纹没变，勾选「只下载新增与变更」时不下这个。';
+  if (reason === 'manifest-unknown') return '下载清单里这条是 done，但缺少可比的版本指纹，按未知处理：本轮会重下，下一轮才能确认未变。';
   return '下载清单里这条已经是 done，勾选「跳过已存在的文件」时不下这个。';
 }
 
 /** 说明行：truncated / 无 FSA 两个降级路径必须显式说清楚，否则用户会以为「跳过」判断得很准。 */
 export function skipNoteText(info) {
   const data = normalizeSkipInfo(info);
-  if (!data.total) return '';
+  // 扫描失败自己也值得单独说一句：它会把整批文件顶成「未知」，所以一个都没跳过时也要提示。
+  if (!data.total && !data.scanFailures) return '';
   const bits = [];
+  if (data.scanFailures > 0) {
+    // 排在最前面：它比「磁盘不可核实」更严重 —— 用户先要知道这次的比对结果是残缺的。
+    bits.push('本次扫描有 ' + data.scanFailures + ' 个文件夹失败，其中的文件一律按未知处理（会重下）。');
+  }
   if (data.truncated) bits.push('目录里文件太多，本次只比对了前面一部分，可能漏判已存在的文件。');
   if (!data.diskChecked) bits.push('还没有可核实的目录（或当前浏览器无法核实磁盘文件），只能按下载清单判断：清单里标着完成的才跳过。');
   else if (data.unverified) bits.push('其中 ' + data.unverified + ' 个文件在磁盘上的体积无法核实，只能按文件名判断。');
+  if (data.unchanged > 0) bits.push('清单里已完成、上游未变的文件本轮不再下载。');
   return bits.join(' ');
 }
 
@@ -292,6 +376,18 @@ export function openSelectDialog(entries, options) {
     const skipNoteEl = node('p', 'bbdl-note bbdl-note--skip', skipNoteText(skipInfo));
     skipNoteEl.hidden = true; // 真正挂不挂由 renderSkip() 决定：比对结果随时会变
 
+    // 顶部预览行：一行六个数，挂在列表体正上方。没有版本知识时整行从 DOM 摘掉，不留空占位。
+    const syncRow = node('div', 'bbdl-toolbar__row bbdl-toolbar__row--sync');
+    const syncEl = node('span', 'bbdl-sync');
+    syncRow.appendChild(syncEl);
+
+    // 疑似删除：只提示、只列相对路径，这一块里永远没有按钮（契约 §8 / §9.3：删除永不自动执行）。
+    const staleBox = node('details', 'bbdl-stale');
+    const staleHead = node('summary', 'bbdl-stale__head');
+    const staleListEl = node('ul', 'bbdl-stale__list');
+    staleBox.appendChild(staleHead);
+    staleBox.appendChild(staleListEl);
+
     toolbar.appendChild(dirRow);
     toolbar.appendChild(toolRow);
     toolbar.appendChild(filterRow);
@@ -365,6 +461,29 @@ export function openSelectDialog(entries, options) {
       } else if (skipNoteEl.parentNode !== toolbar) {
         toolbar.insertBefore(skipNoteEl, filterRow);
       }
+      renderSyncPreview();
+    }
+
+    /** 预览行与疑似删除块都排在工具栏末尾：预览行在前，块在后，顺序每轮重排一次保证不串位。 */
+    function renderSyncPreview() {
+      const text = syncPreviewText(skipInfo);
+      syncEl.textContent = text;
+      if (text) toolbar.appendChild(syncRow);
+      else if (syncRow.parentNode) syncRow.parentNode.removeChild(syncRow);
+      renderStaleList(Boolean(text) && skipInfo.stale > 0);
+    }
+
+    function renderStaleList(show) {
+      if (!show) {
+        if (staleBox.parentNode) staleBox.parentNode.removeChild(staleBox);
+        return;
+      }
+      staleHead.textContent = '疑似删除 ' + skipInfo.stale + ' 个（只提示，不会删除本地文件）';
+      staleListEl.textContent = '';
+      // 一份可显的都没有时也要说清楚：宁可写「路径未记录」，也不让标题上的数字落空。
+      const paths = skipInfo.staleList.length ? skipInfo.staleList : ['（路径未记录）'];
+      for (const path of paths) staleListEl.appendChild(node('li', 'bbdl-stale__item', path));
+      toolbar.appendChild(staleBox);
     }
 
     /** 已选的保存位置 + 来源标注：用户得一眼看出这次到底写哪儿、凭什么说「已存在」。 */

@@ -52,6 +52,29 @@ function permissionText(status) {
   return PERMISSION_TEXT[status] || '目录权限不可用';
 }
 
+/** diff 的计数一律归一化成非负整数：老版本 planSkips 缺键时按 0 算，绝不让 undefined 漏进 UI。 */
+function nonNegCount(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+}
+
+/**
+ * stale 只做展示：契约里它是 { id, path }，这里逐条浅拷贝一份 ——
+ * 对话框不该拿着 planSkips 的活引用，也不该顺手把 entry.href 之类的指纹带进 DOM。
+ */
+function staleListOf(result) {
+  const stale = Array.isArray(result && result.stale) ? result.stale : [];
+  const out = [];
+  for (const item of stale) {
+    if (!item) continue;
+    out.push({
+      id: item.id === null || item.id === undefined ? '' : String(item.id),
+      path: item.path === null || item.path === undefined ? '' : String(item.path)
+    });
+  }
+  return out;
+}
+
 /** skipInfo 的空形状：UI 在没有清单也没有磁盘对照时也只需要这一份结构。 */
 function emptySummary() {
   return {
@@ -64,8 +87,16 @@ function emptySummary() {
     diskChecked: false,
     added: 0,
     changed: 0,
+    moved: 0,
     unchanged: 0,
-    stale: 0
+    unknown: 0,
+    stale: 0,
+    /** 清单命中里「上游未变」的那一档：和磁盘命中分开记，UI 才说得清凭什么是「未变」。 */
+    manifestUnchanged: 0,
+    /** 本轮扫描失败的文件夹数（快照，不是活引用）。 */
+    scanFailures: 0,
+    /** 疑似删除：{ id, path } 原样，只在 UI 里提示，永不触发删除。 */
+    staleList: []
   };
 }
 
@@ -127,6 +158,8 @@ export function createController(config) {
     skipPreserveTree: null,
     diskChecked: false,
     diskTruncated: false,
+    /** 上一轮扫描失败的文件夹数：取的是扫描结束那一刻的快照，扫描器下次跑会重置自己的数组。 */
+    scanFailures: 0,
     /** 目录枚举缓存：同一个句柄只扫一次盘，摘要与最终交给 sink 的判断共用这一份。 */
     existingPaths: null,
     existingHandle: null,
@@ -295,8 +328,21 @@ export function createController(config) {
     const preserveTree = settings.preserveTree !== false;
     state.skipPreserveTree = preserveTree;
     const result = planSkips
-      ? planSkips({ plans: plans, manifest: manifest || null, existingPaths: existing.paths, preserveTree: preserveTree })
-      : { todo: plans, skip: [], stale: [], diff: { added: plans.length, changed: 0, unchanged: 0, stale: 0, total: plans.length } };
+      ? planSkips({
+          plans: plans,
+          manifest: manifest || null,
+          existingPaths: existing.paths,
+          preserveTree: preserveTree,
+          // 契约 §4：本轮有文件夹扫失败 → 清单证据一律降级 unknown，绝不拿「可能变了」的东西冒充未变。
+          scanFailed: nonNegCount(state.scanFailures) > 0
+        })
+      : {
+          todo: plans,
+          skip: [],
+          stale: [],
+          // 降级分支（没有 planSkips 模块）也吐完整六桶：UI 只认一套 diff 形状，不按环境分叉。
+          diff: { added: plans.length, changed: 0, moved: 0, unchanged: 0, stale: 0, unknown: 0, total: plans.length }
+        };
 
     state.skipResult = result;
     state.skipSummary = summarize(result);
@@ -316,17 +362,25 @@ export function createController(config) {
       else if (item.reason === 'disk-unverified') {
         summary.disk += 1;
         summary.unverified += 1;
-      } else summary.manifest += 1;
+      } else {
+        // 清单命中：'manifest-unchanged' 再单独记一笔，否则「上游未变」和「磁盘已经有」在 UI 上分不开。
+        summary.manifest += 1;
+        if (item.reason === 'manifest-unchanged') summary.manifestUnchanged += 1;
+      }
     }
     summary.total = summary.byId.size;
     summary.truncated = !!state.diskTruncated;
     summary.diskChecked = !!state.diskChecked;
 
     const diff = (result && result.diff) || {};
-    summary.added = Number(diff.added) || 0;
-    summary.changed = Number(diff.changed) || 0;
-    summary.unchanged = Number(diff.unchanged) || 0;
-    summary.stale = Number(diff.stale) || 0;
+    summary.added = nonNegCount(diff.added);
+    summary.changed = nonNegCount(diff.changed);
+    summary.moved = nonNegCount(diff.moved);
+    summary.unchanged = nonNegCount(diff.unchanged);
+    summary.unknown = nonNegCount(diff.unknown);
+    summary.stale = nonNegCount(diff.stale);
+    summary.staleList = staleListOf(result);
+    summary.scanFailures = nonNegCount(state.scanFailures);
     return summary;
   }
 
@@ -463,6 +517,8 @@ export function createController(config) {
         onProgress: (p) => panel.setScanProgress(p)
       });
       const entries = await scanner.scan();
+      // 先取失败文件夹数的快照：扫描器的 failures 是 getter，留着活引用等于留下一个会自己变的数字。
+      state.scanFailures = scanner && Array.isArray(scanner.failures) ? scanner.failures.length : 0;
       state.entries = Array.isArray(entries) ? entries : [];
       state.entryById = new Map(state.entries.filter(Boolean).map((entry) => [entry.id, entry]));
       state.skipResult = null;
