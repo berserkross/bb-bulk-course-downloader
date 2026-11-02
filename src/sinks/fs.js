@@ -1,5 +1,13 @@
 import { runPool } from './pool.js';
-import { planBatch, createReporter, isAbort, toMessage } from './shared.js';
+import {
+  planBatch,
+  createReporter,
+  createProgressTracker,
+  progressPayload,
+  relativePath,
+  toFailure,
+  isAbort
+} from './shared.js';
 
 /**
  * FSA 落盘 sink —— 本项目的性能命门。
@@ -79,19 +87,12 @@ export function createFsSink({ settings = {}, dirHandle, signal, total = 0, file
     const ok = [];
     const failed = [];
     const report = createReporter({ onProgress });
+    const progress = createProgressTracker(totalCount);
     let aborted = false;
-    let bytes = 0;
 
-    const snapshot = (state, name) => ({
-      state,
-      name,
-      done: ok.length + failed.length,
-      failed: failed.length,
-      total: totalCount,
-      bytes
-    });
+    const emit = (state, path, force) => report(progressPayload(progress, state, path), force);
 
-    report(snapshot('start', ''), true);
+    emit('start', '', true);
 
     await runPool(
       plans,
@@ -102,30 +103,33 @@ export function createFsSink({ settings = {}, dirHandle, signal, total = 0, file
           aborted = true;
           return;
         }
-        const label = plan.segments.concat(plan.fileName).join('/');
-        report(snapshot('file-start', label), true);
+        const label = relativePath(plan);
+        emit('file-start', label, true);
         try {
           await writeEntry(fetcher, entry, plan, (_written, delta) => {
-            bytes += delta;
-            report(snapshot('progress', label), false);
+            progress.addBytes(delta); // 写完这一块才有资格计入 bytesDone
+            emit('progress', label, false);
           });
           ok.push(entry);
-          report(snapshot('file-done', label), true);
+          progress.endFile(false);
+          emit('file-done', label, true);
         } catch (err) {
           if ((signal && signal.aborted) || isAbort(err)) {
+            // 半截文件写不出去，既不算成功也不进 failed
             aborted = true;
-            report(snapshot('aborted', label), true);
+            emit('aborted', label, true);
             return;
           }
-          failed.push({ entry, error: toMessage(err) });
-          report(snapshot('file-failed', label), true);
+          failed.push(toFailure(entry, plan, err));
+          progress.endFile(true);
+          emit('file-failed', label, true);
         }
       },
       { signal }
     );
 
     if (signal && signal.aborted) aborted = true;
-    report(snapshot('done', ''), true);
+    emit('done', '', true);
     return { ok, failed, aborted };
   }
 

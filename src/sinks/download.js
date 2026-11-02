@@ -1,5 +1,13 @@
 import { runPool } from './pool.js';
-import { planBatch, createReporter, isAbort, toMessage } from './shared.js';
+import {
+  planBatch,
+  createReporter,
+  createProgressTracker,
+  progressPayload,
+  relativePath,
+  toFailure,
+  isAbort
+} from './shared.js';
 
 /** 点击后延迟回收 blob URL：立刻 revoke 会在部分 Chrome 版本上打断下载。 */
 const REVOKE_DELAY_MS = 60000;
@@ -41,19 +49,12 @@ export function createDownloadSink({
     const failed = [];
     const plans = planBatch(list, { preserveTree: false, files });
     const report = createReporter({ onProgress });
+    const progress = createProgressTracker(totalCount);
     let aborted = false;
-    let bytes = 0;
 
-    const snapshot = (state, name) => ({
-      state,
-      name,
-      done: ok.length + failed.length,
-      failed: failed.length,
-      total: totalCount,
-      bytes
-    });
+    const emit = (state, path, force) => report(progressPayload(progress, state, path), force);
 
-    report(snapshot('start', ''), true);
+    emit('start', '', true);
 
     await runPool(
       plans,
@@ -66,11 +67,13 @@ export function createDownloadSink({
         }
         // 无目录写权限：目录信息只能由 buildEntryPath 用 folder__ 前缀编码进文件名
         const name = plan.fileName;
+        const label = relativePath(plan);
         let objectUrl = null;
+        emit('file-start', label, true);
         try {
           const response = await fetcher.fetchOk(entry.url, { signal });
           const blob = await response.blob();
-          bytes += blob.size || 0;
+          progress.addBytes(blob.size || 0); // 整份 blob 已交给浏览器，没有更细的粒度
           objectUrl = urlApi.createObjectURL(blob);
           triggerDownload(doc, objectUrl, name);
 
@@ -85,7 +88,8 @@ export function createDownloadSink({
           }, REVOKE_DELAY_MS);
 
           ok.push(entry);
-          report(snapshot('file-done', name), true);
+          progress.endFile(false);
+          emit('file-done', label, true);
         } catch (err) {
           if (objectUrl) {
             try {
@@ -96,18 +100,19 @@ export function createDownloadSink({
           }
           if ((signal && signal.aborted) || isAbort(err)) {
             aborted = true;
-            report(snapshot('aborted', name), true);
+            emit('aborted', label, true);
             return;
           }
-          failed.push({ entry, error: toMessage(err) });
-          report(snapshot('file-failed', name), true);
+          failed.push(toFailure(entry, plan, err));
+          progress.endFile(true);
+          emit('file-failed', label, true);
         }
       },
       { signal }
     );
 
     if (signal && signal.aborted) aborted = true;
-    report(snapshot('done', ''), true);
+    emit('done', '', true);
     return { ok, failed, aborted };
   }
 

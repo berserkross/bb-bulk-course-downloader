@@ -5,6 +5,10 @@ import { nameFromUrl } from './files.js';
 const FILE_SELECTOR = 'a[href*="/bbcswebdav/"]';
 const FOLDER_SELECTOR = 'a[href*="listContent.jsp"]';
 const RID_RE = /dt-content-rid-(\d+)/i;
+// 只影响视图、不改变所指向内容的参数；比较「是否同一页面」时忽略。
+const HARMLESS_PARAMS = new Set(['mode', 'list_display']);
+// listContent.jsp 用自己的 form action 声明当前文件夹身份：入口 URL 不带 content_id 时，仅此可查。
+const SELF_FORM_SELECTOR = 'form[name="contentForm"]';
 
 function resolveUrl(raw, base) {
   if (!raw) return '';
@@ -24,15 +28,38 @@ function contentIdOf(url) {
   }
 }
 
+function normalizedQuery(url) {
+  const pairs = [];
+  for (const [key, value] of url.searchParams) {
+    if (HARMLESS_PARAMS.has(key)) continue;
+    pairs.push([key, value]);
+  }
+  pairs.sort((left, right) => (left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0));
+  return pairs.map(([key, value]) => key + '=' + value).join('&');
+}
+
+// 参数顺序、"&mode=reset"、"&list_display=..." 都不改变「指向本页」这一事实。
 function sameDocument(a, b) {
   if (!a || !b) return false;
   try {
     const left = new URL(a, 'http://localhost/');
     const right = new URL(b, 'http://localhost/');
-    return left.origin === right.origin && left.pathname === right.pathname && left.search === right.search;
+    return (
+      left.origin === right.origin &&
+      left.pathname === right.pathname &&
+      normalizedQuery(left) === normalizedQuery(right)
+    );
   } catch {
     return false;
   }
+}
+
+function pageContentId(doc, base) {
+  const fromUrl = contentIdOf(base);
+  if (fromUrl) return fromUrl;
+  const form = typeof doc.querySelector === 'function' ? doc.querySelector(SELF_FORM_SELECTOR) : null;
+  if (!form) return null;
+  return contentIdOf(resolveUrl(form.getAttribute('action') || '', base));
 }
 
 /**
@@ -45,7 +72,7 @@ export function parseContentList(doc, pageUrl) {
   if (!doc || typeof doc.querySelectorAll !== 'function') return result;
 
   const base = pageUrl || doc.baseURI || undefined;
-  const pageId = contentIdOf(base);
+  const pageId = pageContentId(doc, base);
   const seenFiles = new Set();
   const seenFolders = new Set();
 

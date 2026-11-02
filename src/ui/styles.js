@@ -261,6 +261,14 @@ export const CSS = `
   word-break: break-all;
 }
 
+.bbdl-failed__path {
+  color: var(--bbdl-muted);
+  font-size: 11.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .bbdl-failed__reason {
   color: #ff9a92;
   font-size: 12px;
@@ -312,26 +320,32 @@ export const CSS = `
   padding: 24px;
 }
 
+/* 纵向 flex 容器：头部/工具栏/底部固定，只有 .bbdl-tree 承载滚动。
+   刻意不写 overflow: hidden —— 那会把超出 82vh 的内容直接吃掉，连滚动条都不给。 */
 .bbdl-dialog {
   width: min(880px, 100%);
   max-height: min(82vh, 860px);
+  min-height: 0;
   background: var(--bbdl-bg);
   border: 1px solid var(--bbdl-line);
   border-radius: 14px;
   box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55);
   display: flex;
   flex-direction: column;
-  overflow: hidden;
+  overflow: visible;
 }
 
 .bbdl-dialog__head {
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 12px;
   padding: 12px 14px;
   background: var(--bbdl-bg-soft);
   border-bottom: 1px solid var(--bbdl-line);
+  border-radius: 13px 13px 0 0;
 }
 
 .bbdl-dialog__title {
@@ -341,12 +355,20 @@ export const CSS = `
 }
 
 .bbdl-dialog__toolbar {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--bbdl-line);
+}
+
+.bbdl-toolbar__row {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
   gap: 8px;
-  padding: 10px 14px;
-  border-bottom: 1px solid var(--bbdl-line);
+  width: 100%;
 }
 
 .bbdl-switch {
@@ -357,29 +379,46 @@ export const CSS = `
   user-select: none;
 }
 
+/* 不变量：每个 .bbdl-group 的实际高度 ≥ 内部所有 .bbdl-row 高度之和，且后一组的头行 top
+   必须 ≥ 前一组最后一行的 bottom —— 组与组永不重叠。
+   所以这里是块流：column flex 下，溢出非 visible 的 flex 项自动最小尺寸为 0，
+   .bbdl-group 会被 flex-shrink 压成十几像素，再由 overflow: hidden 把行裁掉，
+   下一组的头就压在被压扁的行上（用户截图里「文字糊成一片」的根因）。
+   纵横两轴滚动都交给 .bbdl-tree 的 overflow: auto。 */
 .bbdl-tree {
   flex: 1 1 auto;
-  min-height: 120px;
-  max-height: 58vh;
+  min-height: 0;
   overflow: auto;
+  overscroll-behavior: contain;
   padding: 8px 10px 12px;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
+  display: block;
 }
 
+/* 圆角不靠 overflow: hidden 裁（那会连需要横向滚动的长路径一起裁掉），
+   改由文件夹头补上圆角，见 .bbdl-row--folder。 */
 .bbdl-group {
   border: 1px solid var(--bbdl-line);
   border-radius: 10px;
-  overflow: hidden;
+  margin: 0 0 10px;
 }
 
+/* 行高必须由内容决定：宿主 BB 页面自己的 line-height 一旦被继承过来，
+   13px 的中文就会画到行盒之外，被相邻行的底色盖掉半截（用户截图里就是这个现象）。
+   所以这里显式钉死 line-height，紧凑度只用 padding / font-size 调，绝不写 height 或 overflow: hidden 去裁。 */
 .bbdl-row {
   display: grid;
-  grid-template-columns: 18px 1fr auto;
+  /* 体积列定宽 92px：让它别再按内容抢 name 列的宽度。
+     width: max-content 让过长的路径把整行撑宽，横向滚动条才有东西可滚。 */
+  grid-template-columns: 18px minmax(0, 1fr) 92px;
   align-items: center;
   gap: 8px;
   padding: 5px 10px;
+  width: max-content;
+  min-width: 100%;
+  min-height: 30px;
+  height: auto;
+  max-height: none;
+  line-height: 1.45;
   cursor: pointer;
   border-top: 1px solid rgba(255, 255, 255, 0.04);
 }
@@ -388,12 +427,18 @@ export const CSS = `
   border-top: 0;
 }
 
+/* 组内最后一行补下圆角：组的圆角不再靠 overflow: hidden 裁。 */
+.bbdl-group > .bbdl-row:last-child {
+  border-radius: 0 0 9px 9px;
+}
+
+/* 刻意不用 position: sticky：吸顶行一旦叠在正常行上方，任何一点行盒溢出都会变成
+   「上半个字被压掉」。132 行的列表里，吸顶的收益抵不上这个风险。 */
 .bbdl-row--folder {
   background: #2a303a;
   font-weight: 600;
-  position: sticky;
-  top: 0;
-  z-index: 1;
+  line-height: 1.45;
+  border-radius: 9px 9px 0 0;
 }
 
 .bbdl-row--file:hover {
@@ -409,7 +454,11 @@ export const CSS = `
 }
 
 .bbdl-row__name {
-  word-break: break-all;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  line-height: 1.45;
 }
 
 .bbdl-row__size {
@@ -417,16 +466,25 @@ export const CSS = `
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
   font-size: 12px;
+  line-height: 1.45;
 }
 
+/* 路径单行显示：word-break: break-all 会在任意字符处折断，把扩展名和目录段撕开、
+   行高被撑成一堆「堆叠」，这正是用户抱怨的观感。改成 nowrap 后整行宽度按 min-content
+   撑开，.bbdl-tree 的 overflow: auto 才有横向滚动条可给（配合 select.js 的 title 属性兜底阅读）。*/
+/* 路径单行显示：word-break: break-all 会在任意字符处折断，把目录段和扩展名撕开、
+   行高跟着堆叠。改成 nowrap 后整行按 min-content 撑开，.bbdl-tree 的 overflow: auto
+   才有横向滚动条可给（配合 select.js 里 pathEl.title 兜底阅读）。 */
 .bbdl-row__path {
   grid-column: 2 / -1;
   color: #7d868f;
   font-size: 11.5px;
-  word-break: break-all;
+  line-height: 1.45;
+  white-space: nowrap;
 }
 
 .bbdl-dialog__foot {
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -434,6 +492,7 @@ export const CSS = `
   padding: 10px 14px;
   background: var(--bbdl-bg-soft);
   border-top: 1px solid var(--bbdl-line);
+  border-radius: 0 0 13px 13px;
   flex-wrap: wrap;
 }
 
@@ -447,6 +506,7 @@ export const CSS = `
 }
 
 .bbdl-dialog__error {
+  flex: 0 0 auto;
   margin: 0;
   padding: 8px 14px;
   background: #4a2523;
@@ -461,6 +521,65 @@ export const CSS = `
 .bbdl-hint {
   color: var(--bbdl-muted);
   font-size: 12px;
+}
+
+/* ---------- 筛选 / 搜索 / 排序 ---------- */
+.bbdl-search {
+  flex: 1 1 160px;
+  min-width: 120px;
+  background: #12151a;
+  color: var(--bbdl-fg);
+  border: 1px solid var(--bbdl-line);
+  border-radius: 8px;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
+.bbdl-search::placeholder {
+  color: #6d7783;
+}
+
+.bbdl-types {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+}
+
+.bbdl-types__item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  user-select: none;
+  font-size: 12px;
+  color: var(--bbdl-muted);
+}
+
+.bbdl-sort {
+  background: #2f3540;
+  color: var(--bbdl-fg);
+  border: 1px solid var(--bbdl-line);
+  border-radius: 8px;
+  padding: 4px 6px;
+  font-size: 12px;
+}
+
+/* ---------- 落盘方式标注 ---------- */
+.bbdl-mode {
+  margin: 0;
+  padding: 6px 14px;
+  background: #171b21;
+  border-top: 1px solid var(--bbdl-line);
+  color: var(--bbdl-muted);
+  font-size: 12px;
+  word-break: break-word;
+}
+
+.bbdl-panel__body .bbdl-mode {
+  padding: 6px 8px;
+  border: 1px solid var(--bbdl-line);
+  border-radius: 8px;
 }
 
 @media (prefers-color-scheme: light) {

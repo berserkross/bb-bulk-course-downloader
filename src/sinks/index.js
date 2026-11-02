@@ -13,7 +13,9 @@ const files = { buildEntryPath, sanitizeSegment, dedupePaths };
  *           signal?: AbortSignal, total?: number }} [options]
  * @returns {{ kind: 'fs'|'download',
  *            download: (entries: any[], fetcher: any, opts?: { onProgress?: Function })
- *              => Promise<{ ok: any[], failed: { entry: any, error: string }[], aborted: boolean }> }}
+ *              => Promise<{ ok: any[],
+ *                           failed: { entry: any, name: string, path: string, url: string, error: string }[],
+ *                           aborted: boolean }> }}
  */
 export function createSink({ settings = {}, dirHandle, signal, total = 0 } = {}) {
   const deps = { settings, signal, total, files };

@@ -20,7 +20,7 @@ function mount() {
   if (!courseId || !contentId) return;
 
   const settings = loadSettings();
-  const state = { entries: [], busy: false, abort: null };
+  const state = { entries: [], busy: false, abort: null, dirHandle: null, expectedBytes: 0 };
 
   const panel = mountPanel({
     settings,
@@ -29,10 +29,31 @@ function mount() {
     },
     onScan: startScan,
     onDownload: startDownload,
+    onRetryFailed,
     onCancel() {
       if (state.abort) state.abort.abort();
     }
   });
+
+  /**
+   * 分母由 UI 提供：sink 报 bytesTotal === 0（总量未知）时，只有当对话框里
+   * 每个已选文件体积都探测过，才拿它们的和补上，其余情况一概保持未知。
+   */
+  function withExpectedTotal(payload) {
+    const p = payload || {};
+    const total = pickTotal(p);
+    if (total > 0 || !(state.expectedBytes > 0)) return p;
+    return Object.assign({}, p, { bytesTotal: state.expectedBytes });
+  }
+
+  function pickTotal(p) {
+    const v = typeof p.bytesTotal === 'number' ? p.bytesTotal : 0;
+    return Number.isFinite(v) && v > 0 ? v : 0;
+  }
+
+  function onProgress(p) {
+    panel.setDownloadProgress(withExpectedTotal(p));
+  }
 
   function begin() {
     state.busy = true;
@@ -102,22 +123,37 @@ function mount() {
     }
     if (!choice || !choice.entries.length) return;
 
+    state.dirHandle = choice.dirHandle || null;
+    state.expectedBytes = typeof choice.expectedBytes === 'number' ? choice.expectedBytes : 0;
+    panel.setMode(state.dirHandle ? 'fs' : 'download');
+
     const signal = begin();
     panel.setState('downloading');
     try {
-      const sink = await createSink({
-        settings,
-        dirHandle: choice.dirHandle,
-        signal,
-        total: choice.entries.length
-      });
-      const fetcher = createFetcher({ signal });
-      const result = await sink.download(choice.entries, fetcher, {
-        onProgress: (p) => panel.setDownloadProgress(p)
-      });
-      panel.showSummary(result);
+      panel.showSummary(await runDownload(choice.entries, state.dirHandle, signal));
     } catch (err) {
       panel.fail(signal.aborted ? '已取消' : describe(err));
+    } finally {
+      state.busy = false;
+    }
+  }
+
+  async function runDownload(entries, dirHandle, signal) {
+    const sink = await createSink({ settings, dirHandle, signal, total: entries.length });
+    const fetcher = createFetcher({ signal });
+    return sink.download(entries, fetcher, { onProgress });
+  }
+
+  /** 失败项重试：同一套目录句柄与并发设置，只是一次跑更少的文件。 */
+  async function onRetryFailed(entries) {
+    if (state.busy || !entries || !entries.length) return null;
+    state.busy = true;
+    state.abort = new AbortController();
+    // 重试批次的分母和首轮不同，宁可报「总量未知」也不拿首轮的数字冒充。
+    state.expectedBytes = 0;
+    panel.setState('downloading');
+    try {
+      return await runDownload(entries, state.dirHandle, state.abort.signal);
     } finally {
       state.busy = false;
     }

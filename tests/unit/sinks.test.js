@@ -547,3 +547,205 @@ test('createSink：dirHandle 存在 → fs sink；否则 → download sink', () 
   assert.equal(withoutDir.kind, 'download');
   assert.equal(typeof withoutDir.download, 'function');
 });
+// =========================== 进度负载与失败契约 ===========================
+
+test('fs sink：进度负载 bytesDone 单调不减，最终等于真实写入总字节', async () => {
+  const log = newLog();
+  const sink = createFsSink({ settings: { downloadConcurrency: 1 }, dirHandle: makeRoot(log), files, total: 3 });
+  const sizes = [[4], [8, 16], [2]];
+  let call = 0;
+  const fetcher = {
+    async fetchOk() {
+      const chunks = sizes[call];
+      call += 1;
+      return chunkedResponse(chunks);
+    }
+  };
+  const list = ['a', 'b', 'c'].map((n, k) => entry({ url: 'u' + k, name: n + '.bin' }));
+  const events = [];
+  const result = await sink.download(list, fetcher, { onProgress: (p) => events.push(p) });
+
+  const realBytes = log.writes.reduce((sum, w) => sum + w.chunks.reduce((a, b) => a + b, 0), 0);
+  assert.equal(realBytes, 30);
+
+  for (const p of events) {
+    for (const key of ['filesDone', 'filesTotal', 'bytesDone', 'bytesTotal', 'currentPath']) {
+      assert.ok(key in p, '进度负载缺字段 ' + key + '：' + JSON.stringify(p));
+    }
+    assert.equal(Number.isNaN(p.bytesDone), false, 'bytesDone 不得是 NaN');
+    assert.equal(Number.isNaN(p.bytesTotal), false, 'bytesTotal 不得是 NaN');
+  }
+
+  const seen = events.map((p) => p.bytesDone);
+  for (let k = 1; k < seen.length; k += 1) {
+    assert.ok(seen[k] >= seen[k - 1], 'bytesDone 必须单调不减，实测 ' + JSON.stringify(seen));
+  }
+
+  const done = events[events.length - 1];
+  assert.equal(done.state, 'done');
+  assert.equal(done.bytesDone, realBytes, '最终 bytesDone 必须等于真实写入字节');
+  assert.equal(done.filesDone, 3);
+  assert.equal(done.filesTotal, 3);
+  assert.equal(done.currentPath, '');
+  assert.equal(result.ok.length, 3);
+  console.log('  [证据] 进度负载真实样例：', JSON.stringify(events.find((p) => p.state === 'file-done')));
+});
+
+test('fs sink：字节总量未知时 bytesTotal 恒为 0（响应不带长度也一样）', async () => {
+  const log = newLog();
+  const sink = createFsSink({ settings: { downloadConcurrency: 2 }, dirHandle: makeRoot(log), files });
+  let call = 0;
+  const fetcher = {
+    async fetchOk() {
+      call += 1;
+      if (call === 1) throw new Error('HttpError 500');
+      return chunkedResponse([4, 4]);
+    }
+  };
+  const events = [];
+  await sink.download([entry({ url: 'x', name: 'x.bin' }), entry({ url: 'y', name: 'y.bin' })], fetcher, {
+    onProgress: (p) => events.push(p)
+  });
+
+  assert.ok(events.length > 0);
+  for (const p of events) {
+    assert.equal(p.bytesTotal, 0, '未知总量必须是 0，实测 ' + JSON.stringify(p));
+    assert.equal(typeof p.bytesTotal, 'number');
+  }
+});
+
+test('fs sink：failed 项四字段齐全，error 已抹掉 URL 的 query', async () => {
+  const log = newLog();
+  const sink = createFsSink({ settings: { downloadConcurrency: 1 }, dirHandle: makeRoot(log), files });
+  const signed = 'https://cdn.example.com/v/a.mp4?token=deadbeef&exp=1';
+  const bad = entry({ url: signed, name: '坏文件.pdf', folderPath: ['Week 1'] });
+  const fetcher = {
+    async fetchOk() {
+      throw new Error('下载失败：GET ' + signed + ' 返回 HttpError 500');
+    }
+  };
+  const result = await sink.download([bad], fetcher, {});
+
+  assert.equal(result.failed.length, 1);
+  const failure = result.failed[0];
+  assert.equal(failure.name, '坏文件.pdf');
+  assert.equal(failure.path, 'Week 1/坏文件.pdf');
+  assert.equal(failure.url, signed, 'url 字段保留原始地址，便于重试');
+  assert.match(failure.error, /HttpError 500/);
+  assert.match(failure.error, /下载失败/);
+  assert.equal(failure.error.includes('?'), false, 'error 不得包含带 query 的完整 URL');
+  assert.equal(failure.error.includes('token='), false, 'error 不得泄露 query 参数');
+  assert.ok(failure.error.includes('https://cdn.example.com/v/a.mp4'));
+  console.log(
+    '  [证据] failed 项真实样例：',
+    JSON.stringify({ name: failure.name, path: failure.path, url: failure.url, error: failure.error })
+  );
+});
+
+test('fs sink：中断时未完成的文件不得进 ok，也不能伪装成 failed', async () => {
+  const log = newLog();
+  const controller = new AbortController();
+  const sink = createFsSink({
+    settings: { downloadConcurrency: 1 },
+    dirHandle: makeRoot(log),
+    signal: controller.signal,
+    files,
+    total: 3
+  });
+  const first = entry({ url: 'a', name: 'a.bin' });
+  const second = entry({ url: 'b', name: 'b.bin' });
+  const third = entry({ url: 'c', name: 'c.bin' });
+  const fetcher = {
+    async fetchOk(url) {
+      if (url !== 'b') return chunkedResponse([4]);
+      let step = 0;
+      return {
+        ok: true,
+        body: {
+          getReader() {
+            return {
+              async read() {
+                if (step === 0) {
+                  step += 1;
+                  return { done: false, value: new Uint8Array(6) };
+                }
+                controller.abort();
+                throw new DOMException('aborted', 'AbortError');
+              },
+              async cancel() {}
+            };
+          }
+        }
+      };
+    }
+  };
+  const events = [];
+  const result = await sink.download([first, second, third], fetcher, { onProgress: (p) => events.push(p) });
+
+  assert.deepEqual(result.ok, [first], '半截文件不得进 ok');
+  assert.deepEqual(result.failed, [], '中断不得记成失败');
+  assert.equal(result.aborted, true);
+  assert.deepEqual(log.writes.map((w) => w.file), ['a.bin', 'b.bin'], '中断后不再发起下一个文件');
+  assert.deepEqual(log.writes[1].chunks, [6]);
+  assert.equal(log.writes[1].closed, false);
+  assert.equal(log.writes[1].aborted, true);
+
+  const done = events[events.length - 1];
+  assert.equal(done.filesDone, 1, '未完成的文件不计入 filesDone');
+  const seen = events.map((p) => p.bytesDone);
+  for (let k = 1; k < seen.length; k += 1) {
+    assert.ok(seen[k] >= seen[k - 1], '中断路径下 bytesDone 也不得回退，实测 ' + JSON.stringify(seen));
+  }
+});
+
+test('download sink：bytesDone 按已交给浏览器的 blob 累加，failed 项四字段齐全', async () => {
+  const { doc } = fakeDoc();
+  const urlApi = fakeUrlApi();
+  const sink = createDownloadSink({
+    settings: { downloadConcurrency: 1 },
+    files,
+    doc,
+    urlApi,
+    schedule: (fn) => {
+      fn();
+      return 0;
+    },
+    total: 2
+  });
+  const good = entry({ url: 'https://cdn.example.com/g.mp4?sig=abc', name: 'good.mp4', folderPath: ['Week 1'] });
+  const badUrl = 'https://cdn.example.com/b.mp4?sig=deadbeef';
+  const bad = entry({ url: badUrl, name: 'bad.pdf', folderPath: ['Week 1'] });
+  const fetcher = {
+    async fetchOk(url) {
+      if (url === badUrl) throw new Error('下载失败：GET ' + badUrl + ' 返回 404');
+      return {
+        ok: true,
+        async blob() {
+          return { size: 2048 };
+        }
+      };
+    }
+  };
+  const events = [];
+  const result = await sink.download([good, bad], fetcher, { onProgress: (p) => events.push(p) });
+
+  for (const p of events) {
+    for (const key of ['filesDone', 'filesTotal', 'bytesDone', 'bytesTotal', 'currentPath']) {
+      assert.ok(key in p, '进度负载缺字段 ' + key);
+    }
+  }
+  const done = events[events.length - 1];
+  assert.equal(done.bytesDone, 2048);
+  assert.equal(done.bytesTotal, 0);
+  assert.equal(done.filesDone, 2);
+  assert.equal(done.failed, 1);
+
+  const failure = result.failed[0];
+  assert.equal(failure.name, 'Week 1__bad.pdf');
+  assert.equal(failure.path, 'Week 1__bad.pdf');
+  assert.equal(failure.url, badUrl);
+  assert.match(failure.error, /返回 404/);
+  assert.equal(failure.error.includes('?'), false, 'error 不得包含带 query 的完整 URL');
+  assert.equal(failure.error.includes('sig='), false);
+  assert.equal(result.ok.length, 1);
+});

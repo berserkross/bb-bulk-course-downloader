@@ -1,4 +1,27 @@
 import { injectStyles } from './styles.js';
+import { redactUrlText } from './panel.js';
+
+/**
+ * 扩展名归并成 6 个类型：勾选「pdf」比让用户面对 20 种后缀要省事，
+ * ext 列表之外的一切都落进「其他」，所以任何文件永远属于且只属于一个类型。
+ */
+export const TYPE_GROUPS = [
+  { id: 'pdf', label: 'pdf', exts: ['pdf'] },
+  { id: 'ppt', label: 'ppt', exts: ['ppt', 'pptx', 'pps', 'ppsx', 'pot', 'potx'] },
+  { id: 'doc', label: 'doc', exts: ['doc', 'docx', 'rtf', 'txt', 'odt'] },
+  { id: 'zip', label: 'zip', exts: ['zip', 'rar', '7z', 'tar', 'gz', 'tgz', 'bz2'] },
+  { id: 'image', label: '图片', exts: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'heic', 'tif', 'tiff'] },
+  { id: 'other', label: '其他', exts: [] }
+];
+
+export function typeOf(entry) {
+  const match = /\.([a-z0-9]+)$/i.exec(String((entry && entry.name) || '').trim());
+  const ext = match ? match[1].toLowerCase() : '';
+  for (const group of TYPE_GROUPS) {
+    if (group.exts.indexOf(ext) >= 0) return group.id;
+  }
+  return 'other';
+}
 
 /**
  * 当前打开的对话框实例。模块级 setRowSize(id, size) 转发给它，
@@ -72,6 +95,13 @@ export function openSelectDialog(entries, options) {
 
     let preserveTree = settings.preserveTree !== false;
     let closed = false;
+    let query = '';
+    let sortMode = 'none';
+    const activeTypes = new Set(
+      TYPE_GROUPS.map(function (group) {
+        return group.id;
+      })
+    );
     const fsaAvailable = directoryPickerAvailable();
 
     const rows = new Map();
@@ -98,6 +128,8 @@ export function openSelectDialog(entries, options) {
     head.appendChild(closeBtn);
 
     const toolbar = node('div', 'bbdl-dialog__toolbar');
+    const toolRow = node('div', 'bbdl-toolbar__row');
+    const filterRow = node('div', 'bbdl-toolbar__row');
     const allBtn = button('all', '全选', 'bbdl-btn bbdl-btn--small');
     const noneBtn = button('none', '全不选', 'bbdl-btn bbdl-btn--small');
     const probeBtn = button('probe', '获取体积', 'bbdl-btn bbdl-btn--small');
@@ -111,15 +143,59 @@ export function openSelectDialog(entries, options) {
     treeSwitch.appendChild(treeInput);
     treeSwitch.appendChild(node('span', null, '保留原始目录结构'));
 
+    const sortSelect = node('select', 'bbdl-sort');
+    sortSelect.setAttribute('aria-label', '排序方式');
+    [
+      ['none', '目录顺序'],
+      ['name', '按名称'],
+      ['size', '按体积']
+    ].forEach(function (pair) {
+      const opt = node('option', null, pair[1]);
+      opt.value = pair[0];
+      sortSelect.appendChild(opt);
+    });
+    sortSelect.value = sortMode;
+
     const hintEl = node('span', 'bbdl-hint');
 
-    toolbar.appendChild(allBtn);
-    toolbar.appendChild(noneBtn);
-    toolbar.appendChild(probeBtn);
-    toolbar.appendChild(treeSwitch);
-    toolbar.appendChild(hintEl);
+    toolRow.appendChild(allBtn);
+    toolRow.appendChild(noneBtn);
+    toolRow.appendChild(probeBtn);
+    toolRow.appendChild(sortSelect);
+    toolRow.appendChild(treeSwitch);
+    toolRow.appendChild(hintEl);
+
+    const searchInput = node('input', 'bbdl-search');
+    searchInput.type = 'search';
+    searchInput.placeholder = '搜索文件名…';
+    searchInput.setAttribute('aria-label', '搜索文件名');
+
+    const typesEl = node('div', 'bbdl-types');
+    TYPE_GROUPS.forEach(function (group) {
+      const item = node('label', 'bbdl-types__item');
+      const box = node('input');
+      box.type = 'checkbox';
+      box.className = 'bbdl-check';
+      box.checked = activeTypes.has(group.id);
+      box.setAttribute('data-type', group.id);
+      box.addEventListener('change', function () {
+        if (box.checked) activeTypes.add(group.id);
+        else activeTypes.delete(group.id);
+        applyView();
+      });
+      item.appendChild(box);
+      item.appendChild(node('span', null, group.label));
+      typesEl.appendChild(item);
+    });
+
+    filterRow.appendChild(searchInput);
+    filterRow.appendChild(typesEl);
+
+    toolbar.appendChild(toolRow);
+    toolbar.appendChild(filterRow);
 
     const treeEl = node('div', 'bbdl-tree');
+    const modeEl = node('p', 'bbdl-mode');
 
     const foot = node('div', 'bbdl-dialog__foot');
     const totalsEl = node('span', 'bbdl-dialog__totals');
@@ -142,6 +218,7 @@ export function openSelectDialog(entries, options) {
     dialog.appendChild(head);
     dialog.appendChild(toolbar);
     dialog.appendChild(treeEl);
+    dialog.appendChild(modeEl);
     dialog.appendChild(errorEl);
     dialog.appendChild(foot);
     overlay.appendChild(dialog);
@@ -152,7 +229,7 @@ export function openSelectDialog(entries, options) {
     };
 
     function showError(text, offerFallback) {
-      errorText.textContent = String(text);
+      errorText.textContent = redactUrlText(String(text));
       errorEl.hidden = false;
       fallbackBtn.hidden = !offerFallback;
     }
@@ -190,11 +267,13 @@ export function openSelectDialog(entries, options) {
         folderBox.type = 'checkbox';
         folderBox.className = 'bbdl-check';
         folderBox.checked = true;
-        const folderName = node(
-          'span',
-          'bbdl-row__name',
-          (group.path.length ? group.path.join(' / ') : '课程根目录') + '（' + group.items.length + ' 个文件）'
-        );
+        // 层级用缩进表达：132 个文件时「a / b / c」这种扁平全路径根本没法扫读。
+        // 完整路径退到 title 里，缩进只负责一眼看出谁在谁下面。
+        folderRow.style.paddingLeft = 10 + Math.max(0, group.path.length - 1) * 12 + 'px';
+        const leaf = group.path.length ? group.path[group.path.length - 1] : '课程根目录';
+        const folderLabel = (group.path.length ? group.path.join(' / ') : '课程根目录') + '（' + group.items.length + ' 个文件）';
+        const folderName = node('span', 'bbdl-row__name', leaf + '（' + group.items.length + ' 个文件）');
+        folderName.title = folderLabel;
         const folderSize = node('span', 'bbdl-row__size', '');
         folderRow.appendChild(folderBox);
         folderRow.appendChild(folderName);
@@ -212,7 +291,7 @@ export function openSelectDialog(entries, options) {
           renderTotals();
         });
 
-        folders.set(key, { input: folderBox, sizeEl: folderSize, items: group.items });
+        folders.set(key, { input: folderBox, sizeEl: folderSize, items: group.items, el: groupEl });
 
         for (const entry of group.items) {
           const rowEl = node('label', 'bbdl-row bbdl-row--file');
@@ -238,7 +317,7 @@ export function openSelectDialog(entries, options) {
           rowEl.appendChild(pathEl);
           groupEl.appendChild(rowEl);
 
-          rows.set(entry.id, { input: input, sizeEl: sizeEl, pathEl: pathEl, entry: entry });
+          rows.set(entry.id, { input: input, sizeEl: sizeEl, pathEl: pathEl, entry: entry, el: rowEl });
         }
 
         frag.appendChild(groupEl);
@@ -256,8 +335,102 @@ export function openSelectDialog(entries, options) {
 
     function renderPaths() {
       rows.forEach(function (row) {
-        row.pathEl.textContent = previewPath(row.entry);
+        const text = previewPath(row.entry);
+        row.pathEl.textContent = text;
+        // 路径单行不折行，被截断的部分靠 title 兜底（见 styles.js 里 .bbdl-row__path 的说明）。
+        row.pathEl.title = text;
       });
+    }
+
+    /** 视图过滤的唯一判定：类型勾选 + 文件名搜索。 */
+    function visibleEntry(entry) {
+      if (!entry) return false;
+      if (!activeTypes.has(typeOf(entry))) return false;
+      const q = query.trim().toLowerCase();
+      if (!q) return true;
+      return String(entry.name || '').toLowerCase().indexOf(q) >= 0;
+    }
+
+    function sortedRows(group) {
+      const items = group.items
+        .map(function (entry) {
+          return rows.get(entry.id);
+        })
+        .filter(Boolean);
+      if (sortMode === 'name') {
+        items.sort(function (a, b) {
+          return String(a.entry.name || '').localeCompare(String(b.entry.name || ''), 'zh-Hans-CN', { numeric: true });
+        });
+      } else if (sortMode === 'size') {
+        // 「稳定置底」用分组实现而不是比较函数：未探测项之间的相对顺序因此原封不动。
+        const known = items.filter(function (row) {
+          return sizes.has(row.entry.id);
+        });
+        const unknown = items.filter(function (row) {
+          return !sizes.has(row.entry.id);
+        });
+        known.sort(function (a, b) {
+          return sizes.get(b.entry.id) - sizes.get(a.entry.id);
+        });
+        return known.concat(unknown);
+      }
+      return items;
+    }
+
+    let viewHint = '';
+    function applyView() {
+      let visible = 0;
+      let pendingSize = 0;
+      groups.forEach(function (group, key) {
+        const folder = folders.get(key);
+        let shown = 0;
+        for (const entry of group.items) {
+          const row = rows.get(entry.id);
+          if (!row) continue;
+          const ok = visibleEntry(entry);
+          row.el.hidden = !ok;
+          if (!ok) continue;
+          shown += 1;
+          if (!sizes.has(entry.id)) pendingSize += 1;
+        }
+        visible += shown;
+        if (!folder) return;
+        if (folder.el) folder.el.hidden = shown === 0;
+        if (sortMode === 'none' || !shown || !folder.el) return;
+        // 文件夹标题行永远是组内第一格，这里只重排文件行。
+        for (const row of sortedRows(group)) {
+          if (row.el.parentNode === folder.el) folder.el.appendChild(row.el);
+        }
+      });
+
+      let next = '';
+      if (!visible) next = '没有匹配的文件：换个关键词，或把类型勾回来。';
+      else if (sortMode === 'size' && pendingSize) {
+        next = '按体积排序：' + pendingSize + ' 个体积未探测，已稳定排在最后，可先点「获取体积」。';
+      }
+      // hintEl 也被「正在获取体积…」这类临时消息借用，只在还显示视图自己的提示时才改写它。
+      if (hintEl.textContent === viewHint) hintEl.textContent = next;
+      viewHint = next;
+    }
+
+    const MODE_TEXT = {
+      fs: '落盘方式：保存到文件夹（Chromium）——可以选一个目录，文件按原目录结构直接写进去。代价：每次下载都要重新选一次文件夹，且只有 Chromium 系浏览器支持。',
+      download: '落盘方式：逐文件下载（进浏览器默认下载目录）——当前浏览器无法让网页选目录，文件名用目录前缀保留层级。代价：所有文件都进默认下载目录，建不了子目录，文件多时会连续弹下载。'
+    };
+
+    function renderMode() {
+      modeEl.textContent = MODE_TEXT[fsaAvailable ? 'fs' : 'download'] + (preserveTree ? '' : '（已关闭「保留原始目录结构」）');
+      modeEl.title = modeEl.textContent;
+    }
+
+    /** 分母由 UI 自己算：只有当每个已选文件体积都已知，才敢报百分比，否则一律按未知处理。 */
+    function expectedTotalBytes(chosen) {
+      let sum = 0;
+      for (const entry of chosen) {
+        if (!sizes.has(entry.id)) return 0;
+        sum += sizes.get(entry.id);
+      }
+      return sum;
     }
 
     function folderTotals(folder) {
@@ -320,6 +493,7 @@ export function openSelectDialog(entries, options) {
         row.sizeEl.textContent = '—';
         row.sizeEl.title = '';
       }
+      applyView();
       syncFolders();
       renderTotals();
       return true;
@@ -349,7 +523,12 @@ export function openSelectDialog(entries, options) {
         return;
       }
       if (dirHandle) {
-        close({ entries: chosen, dirHandle: dirHandle, sizeRefresher: setRowSizeInternal });
+        close({
+          entries: chosen,
+          dirHandle: dirHandle,
+          sizeRefresher: setRowSizeInternal,
+          expectedBytes: expectedTotalBytes(chosen)
+        });
         return;
       }
       // pickDirectory() 的 null 是二义的：FSA 可用时为「用户取消选目录」，不可用时为「无 FSA」。
@@ -357,7 +536,7 @@ export function openSelectDialog(entries, options) {
         showError('已取消选择文件夹，未开始下载。可再次点击「开始下载」，或改用默认下载。', true);
         return;
       }
-      close({ entries: chosen, sizeRefresher: setRowSizeInternal });
+      close({ entries: chosen, sizeRefresher: setRowSizeInternal, expectedBytes: expectedTotalBytes(chosen) });
     }
 
     function onDirectoryFailed(err) {
@@ -376,7 +555,7 @@ export function openSelectDialog(entries, options) {
         showError('请至少选择一个文件。');
         return;
       }
-      close({ entries: chosen, sizeRefresher: setRowSizeInternal });
+      close({ entries: chosen, sizeRefresher: setRowSizeInternal, expectedBytes: expectedTotalBytes(chosen) });
     });
 
     function handleConfirm() {
@@ -417,9 +596,11 @@ export function openSelectDialog(entries, options) {
       close(null);
     });
 
+    // 全选 / 全不选只作用于当前可见项：否则「筛出 pdf → 全选」会把隐藏的 100 个文件一起选上，
+    // 用户看到的勾选状态和实际提交的清单就对不上了。
     allBtn.addEventListener('click', function () {
       for (const entry of list) {
-        if (!entry) continue;
+        if (!entry || !visibleEntry(entry)) continue;
         selected.add(entry.id);
         const row = rows.get(entry.id);
         if (row) row.input.checked = true;
@@ -429,12 +610,24 @@ export function openSelectDialog(entries, options) {
     });
 
     noneBtn.addEventListener('click', function () {
-      selected.clear();
-      rows.forEach(function (row) {
-        row.input.checked = false;
-      });
+      for (const entry of list) {
+        if (!entry || !visibleEntry(entry)) continue;
+        selected.delete(entry.id);
+        const row = rows.get(entry.id);
+        if (row) row.input.checked = false;
+      }
       syncFolders();
       renderTotals();
+    });
+
+    searchInput.addEventListener('input', function () {
+      query = searchInput.value || '';
+      applyView();
+    });
+
+    sortSelect.addEventListener('change', function () {
+      sortMode = sortSelect.value || 'none';
+      applyView();
     });
 
     probeBtn.addEventListener('click', function () {
@@ -453,7 +646,7 @@ export function openSelectDialog(entries, options) {
         pending = onProbeSizes(unknown, { setRowSize: setRowSizeInternal });
       } catch (err) {
         probeBtn.disabled = false;
-        setHint('体积获取失败：' + ((err && err.message) || String(err)));
+        setHint('体积获取失败：' + redactUrlText(String((err && err.message) || err)));
         return;
       }
       Promise.resolve(pending).then(
@@ -463,7 +656,7 @@ export function openSelectDialog(entries, options) {
         },
         function (err) {
           probeBtn.disabled = false;
-          setHint('体积获取失败：' + ((err && err.message) || String(err)));
+          setHint('体积获取失败：' + redactUrlText(String((err && err.message) || err)));
         }
       );
     });
@@ -478,13 +671,16 @@ export function openSelectDialog(entries, options) {
         }
       }
       renderPaths();
+      renderMode();
       renderTotals();
     });
 
     buildTree();
     renderPaths();
+    renderMode();
     syncFolders();
     renderTotals();
+    applyView();
 
     document.addEventListener('keydown', onKeyDown, true);
     (document.body || document.documentElement).appendChild(overlay);

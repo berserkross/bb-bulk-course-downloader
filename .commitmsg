@@ -1,8 +1,0 @@
-M1: 递归扫描、选择对话框、流式落盘（FSA / a[download]）
-
-- src/bb: listContent 解析、有界并发扫描（content_id 防环 + 抖动）、会话失效识别、文件名清洗
-- src/sinks: Sink 抽象。fs sink 用 File System Access 边下边写，内存只留一个 chunk；
-  无 FSA 时退化为 a[download] 逐个交给浏览器下载管理器；runPool 有界并发
-- src/ui: 常驻面板 + 扫描后选择对话框（文件夹树、勾选、按需探测体积、目录结构开关）
-- src/index.js: 扫描 > 选择 > 落盘 的接线，体积用 Range: bytes=0-0 按需探测
-- tests: 55 个单测 + 2 个 jsdom 集成测试（在 dist 产物上跑挂载与递归扫描）
