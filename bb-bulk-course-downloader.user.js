@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BB 课件批量下载
 // @namespace    bb-bulk-course-downloader
-// @version      2.4.0
+// @version      2.5.0
 // @description  扫描 Blackboard 课程内容，勾选后按原始目录结构批量下载课件
 // @updateURL    https://raw.githubusercontent.com/berserkross/bb-bulk-course-downloader/main/bb-bulk-course-downloader.user.js
 // @downloadURL  https://raw.githubusercontent.com/berserkross/bb-bulk-course-downloader/main/bb-bulk-course-downloader.user.js
@@ -2589,6 +2589,8 @@
     minDelayMs: 150,
     maxDelayMs: 400,
     probeSizes: true,
+    // 面板默认收起：首次安装只留左下角一条，不把第三方页面挡住。
+    panelCollapsed: true,
     // ZIP 降级落盘的单包上限（200 MiB）：一个包装满就封口交给浏览器，内存上界就是一个包
     zipChunkBytes: 200 * 1024 * 1024
   };
@@ -2904,25 +2906,59 @@
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
 }
 
-/* ---------- \u6298\u53E0\u5C0F\u5706\u94AE ---------- */
+/* ---------- \u6536\u8D77\u72B6\u6001\u6761\uFF08\u9ED8\u8BA4\u5F62\u6001\uFF09\uFF1A\u2264240\xD744\uFF0C\u56FA\u5B9A\u5728\u5DE6\u4E0B\u89D2 ---------- */
 .bbdl-fab {
   display: none;
-  width: 52px;
-  height: 52px;
-  border-radius: 50%;
+  position: fixed;
+  left: 16px;
+  bottom: 16px;
+  box-sizing: border-box;
+  max-width: 240px;
+  height: 44px;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px;
   border: 1px solid var(--bbdl-line);
+  border-radius: 10px;
   background: var(--bbdl-bg);
   color: var(--bbdl-fg);
   box-shadow: 0 10px 26px rgba(0, 0, 0, 0.45);
   cursor: pointer;
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
   line-height: 1.15;
-  padding: 0;
+  text-align: left;
+  /* \u6BD4 .bbdl-panel \u4F4E\u4E00\u6863\uFF082147483000\uFF09\uFF1A\u6761\u6C38\u8FDC\u538B\u4E0D\u4F4F\u5B8C\u6574\u9762\u677F */
+  z-index: 2147482999;
 }
 
 .bbdl-panel--collapsed .bbdl-fab {
-  display: block;
+  display: flex;
+}
+
+.bbdl-fab__title {
+  white-space: nowrap;
+}
+
+/* \u72B6\u6001\u5B57\uFF1A\u6CA1\u5185\u5BB9\u5C31\u6574\u5757\u4E0D\u5360\u4F4D\uFF08:empty\uFF09\uFF0C\u6709\u5185\u5BB9\u6700\u591A 96px \u540E\u7701\u7565\u3002 */
+.bbdl-fab__status {
+  display: none;
+  max-width: 96px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--bbdl-muted);
+  font-weight: 500;
+}
+
+.bbdl-fab__status:not(:empty) {
+  display: inline-block;
+}
+
+.bbdl-fab__hint {
+  white-space: nowrap;
+  color: var(--bbdl-accent);
+  font-weight: 500;
 }
 
 /* ---------- \u9009\u62E9\u5BF9\u8BDD\u6846 ---------- */
@@ -3762,6 +3798,7 @@
     let fileMap = /* @__PURE__ */ new Map();
     let haltText = "";
     let haltPendingCount = 0;
+    let downloadNote = "";
     const root = node("div", "bbdl-panel");
     root.dataset.state = "idle";
     root.setAttribute("role", "complementary");
@@ -3882,13 +3919,20 @@
     body.appendChild(summaryEl);
     card.appendChild(head);
     card.appendChild(body);
-    const fab = button("bbdl-fab", "expand", "BB\n\u4E0B\u8F7D");
+    const fab = button("bbdl-fab", "expand", "");
     fab.title = "\u5C55\u5F00\u9762\u677F";
-    fab.textContent = "BB \u4E0B\u8F7D";
+    fab.setAttribute("aria-expanded", "false");
+    const fabTitleEl = node("span", "bbdl-fab__title", "BB \u6279\u91CF\u4E0B\u8F7D");
+    const fabStatusEl = node("span", "bbdl-fab__status");
+    const fabHintEl = node("span", "bbdl-fab__hint", "\u70B9\u51FB\u5C55\u5F00");
+    fab.appendChild(fabTitleEl);
+    fab.appendChild(fabStatusEl);
+    fab.appendChild(fabHintEl);
     root.appendChild(card);
     root.appendChild(fab);
     const host = document.body || document.documentElement;
     host.appendChild(root);
+    setCollapsed(settings.panelCollapsed !== false, { persist: false });
     function clearWatchdog() {
       if (watchdog) {
         clearTimeout(watchdog);
@@ -3932,6 +3976,7 @@
       }
       statusEl.textContent = view.status;
       progressEl.hidden = next !== "scanning" && next !== "downloading";
+      refreshFabStatus();
       if (next === "scanning" || next === "downloading") {
         summaryEl.hidden = true;
         summaryEl.textContent = "";
@@ -3946,6 +3991,22 @@
       } catch (err) {
         render("error", { message: err && err.message || String(err) });
       }
+    }
+    function setCollapsed(collapsed, options2) {
+      const next = !!collapsed;
+      root.classList.toggle("bbdl-panel--collapsed", next);
+      fab.setAttribute("aria-expanded", next ? "false" : "true");
+      if (!options2 || options2.persist !== false) emitSettings({ panelCollapsed: next });
+    }
+    function refreshFabStatus() {
+      if (destroyed) return;
+      let text = "";
+      if (haltText) text = "\u5DF2\u6682\u505C";
+      else if (current === "error") text = "\u51FA\u9519";
+      else if (current === "downloading") text = downloadNote || "\u4E0B\u8F7D\u4E2D";
+      else if (current === "scanning") text = "\u626B\u63CF\u4E2D";
+      fabStatusEl.textContent = text;
+      fabStatusEl.title = text;
     }
     probeInput.addEventListener("change", function() {
       emitSettings({ probeSizes: probeInput.checked });
@@ -3978,10 +4039,10 @@
       if (el.disabled) return;
       switch (el.dataset.act) {
         case "collapse":
-          root.classList.add("bbdl-panel--collapsed");
+          setCollapsed(true);
           break;
         case "expand":
-          root.classList.remove("bbdl-panel--collapsed");
+          setCollapsed(false);
           break;
         case "scan":
           if (onScan) onScan();
@@ -4007,7 +4068,10 @@
     });
     function setState(state, extra) {
       clearWatchdog();
-      if (state === "scanning" || state === "downloading") haltPendingCount = 0;
+      if (state === "scanning" || state === "downloading") {
+        haltPendingCount = 0;
+        downloadNote = "";
+      }
       const nextContext = {};
       if (extra && typeof extra.count === "number") nextContext.entryCount = extra.count;
       else if (extra && typeof extra.entryCount === "number") nextContext.entryCount = extra.entryCount;
@@ -4045,6 +4109,8 @@
       if (failedCount) text += " \xB7 \u5931\u8D25 " + failedCount;
       progressTextEl.textContent = text;
       progressTextEl.title = text;
+      downloadNote = filesTotal > 0 ? "\u4E0B\u8F7D " + filesDone + "/" + filesTotal : "\u4E0B\u8F7D\u4E2D";
+      refreshFabStatus();
       const now = Date.now();
       if (!sample || now - sample.at >= 800) sample = { at: now, bytes: bytesDone };
     }
@@ -4383,6 +4449,7 @@
       haltPendingCount = pending;
       haltText = "\u767B\u5F55\u5DF2\u8FC7\u671F\uFF0C\u5DF2\u6682\u505C\u3002\u5237\u65B0\u9875\u9762\u91CD\u65B0\u767B\u5F55\u540E\u518D\u7EE7\u7EED\uFF08" + pending + " \u4E2A\u672A\u4E0B\u8F7D\uFF09\u3002";
       paintHalt();
+      refreshFabStatus();
     }
     function clearHalted() {
       if (destroyed) return;
@@ -4390,6 +4457,7 @@
       haltText = "";
       haltEl.textContent = "";
       haltEl.hidden = true;
+      refreshFabStatus();
     }
     function applyFileEvent(event) {
       if (destroyed) return;
@@ -5430,9 +5498,15 @@
           return;
         }
         Promise.resolve(pending).then(
-          function() {
+          function(report) {
             probeBtn.disabled = false;
-            setHint("\u4F53\u79EF\u5DF2\u66F4\u65B0\u3002");
+            const failed = report && Number.isFinite(report.fail) ? report.fail : 0;
+            if (!failed) {
+              setHint("\u4F53\u79EF\u5DF2\u66F4\u65B0\u3002");
+              return;
+            }
+            const reason = report && report.firstError ? "\uFF1A" + redactUrlText(String(report.firstError)) : "";
+            setHint("\u4F53\u79EF\u5DF2\u66F4\u65B0\uFF08" + failed + " \u4E2A\u4F53\u79EF\u63A2\u6D4B\u5931\u8D25\uFF09" + reason);
           },
           function(err) {
             probeBtn.disabled = false;
@@ -5484,6 +5558,10 @@
   var MAX_SCAN_HISTORY = 10;
   var MAX_CHANGED_PATHS = 50;
   var SINK_DEFAULTS = { idleTimeoutMs: 3e4, fileRetries: 1, serializeOverBytes: 48 * 1024 * 1024 };
+  var SINK_LABELS = { fs: "\u4FDD\u5B58\u5230\u6587\u4EF6\u5939", zip: "\u6253\u5305\u6210 ZIP", download: "\u6D4F\u89C8\u5668\u4E0B\u8F7D" };
+  function sinkLabel(kind) {
+    return SINK_LABELS[kind] || String(kind || "\u672A\u77E5");
+  }
   var PERMISSION_TEXT = {
     prompt: "\u6D4F\u89C8\u5668\u8FD8\u9700\u8981\u4F60\u518D\u786E\u8BA4\u4E00\u6B21\u76EE\u5F55\u6743\u9650",
     denied: "\u6D4F\u89C8\u5668\u62D2\u7EDD\u4E86\u76EE\u5F55\u6743\u9650",
@@ -5912,22 +5990,40 @@
       const fetcher = createFetcher2({ signal: controller.signal });
       const queue = list.slice();
       const width = Math.max(1, Math.min(settings.probeConcurrency || 6, queue.length));
+      const report = { ok: 0, fail: 0, firstError: "" };
+      function noteFailure(err) {
+        report.fail += 1;
+        if (report.firstError) return;
+        const raw = err && err.message ? err.message : err ? String(err) : "";
+        report.firstError = raw ? redactUrls(raw) : "\u63A2\u6D4B\u8BF7\u6C42\u6CA1\u6709\u8FD4\u56DE\u4F53\u79EF\uFF08\u54CD\u5E94\u7F3A\u5C11\u957F\u5EA6\uFF0C\u6216 Range \u88AB\u62D2\u7EDD\uFF09";
+      }
       async function worker() {
         for (; ; ) {
           if (controller.signal.aborted) return;
           const entry = queue.shift();
           if (!entry) return;
-          const size = await fetcher.probeSize(entry.url);
+          let size;
+          try {
+            size = await fetcher.probeSize(entry.url);
+          } catch (err) {
+            if (controller.signal.aborted) return;
+            noteFailure(err);
+            continue;
+          }
           if (typeof size === "number") {
+            report.ok += 1;
             if (isKnownSize(size) && entry.id !== null && entry.id !== void 0 && entry.id !== "") {
               state.probedSizes.set(String(entry.id), size);
             }
             api.setRowSize(entry.id, size);
+          } else {
+            noteFailure(null);
           }
         }
       }
       await Promise.all(Array.from({ length: width }, worker));
-      return controller;
+      if (report.fail > 0) console.warn("[bbdl] \u4F53\u79EF\u63A2\u6D4B\u5931\u8D25", { fail: report.fail, reason: report.firstError });
+      return report;
     }
     async function startDownload() {
       if (state.busy || !state.entries.length) return null;
@@ -5994,24 +6090,59 @@
         state.busy = false;
       }
     }
+    let zeroWork = null;
     async function runDownload(entries, dirHandle, signal, options) {
       const opts = options || {};
       const sink = await createSink2({ settings, dirHandle, signal, total: entries.length, sizeOf });
       const fetcher = createFetcher2({ signal });
       if (opts.seedFiles !== false && typeof panel.setFiles === "function") panel.setFiles(entries);
-      return sink.download(entries, fetcher, {
+      console.info("[bbdl] \u5F00\u59CB\u4E0B\u8F7D", { sink: sink.kind, entries: entries.length });
+      const result = await sink.download(entries, fetcher, {
         onProgress,
         // 原样转发：事件字段由 panel 解释，这里既不裁剪也不改形状。
         onFileEvent(event) {
           if (typeof panel.applyFileEvent === "function") panel.applyFileEvent(event);
         }
       });
+      console.info("[bbdl] \u6279\u6B21\u7ED3\u675F", {
+        sink: sink.kind,
+        ok: result && Array.isArray(result.ok) ? result.ok.length : 0,
+        failed: result && Array.isArray(result.failed) ? result.failed.length : 0,
+        aborted: !!(result && result.aborted),
+        halted: !!(result && result.halted)
+      });
+      zeroWork = describeZeroWork(result, entries.length, sink.kind);
+      return result;
+    }
+    function describeZeroWork(result, total, sinkKind) {
+      if (!result || !total) return null;
+      const ok = Array.isArray(result.ok) ? result.ok.length : 0;
+      const failed = Array.isArray(result.failed) ? result.failed.length : 0;
+      if (ok || failed || result.aborted || result.halted) return null;
+      return { sink: String(sinkKind || "\u672A\u77E5"), entries: total, total };
     }
     async function finishDownload(result) {
       await flushRecords();
       const halted = result ? result.halted : null;
       state.haltedPending = rememberHalted(halted);
-      panel.showSummary(resultForPanel(result, state.haltedPending));
+      const zero = zeroWork;
+      zeroWork = null;
+      if (zero) {
+        console.error("[bbdl] zero-work", {
+          sink: zero.sink,
+          entries: zero.entries,
+          total: zero.total,
+          ok: 0,
+          failed: 0,
+          aborted: false,
+          halted: null
+        });
+        panel.fail(
+          "\u6CA1\u6709\u5F00\u59CB\u4EFB\u4F55\u6587\u4EF6\uFF1A\u63D0\u4EA4 " + zero.entries + " \u4E2A\u6587\u4EF6\uFF0C\u843D\u76D8\u65B9\u5F0F\uFF1A" + sinkLabel(zero.sink) + "\uFF0C\u6210\u529F 0\u3001\u5931\u8D25 0\u3002\u8BF7\u628A\u63A7\u5236\u53F0\u91CC [bbdl] \u5F00\u5934\u7684\u65E5\u5FD7\u53D1\u7ED9\u5F00\u53D1\u8005\u3002"
+        );
+      } else {
+        panel.showSummary(resultForPanel(result, state.haltedPending));
+      }
       noticePartialPackages(result);
       return result;
     }

@@ -292,25 +292,59 @@ export const CSS = `
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
 }
 
-/* ---------- 折叠小圆钮 ---------- */
+/* ---------- 收起状态条（默认形态）：≤240×44，固定在左下角 ---------- */
 .bbdl-fab {
   display: none;
-  width: 52px;
-  height: 52px;
-  border-radius: 50%;
+  position: fixed;
+  left: 16px;
+  bottom: 16px;
+  box-sizing: border-box;
+  max-width: 240px;
+  height: 44px;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px;
   border: 1px solid var(--bbdl-line);
+  border-radius: 10px;
   background: var(--bbdl-bg);
   color: var(--bbdl-fg);
   box-shadow: 0 10px 26px rgba(0, 0, 0, 0.45);
   cursor: pointer;
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
   line-height: 1.15;
-  padding: 0;
+  text-align: left;
+  /* 比 .bbdl-panel 低一档（2147483000）：条永远压不住完整面板 */
+  z-index: 2147482999;
 }
 
 .bbdl-panel--collapsed .bbdl-fab {
-  display: block;
+  display: flex;
+}
+
+.bbdl-fab__title {
+  white-space: nowrap;
+}
+
+/* 状态字：没内容就整块不占位（:empty），有内容最多 96px 后省略。 */
+.bbdl-fab__status {
+  display: none;
+  max-width: 96px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--bbdl-muted);
+  font-weight: 500;
+}
+
+.bbdl-fab__status:not(:empty) {
+  display: inline-block;
+}
+
+.bbdl-fab__hint {
+  white-space: nowrap;
+  color: var(--bbdl-accent);
+  font-weight: 500;
 }
 
 /* ---------- 选择对话框 ---------- */

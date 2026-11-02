@@ -1161,9 +1161,16 @@ export function openSelectDialog(entries, options) {
         return;
       }
       Promise.resolve(pending).then(
-        function () {
+        function (report) {
           probeBtn.disabled = false;
-          setHint('体积已更新。');
+          const failed = report && Number.isFinite(report.fail) ? report.fail : 0;
+          if (!failed) {
+            setHint('体积已更新。');
+            return;
+          }
+          // 有失败时必须说出来：只显示「已更新」会让「永远未知」看起来像正常结果。
+          const reason = report && report.firstError ? '：' + redactUrlText(String(report.firstError)) : '';
+          setHint('体积已更新（' + failed + ' 个体积探测失败）' + reason);
         },
         function (err) {
           probeBtn.disabled = false;

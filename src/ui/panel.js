@@ -393,6 +393,8 @@ export function mountPanel(options) {
   let haltText = '';
   /** 停机时没下载到的文件数（0 = 没停机）：顶部状态行与摘要头都靠它让位给「已暂停」。 */
   let haltPendingCount = 0;
+  /** 收起条上的下载进度短串（如「下载 12/132」）：setDownloadProgress 维护，render 不重算。 */
+  let downloadNote = '';
 
   const root = node('div', 'bbdl-panel');
   root.dataset.state = 'idle';
@@ -539,15 +541,24 @@ export function mountPanel(options) {
   card.appendChild(head);
   card.appendChild(body);
 
-  const fab = button('bbdl-fab', 'expand', 'BB\n下载');
+  // 收起态不是圆钮而是一条 ≤240×44 的条：标题 + 一行极短状态字 + 展开提示。
+  const fab = button('bbdl-fab', 'expand', '');
   fab.title = '展开面板';
-  fab.textContent = 'BB 下载';
+  fab.setAttribute('aria-expanded', 'false');
+  const fabTitleEl = node('span', 'bbdl-fab__title', 'BB 批量下载');
+  const fabStatusEl = node('span', 'bbdl-fab__status');
+  const fabHintEl = node('span', 'bbdl-fab__hint', '点击展开');
+  fab.appendChild(fabTitleEl);
+  fab.appendChild(fabStatusEl);
+  fab.appendChild(fabHintEl);
 
   root.appendChild(card);
   root.appendChild(fab);
 
   const host = document.body || document.documentElement;
   host.appendChild(root);
+  // 挂载时只按已存设置应用形态，绝不反写 settings（刷新后保持上次状态）。
+  setCollapsed(settings.panelCollapsed !== false, { persist: false });
 
   function clearWatchdog() {
     if (watchdog) {
@@ -600,6 +611,8 @@ export function mountPanel(options) {
 
     statusEl.textContent = view.status;
     progressEl.hidden = next !== 'scanning' && next !== 'downloading';
+    // 收起态只剩一条：状态字必须跟着状态机走，否则条上永远看不出在干什么。
+    refreshFabStatus();
 
     if (next === 'scanning' || next === 'downloading') {
       summaryEl.hidden = true;
@@ -616,6 +629,29 @@ export function mountPanel(options) {
     } catch (err) {
       render('error', { message: (err && err.message) || String(err) });
     }
+  }
+
+  /**
+   * 收起 / 展开：只改类名与 aria，不重建 DOM。
+   * persist:false 用于挂载时应用已存设置——那次不该写回。
+   */
+  function setCollapsed(collapsed, options) {
+    const next = !!collapsed;
+    root.classList.toggle('bbdl-panel--collapsed', next);
+    fab.setAttribute('aria-expanded', next ? 'false' : 'true');
+    if (!options || options.persist !== false) emitSettings({ panelCollapsed: next });
+  }
+
+  /** 收起条那一行极短状态字：停机 > 出错 > 下载 x/y > 扫描中；都没有就整块不占位。 */
+  function refreshFabStatus() {
+    if (destroyed) return;
+    let text = '';
+    if (haltText) text = '已暂停';
+    else if (current === 'error') text = '出错';
+    else if (current === 'downloading') text = downloadNote || '下载中';
+    else if (current === 'scanning') text = '扫描中';
+    fabStatusEl.textContent = text;
+    fabStatusEl.title = text;
   }
 
   probeInput.addEventListener('change', function () {
@@ -653,10 +689,10 @@ export function mountPanel(options) {
 
     switch (el.dataset.act) {
       case 'collapse':
-        root.classList.add('bbdl-panel--collapsed');
+        setCollapsed(true);
         break;
       case 'expand':
-        root.classList.remove('bbdl-panel--collapsed');
+        setCollapsed(false);
         break;
       case 'scan':
         if (onScan) onScan();
@@ -685,8 +721,11 @@ export function mountPanel(options) {
 
   function setState(state, extra) {
     clearWatchdog();
-    // 新一轮开始（扫描 / 下载）：上一批的停机数字不许泄漏进来。
-    if (state === 'scanning' || state === 'downloading') haltPendingCount = 0;
+    // 新一轮开始（扫描 / 下载）：上一批的停机数字与进度短串都不许泄漏进来。
+    if (state === 'scanning' || state === 'downloading') {
+      haltPendingCount = 0;
+      downloadNote = '';
+    }
     const nextContext = {};
     if (extra && typeof extra.count === 'number') nextContext.entryCount = extra.count;
     else if (extra && typeof extra.entryCount === 'number') nextContext.entryCount = extra.entryCount;
@@ -729,6 +768,8 @@ export function mountPanel(options) {
     if (failedCount) text += ' · 失败 ' + failedCount;
     progressTextEl.textContent = text;
     progressTextEl.title = text;
+    downloadNote = filesTotal > 0 ? '下载 ' + filesDone + '/' + filesTotal : '下载中';
+    refreshFabStatus();
 
     // 采样窗口 ≥ 800ms：太密的样本会把速率算成噪声，太稀又会长时间不刷新 ETA。
     const now = Date.now();
@@ -1129,6 +1170,7 @@ export function mountPanel(options) {
     haltPendingCount = pending;
     haltText = '登录已过期，已暂停。刷新页面重新登录后再继续（' + pending + ' 个未下载）。';
     paintHalt();
+    refreshFabStatus();
   }
 
   function clearHalted() {
@@ -1137,6 +1179,7 @@ export function mountPanel(options) {
     haltText = '';
     haltEl.textContent = '';
     haltEl.hidden = true;
+    refreshFabStatus();
   }
 
   /** 逐文件事件：只按 entryId 更新自己那一行，重试计数天然互不污染。 */

@@ -7,6 +7,8 @@ export const DEFAULTS = {
   minDelayMs: 150,
   maxDelayMs: 400,
   probeSizes: true,
+  // 面板默认收起：首次安装只留左下角一条，不把第三方页面挡住。
+  panelCollapsed: true,
   // ZIP 降级落盘的单包上限（200 MiB）：一个包装满就封口交给浏览器，内存上界就是一个包
   zipChunkBytes: 200 * 1024 * 1024
 };

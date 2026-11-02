@@ -5,7 +5,7 @@ import {
   listExistingFiles as defaultListExistingFiles,
   pickDirectory as defaultPickDirectory
 } from './sinks/index.js';
-import { planBatch, relativePath } from './sinks/shared.js';
+import { planBatch, redactUrls, relativePath } from './sinks/shared.js';
 import { buildEntryPath, dedupePaths, sanitizeSegment } from './bb/files.js';
 import { loadSettings, saveSettings } from './store.js';
 import { mountPanel as defaultMountPanel } from './ui/panel.js';
@@ -28,6 +28,13 @@ const MAX_CHANGED_PATHS = 50;
 
 /** 落盘层参数只补默认值（不新增 UI 控件）：用户在面板里能看到的两项不在此列。 */
 const SINK_DEFAULTS = { idleTimeoutMs: 30000, fileRetries: 1, serializeOverBytes: 48 * 1024 * 1024 };
+
+/** 落盘方式的用户可读名：只用来组一句话，不参与任何分支判断。 */
+const SINK_LABELS = { fs: '保存到文件夹', zip: '打包成 ZIP', download: '浏览器下载' };
+
+function sinkLabel(kind) {
+  return SINK_LABELS[kind] || String(kind || '未知');
+}
 
 const PERMISSION_TEXT = {
   prompt: '浏览器还需要你再确认一次目录权限',
@@ -574,25 +581,47 @@ export function createController(config) {
     const fetcher = createFetcher({ signal: controller.signal });
     const queue = list.slice();
     const width = Math.max(1, Math.min(settings.probeConcurrency || 6, queue.length));
+    // 失败过去被整个吞掉，「获取体积」就永远显示未知且没有原因：这里如实记数并留第一条原因。
+    const report = { ok: 0, fail: 0, firstError: '' };
+
+    function noteFailure(err) {
+      report.fail += 1;
+      if (report.firstError) return;
+      const raw = err && err.message ? err.message : err ? String(err) : '';
+      // 原因里可能带完整 URL：进对话框与控制台之前，先用既有脱敏函数抹掉 query。
+      report.firstError = raw ? redactUrls(raw) : '探测请求没有返回体积（响应缺少长度，或 Range 被拒绝）';
+    }
 
     async function worker() {
       for (;;) {
         if (controller.signal.aborted) return;
         const entry = queue.shift();
         if (!entry) return;
-        const size = await fetcher.probeSize(entry.url);
+        let size;
+        try {
+          size = await fetcher.probeSize(entry.url);
+        } catch (err) {
+          if (controller.signal.aborted) return;
+          noteFailure(err);
+          continue;
+        }
         if (typeof size === 'number') {
+          report.ok += 1;
           // 探测结果先落进控制器自己的索引：对话框关闭后它才是落盘层的体积来源。
           if (isKnownSize(size) && entry.id !== null && entry.id !== undefined && entry.id !== '') {
             state.probedSizes.set(String(entry.id), size);
           }
           api.setRowSize(entry.id, size);
+        } else {
+          noteFailure(null);
         }
       }
     }
 
     await Promise.all(Array.from({ length: width }, worker));
-    return controller;
+    // 整批一条 warn：有失败才打，绝不逐文件刷屏。
+    if (report.fail > 0) console.warn('[bbdl] 体积探测失败', { fail: report.fail, reason: report.firstError });
+    return report;
   }
 
   /* ---------------- 下载 ---------------- */
@@ -674,6 +703,9 @@ export function createController(config) {
     }
   }
 
+  /** 本批次的零工作量证据：runDownload 写、finishDownload 读一次就清。 */
+  let zeroWork = null;
+
   async function runDownload(entries, dirHandle, signal, options) {
     const opts = options || {};
     const sink = await createSink({ settings, dirHandle, signal, total: entries.length, sizeOf: sizeOf });
@@ -681,13 +713,37 @@ export function createController(config) {
     // 种子行必须在 sink.download 之前、且只种这一次：panel 不为陌生 entryId 造行，
     // 漏了这一步逐文件事件会全部落空。续跑（resumePending）传 seedFiles:false —— 列表原样保留。
     if (opts.seedFiles !== false && typeof panel.setFiles === 'function') panel.setFiles(entries);
-    return sink.download(entries, fetcher, {
+    // 每批次各一条：只打结构化对象，绝不打 URL（用户靠控制台 [bbdl] 前缀自查）。
+    console.info('[bbdl] 开始下载', { sink: sink.kind, entries: entries.length });
+    const result = await sink.download(entries, fetcher, {
       onProgress,
       // 原样转发：事件字段由 panel 解释，这里既不裁剪也不改形状。
       onFileEvent(event) {
         if (typeof panel.applyFileEvent === 'function') panel.applyFileEvent(event);
       }
     });
+    console.info('[bbdl] 批次结束', {
+      sink: sink.kind,
+      ok: result && Array.isArray(result.ok) ? result.ok.length : 0,
+      failed: result && Array.isArray(result.failed) ? result.failed.length : 0,
+      aborted: !!(result && result.aborted),
+      halted: !!(result && result.halted)
+    });
+    // 判定留在收尾之前：只有 finishDownload 写摘要，这里只留证据。
+    zeroWork = describeZeroWork(result, entries.length, sink.kind);
+    return result;
+  }
+
+  /**
+   * 一个文件都没处理、也没报错 —— 这种结果过去会落进「下载完成：成功 0 个，失败 0 个」，
+   * 用户看不出什么都没发生。返回证据交给 finishDownload；正常完成 / 部分失败 / 取消 / 停机一律 null。
+   */
+  function describeZeroWork(result, total, sinkKind) {
+    if (!result || !total) return null;
+    const ok = Array.isArray(result.ok) ? result.ok.length : 0;
+    const failed = Array.isArray(result.failed) ? result.failed.length : 0;
+    if (ok || failed || result.aborted || result.halted) return null;
+    return { sink: String(sinkKind || '未知'), entries: total, total: total };
   }
 
   /* ---------------- 停机 / 收尾 ---------------- */
@@ -701,7 +757,26 @@ export function createController(config) {
     await flushRecords();
     const halted = result ? result.halted : null;
     state.haltedPending = rememberHalted(halted);
-    panel.showSummary(resultForPanel(result, state.haltedPending));
+    // 零工作量必须走错误态：摘要行「成功 0 个，失败 0 个」会把「什么都没发生」写成完成。
+    const zero = zeroWork;
+    zeroWork = null;
+    if (zero) {
+      console.error('[bbdl] zero-work', {
+        sink: zero.sink,
+        entries: zero.entries,
+        total: zero.total,
+        ok: 0,
+        failed: 0,
+        aborted: false,
+        halted: null
+      });
+      panel.fail(
+        '没有开始任何文件：提交 ' + zero.entries + ' 个文件，落盘方式：' + sinkLabel(zero.sink) +
+          '，成功 0、失败 0。请把控制台里 [bbdl] 开头的日志发给开发者。'
+      );
+    } else {
+      panel.showSummary(resultForPanel(result, state.haltedPending));
+    }
     noticePartialPackages(result);
     return result;
   }
