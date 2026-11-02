@@ -61,6 +61,28 @@ function mount() {
     }
   }
 
+  // 体积靠 Range: bytes=0-0 单独探测，绝不为此下载文件本体。
+  // 只在对话框打开时按需触发，且有界并发，避免 300 个文件瞬间打 300 个请求。
+  async function probeSizes(list, api) {
+    const controller = new AbortController();
+    const fetcher = createFetcher({ signal: controller.signal });
+    const queue = list.slice();
+    const width = Math.max(1, Math.min(settings.probeConcurrency || 6, queue.length));
+
+    async function worker() {
+      for (;;) {
+        if (controller.signal.aborted) return;
+        const entry = queue.shift();
+        if (!entry) return;
+        const size = await fetcher.probeSize(entry.url);
+        if (typeof size === 'number') api.setRowSize(entry.id, size);
+      }
+    }
+
+    await Promise.all(Array.from({ length: width }, worker));
+    return controller;
+  }
+
   async function startDownload() {
     if (state.busy || !state.entries.length) return;
 
@@ -69,6 +91,7 @@ function mount() {
       choice = await openSelectDialog(state.entries, {
         settings,
         pickDirectory,
+        onProbeSizes: probeSizes,
         onSettingsChange(patch) {
           Object.assign(settings, saveSettings(patch));
         }
