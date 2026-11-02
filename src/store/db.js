@@ -243,6 +243,8 @@ export function makeStore({ indexedDB } = {}) {
       updatedAt: Date.now(),
       files
     };
+    // 扫描历史存在同一条清单记录里，并进下载结果时不能顺手丢掉，否则下载中途刷新页面历史就没了。
+    if (Array.isArray(base.scans)) next.scans = base.scans;
     await saveManifest(key, next);
     return next;
   }

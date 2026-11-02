@@ -273,6 +273,18 @@ test('mergeFiles 保留记录里已有的 path/name，只更新本次带来的�
   assert.equal(merged.files.a.size, 1234);
 });
 
+test('mergeFiles 并下载结果时保留清单里的扫描历史（防：下载进度一落库，IndexedDB 里的扫描历史被清空）', async () => {
+  const fake = makeFakeIdb();
+  const store = makeStore({ indexedDB: fake.indexedDB });
+  const scans = [{ at: 1234, diff: { added: 2, changed: 1, moved: 0, unchanged: 5, unknown: 0, stale: 1, total: 9 }, changedPaths: ['Week 1/a.pdf'] }];
+  await store.saveManifest('c', { courseId: 'c', version: 2, updatedAt: 1, files: {}, scans });
+  const merged = await store.mergeFiles('c', [{ id: 'a', status: 'done', size: 100 }]);
+  assert.deepEqual(merged.scans, scans);
+  const loaded = await store.loadManifest('c');
+  assert.deepEqual(loaded.scans, scans);
+  assert.equal(loaded.files.a.status, 'done');
+});
+
 test('mergeFiles 跳过没有 id 的脏记录，不写进清单（防：一条残缺的进度事件把清单变成不可用）', async () => {
   const fake = makeFakeIdb();
   const store = makeStore({ indexedDB: fake.indexedDB });

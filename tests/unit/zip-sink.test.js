@@ -678,3 +678,143 @@ test('zip sink：progressPayload 字段一个不少（事件是并列新增，�
   }
 });
 
+// ==================== partial seal（契约 §2 · M4-F2） ====================
+
+test('zip sink：partial seal —— 3 个文件里第 2 个永久失败，只交付含第 1 个的合法包，第 2、3 个进 failed', async () => {
+  const contents = { a: utf8.encode('alpha'), c: utf8.encode('charlie') };
+  const { sink, clicks, urlApi } = sinkWith({ settings: { preserveTree: true, fileRetries: 1 } });
+  const fetcher = makeFetcher(contents, {
+    fail: (url) => (url === 'b' ? new TypeError('网络中断') : null)
+  });
+  const events = [];
+  const list = [
+    entry({ id: '1', url: 'a', name: 'a.txt', folderPath: ['Week 1'] }),
+    entry({ id: '2', url: 'b', name: 'b.txt', folderPath: ['Week 1'] }),
+    entry({ id: '3', url: 'c', name: 'c.txt', folderPath: ['Week 1'] })
+  ];
+  const result = await sink.download(list, fetcher, { onFileEvent: (ev) => events.push(ev) });
+
+  // 已完整收下的那一条照常封包交付，包里只有它
+  assert.equal(clicks.length, 1);
+  assert.equal(clicks[0].download, 'Week 1.zip');
+  const entries = parseZip(await bytesOf(urlApi.made[0].blob));
+  assert.deepEqual(entries.map((e) => e.name), ['Week 1/a.txt']);
+  assert.equal(entries[0].usize, contents.a.length);
+  assert.equal(entries[0].crc, crc32(contents.a));
+  assert.deepEqual(Array.from(entries[0].data), Array.from(contents.a));
+  // 包体精确等于「一条 STORE 条目（local header + 名字 + 数据 + descriptor）+ 中央目录 + EOCD」：
+  // 失败条目一个字节都没留在包里；Blob 交出之后 pkg.parts 已经清空（内存上界仍是一个包）
+  const nameLen = utf8.encode('Week 1/a.txt').length;
+  assert.equal(urlApi.made[0].size, 30 + nameLen + contents.a.length + 16 + 46 + nameLen + 22);
+
+  // 账目：ok 只有第 1 个；failed 是第 2 个（真失败）+ 第 3 个（没机会开始），下次只重下这两条
+  assert.deepEqual(result.ok.map((e) => e.id), ['1']);
+  assert.deepEqual(result.failed.map((f) => f.entry.id), ['2', '3']);
+  assert.deepEqual(result.partialPackages, [{ name: 'Week 1.zip', saved: 1, missing: 2 }]);
+  assert.equal(result.aborted, false);
+  assert.equal(result.halted, null);
+  assert.equal(fetcher.attempts.get('b'), 2, 'fileRetries=1 → 2 次尝试都用尽才判永久失败');
+  assert.equal(fetcher.attempts.get('c'), undefined, '包已收口：第 3 个不再开新请求');
+
+  // 事件语义不变：已交付条目的 done 只发一次；失败条目各有一条 failed 事件
+  assert.deepEqual(events.filter((e) => e.type === 'done').map((e) => e.entryId), ['1']);
+  assert.deepEqual(events.filter((e) => e.type === 'failed').map((e) => e.entryId), ['2', '3']);
+  for (const ev of events.filter((e) => e.type === 'failed')) {
+    assert.ok(!/https?:|[?#]/.test(ev.error), '失败文案不带 URL / query：' + ev.error);
+  }
+  assertCleanPathName(events);
+});
+
+test('zip sink：partial seal —— 第 1 个就永久失败时不交付任何包，partialPackages 为空', async () => {
+  const contents = { b: utf8.encode('bravo'), c: utf8.encode('charlie') };
+  const { sink, clicks, urlApi } = sinkWith({ settings: { preserveTree: true, fileRetries: 0 } });
+  const fetcher = makeFetcher(contents, {
+    fail: (url) => (url === 'a' ? new TypeError('网络中断') : null)
+  });
+  const result = await sink.download(
+    [
+      entry({ id: '1', url: 'a', name: 'a.txt', folderPath: ['Week 1'] }),
+      entry({ id: '2', url: 'b', name: 'b.txt', folderPath: ['Week 1'] }),
+      entry({ id: '3', url: 'c', name: 'c.txt', folderPath: ['Week 1'] })
+    ],
+    fetcher
+  );
+
+  assert.equal(clicks.length, 0, '一个完整条目都没有，就不该交出一个空包');
+  assert.equal(urlApi.made.length, 0);
+  assert.deepEqual(result.ok, []);
+  // 整包作废：真正失败的那一条与没机会开始的两条都进 failed，下次只重下这几条
+  assert.deepEqual(result.failed.map((f) => f.entry.id), ['1', '2', '3']);
+  assert.deepEqual(result.partialPackages, []);
+});
+
+test('zip sink：全成功时 partialPackages 为空，包内条目齐全，字段是普通可枚举属性', async () => {
+  const contents = { a: utf8.encode('alpha'), b: utf8.encode('bravo'), c: utf8.encode('charlie') };
+  const { sink, clicks, urlApi } = sinkWith();
+  const result = await sink.download(
+    [
+      entry({ id: '1', url: 'a', name: 'a.txt', folderPath: ['Week 1'] }),
+      entry({ id: '2', url: 'b', name: 'b.txt', folderPath: ['Week 1'] }),
+      entry({ id: '3', url: 'c', name: 'c.txt', folderPath: ['Week 1'] })
+    ],
+    makeFetcher(contents)
+  );
+
+  assert.deepEqual(result.partialPackages, []);
+  assert.ok(Object.keys(result).includes('partialPackages'), 'partialPackages 必须是普通可枚举字段');
+  assert.equal(clicks.length, 1);
+  const entries = parseZip(await bytesOf(urlApi.made[0].blob));
+  assert.deepEqual(entries.map((e) => e.name), ['Week 1/a.txt', 'Week 1/b.txt', 'Week 1/c.txt']);
+  assert.deepEqual(result.failed, []);
+  assert.equal(result.ok.length, 3);
+});
+
+test('zip sink：会话过期优先于 partial seal —— 不产出 partialPackages，未开始的进 pending 不进 failed', async () => {
+  const contents = { a: utf8.encode('A'), b: utf8.encode('B'), c: utf8.encode('C') };
+  const { sink } = sinkWith({ settings: { preserveTree: true, fileRetries: 2 } });
+  const fetcher = makeFetcher(contents, {
+    fail: (url) => (url === 'b' ? new SessionExpiredError('会话已失效') : null)
+  });
+  const result = await sink.download(
+    [
+      entry({ id: '1', url: 'a', name: 'a.txt', folderPath: ['W'] }),
+      entry({ id: '2', url: 'b', name: 'b.txt', folderPath: ['W'] }),
+      entry({ id: '3', url: 'c', name: 'c.txt', folderPath: ['W'] })
+    ],
+    fetcher
+  );
+
+  assert.equal(result.halted.reason, 'session-expired');
+  assert.deepEqual(result.partialPackages, [], '停机不走 partial seal：这不是「部分交付」');
+  assert.deepEqual(result.failed, [], '停机不把没开始的条目记成失败');
+  assert.deepEqual(result.halted.pending.map((e) => e.id), ['2', '3']);
+});
+
+test('zip sink：partial seal 交付先于下一包开始取字节（内存上界仍是一个包），失败不牵连别的包', async () => {
+  const log = [];
+  const contents = { a: utf8.encode('A'), b: utf8.encode('B'), c: utf8.encode('C') };
+  const { sink, clicks } = sinkWith({ log, settings: { preserveTree: true, fileRetries: 0 } });
+  const fetcher = makeFetcher(contents, {
+    log,
+    fail: (url) => (url === 'b' ? new TypeError('网络中断') : null)
+  });
+  const result = await sink.download(
+    [
+      entry({ id: '1', url: 'a', name: 'a.txt', folderPath: ['Week 1'] }),
+      entry({ id: '2', url: 'b', name: 'b.txt', folderPath: ['Week 1'] }),
+      entry({ id: '3', url: 'c', name: 'c.txt', folderPath: ['Week 2'] })
+    ],
+    fetcher
+  );
+
+  assert.deepEqual(clicks.map((c) => c.download), ['Week 1.zip', 'Week 2.zip']);
+  // 第 1 个包封口交付之后，才轮到第 2 个包去取字节
+  assert.deepEqual(
+    log.filter((x) => x === 'click' || x.startsWith('fetch:')),
+    ['fetch:a', 'fetch:b', 'click', 'fetch:c', 'click']
+  );
+  assert.deepEqual(result.partialPackages, [{ name: 'Week 1.zip', saved: 1, missing: 1 }]);
+  assert.deepEqual(result.ok.map((e) => e.id), ['1', '3']);
+  assert.deepEqual(result.failed.map((f) => f.entry.id), ['2']);
+});
+

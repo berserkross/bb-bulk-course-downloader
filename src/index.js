@@ -5,11 +5,12 @@ import {
   listExistingFiles as defaultListExistingFiles,
   pickDirectory as defaultPickDirectory
 } from './sinks/index.js';
-import { planBatch } from './sinks/shared.js';
+import { planBatch, relativePath } from './sinks/shared.js';
 import { buildEntryPath, dedupePaths, sanitizeSegment } from './bb/files.js';
 import { loadSettings, saveSettings } from './store.js';
 import { mountPanel as defaultMountPanel } from './ui/panel.js';
 import { openSelectDialog as defaultOpenSelectDialog } from './ui/select.js';
+import { downloadTextFile as defaultDownloadTextFile, manifestFileName } from './bb/dom.js';
 
 /** files.js 是纯函数模块：注入给 planBatch，不让它自己去 import（与 sinks 的分层保持一致）。 */
 const files = { buildEntryPath, sanitizeSegment, dedupePaths };
@@ -20,6 +21,10 @@ const FILE_FAILED = 'file-failed';
 
 /** 清单落库节流：500ms 内的多条记录合并成一次写库，避免每个文件一次事务。 */
 const MANIFEST_FLUSH_MS = 500;
+
+/** 扫描历史：面板只列最近 5 条，清单里留 10 条，单次变更路径最多记 50 条。 */
+const MAX_SCAN_HISTORY = 10;
+const MAX_CHANGED_PATHS = 50;
 
 /** 落盘层参数只补默认值（不新增 UI 控件）：用户在面板里能看到的两项不在此列。 */
 const SINK_DEFAULTS = { idleTimeoutMs: 30000, fileRetries: 1, serializeOverBytes: 48 * 1024 * 1024 };
@@ -133,6 +138,12 @@ export function createController(config) {
   const planSkips = typeof deps.planSkips === 'function' ? deps.planSkips : null;
   const updateRecords = typeof deps.updateRecords === 'function' ? deps.updateRecords : null;
   const ensurePermission = typeof deps.ensureDirectoryPermission === 'function' ? deps.ensureDirectoryPermission : null;
+  const appendScanHistory = typeof deps.appendScanHistory === 'function' ? deps.appendScanHistory : null;
+  const exportManifestPack = typeof deps.exportManifestPack === 'function' ? deps.exportManifestPack : null;
+  const importManifestPack = typeof deps.importManifestPack === 'function' ? deps.importManifestPack : null;
+  const mergeManifests = typeof deps.mergeManifests === 'function' ? deps.mergeManifests : null;
+  /** 下载边界可注入：测试里换成收集器，真实运行时才碰 a[download]。 */
+  const writeDownload = typeof cfg.downloadTextFile === 'function' ? cfg.downloadTextFile : null;
 
   const listExistingFiles = typeof cfg.listExistingFiles === 'function' ? cfg.listExistingFiles : defaultListExistingFiles;
   const pickDirectory = typeof cfg.pickDirectory === 'function' ? cfg.pickDirectory : defaultPickDirectory;
@@ -190,6 +201,9 @@ export function createController(config) {
     onScan: startScan,
     onDownload: startDownload,
     onRetryFailed,
+    // 依赖缺失（或降级加载失败）时把行整个藏掉：面板不摆一个按了没反应的按钮。
+    onExportManifest: exportManifestPack ? exportManifest : null,
+    onImportManifest: importManifestPack ? importManifest : null,
     onResume: resumeLast,
     onResumePending: resumePending,
     onCancel() {
@@ -197,8 +211,14 @@ export function createController(config) {
     }
   });
 
+  // 常驻课程标识：优先课程名（调用方给的，或页面标题），取不到退回 courseId。
+  if (typeof panel.setCourse === 'function') panel.setCourse(courseId, cfg.courseName || pageTitle(doc));
+
   /** 上次的目录句柄 + 清单一起恢复；失败一律当「没有」处理，绝不拦住面板。 */
-  const ready = hydrate();
+  const ready = hydrate().then(function (value) {
+    pushHistory();
+    return value;
+  });
 
   async function safeCall(fn) {
     try {
@@ -536,6 +556,8 @@ export function createController(config) {
       panel.setState('scanned', { count: state.entries.length });
       // 契约：扫描完成后按「当前 plans + 清单 + 磁盘现状」算一次，结果交给对话框。
       await refreshSkips(null, signal);
+      // diff 算完才有历史可记；历史落库失败不该把扫描结果作废，所以内部自己吞异常。
+      await recordScan();
       return state.entries;
     } catch (err) {
       panel.fail(signal.aborted ? '已取消' : describe(err));
@@ -589,6 +611,9 @@ export function createController(config) {
       choice = await openSelectDialog(state.entries, {
         document: doc,
         settings,
+        // 勾选记忆按 (courseId, pageId) 分桶：换课程不串台，同一门课来回切各自保留。
+        courseId: courseId,
+        pageId: contentId,
         // 续接上次目录时不再弹选择器：直接把这个已授权的句柄交回去。
         pickDirectory: state.resumeHandle ? function () { return state.resumeHandle; } : pickDirectory,
         skipInfo: summary,
@@ -677,7 +702,29 @@ export function createController(config) {
     const halted = result ? result.halted : null;
     state.haltedPending = rememberHalted(halted);
     panel.showSummary(resultForPanel(result, state.haltedPending));
+    noticePartialPackages(result);
     return result;
+  }
+
+  /**
+   * 部分包提示：只数真·部分交付的包，字段缺失一律按空处理。
+   * 文案固定，不回显任何 URL / query；结果只走既有 notice 行，不新开弹窗。
+   */
+  function noticePartialPackages(result) {
+    const list = result && Array.isArray(result.partialPackages) ? result.partialPackages : [];
+    if (!list.length || typeof panel.setNotice !== 'function') return;
+    let missing = 0;
+    for (const pkg of list) {
+      const counts = Number.isFinite(pkg && pkg.missingCount) ? Math.max(0, Math.floor(pkg.missingCount)) : null;
+      // missingCount 缺席就可能连 missing 也没有：那时这一包按 0 缺计，绝不让整句变成 NaN。
+      // zip sink 给的是数字（这个包里彻底失败、没能进包的条数），旧形状给的是数组：两种都认。
+      const raw = pkg ? pkg.missing : null;
+      const files = Array.isArray(raw) ? raw.length : Number.isFinite(raw) ? Math.max(0, Math.floor(raw)) : 0;
+      missing += counts === null ? files : counts;
+    }
+    panel.setNotice(
+      '本次有 ' + list.length + ' 个包只交付了部分文件（共缺 ' + missing + ' 个），其余已记为失败可重试。'
+    );
   }
 
   /**
@@ -842,6 +889,207 @@ export function createController(config) {
     return state.manifest;
   }
 
+  /* ---------------- 扫描历史 / 导出 / 导入 ---------------- */
+
+  /** 课程名的第二来源：页面标题本身就是纯文本，不会带 query。 */
+  function pageTitle(doc) {
+    const raw = doc && typeof doc.title === 'string' ? doc.title.trim() : '';
+    return raw || '';
+  }
+
+  /** 内存里的扫描历史（newest first）：面板、getState、导入后刷新都读这一处。 */
+  function scans() {
+    return state.manifest && Array.isArray(state.manifest.scans) ? state.manifest.scans : [];
+  }
+
+  function pushHistory() {
+    if (typeof panel.setHistory !== 'function') return;
+    panel.setHistory(scans());
+  }
+
+  /** 一条历史快照：五分类取自已算好的 diff，变更路径取这次要下发的计划。 */
+  function scanSnapshot() {
+    const summary = state.skipSummary || {};
+    return {
+      at: Date.now(),
+      total: state.entries.length,
+      added: nonNegCount(summary.added),
+      changed: nonNegCount(summary.changed),
+      moved: nonNegCount(summary.moved),
+      unchanged: nonNegCount(summary.unchanged),
+      unknown: nonNegCount(summary.unknown),
+      stale: nonNegCount(summary.stale),
+      changedPaths: changedPathList(MAX_CHANGED_PATHS)
+    };
+  }
+
+  /**
+   * 变更路径：planSkips 的 diff 只给计数、不给分类后的路径，所以这里取「这次要下发的计划」，
+   * 一条 path 出错的计划只跳过它自己。上限由调用方给，服务层不再截断。
+   */
+  function changedPathList(limit) {
+    const todo = state.skipResult && Array.isArray(state.skipResult.todo) ? state.skipResult.todo : [];
+    const out = [];
+    for (const plan of todo) {
+      if (out.length >= limit) break;
+      if (!plan || !plan.entry || plan.entry.id === null || plan.entry.id === undefined) continue;
+      const id = String(plan.entry.id);
+      if (!id) continue;
+      let path = '';
+      try {
+        path = relativePath(plan);
+      } catch (err) {
+        continue;
+      }
+      out.push({ id: id, path: path });
+    }
+    return out;
+  }
+
+  /**
+   * 每轮扫描成功后落一条历史。
+   * 顺序是契约：updateRecords 先把 v1 清单升到 v2，appendScanHistory 才会保留 version，
+   * 最后才 saveManifest —— 反过来会存出一版 version 1 清单。
+   */
+  async function recordScan() {
+    if (!appendScanHistory) return state.manifest;
+    try {
+      const now = Date.now();
+      let manifest = state.manifest;
+      if (updateRecords) manifest = updateRecords(manifest, [], [], now) || manifest;
+      state.manifest = appendScanHistory(manifest, scanSnapshot(), MAX_SCAN_HISTORY) || manifest;
+    } catch (err) {
+      /* 历史是附加信息：算不出来也不能让「扫描成功」变成失败。 */
+      return state.manifest;
+    }
+    await saveManifestNow();
+    pushHistory();
+    return state.manifest;
+  }
+
+  async function saveManifestNow() {
+    if (!store || typeof store.saveManifest !== 'function') return state.manifest;
+    try {
+      await store.saveManifest(courseId, state.manifest);
+    } catch (err) {
+      /* 落库失败不改变内存里的历史：下一次仍然能接着记。 */
+    }
+    return state.manifest;
+  }
+
+  /** 导出：清单包 -> JSON 文本 -> a[download]；结果只走既有 notice 行。 */
+  function exportManifest() {
+    if (!exportManifestPack) {
+      panel.setNotice('当前环境不支持导出清单。');
+      return null;
+    }
+    let pack = null;
+    try {
+      pack = exportManifestPack({ courseId: courseId, manifest: state.manifest });
+    } catch (err) {
+      panel.setNotice('导出失败：清单没能生成。');
+      return null;
+    }
+    const text = JSON.stringify(pack, null, 2);
+    const fileName = manifestFileName(courseId);
+    let anchor = null;
+    try {
+      const write = writeDownload || defaultDownloadTextFile;
+      anchor = write(doc, text, fileName);
+    } catch (err) {
+      anchor = null;
+    }
+    const count = packFileCount(pack);
+    panel.setNotice(
+      anchor ? '已导出 ' + count + ' 条记录到 ' + fileName : '导出没成功：当前环境无法下载文件。'
+    );
+    return { pack: pack, text: text, fileName: fileName, count: count };
+  }
+
+  /** 导入：读文件 -> 解析 -> 合并当前课程 -> 落库；坏包只显示原因，绝不写库。 */
+  async function importManifest(file) {
+    if (!importManifestPack || !mergeManifests) {
+      panel.setNotice('当前环境不支持导入清单。');
+      return null;
+    }
+    const fail = function (reason) {
+      panel.setNotice('导入失败：' + reason);
+      return null;
+    };
+    let text = '';
+    try {
+      text = file && typeof file.text === 'function' ? await file.text() : '';
+    } catch (err) {
+      return fail('读不出这个文件');
+    }
+    let pack = null;
+    try {
+      pack = JSON.parse(text);
+    } catch (err) {
+      return fail('不是合法的 JSON 文件');
+    }
+    let result = null;
+    try {
+      result = importManifestPack(pack, Date.now());
+    } catch (err) {
+      return fail('清单文件无法识别');
+    }
+    if (!result || result.ok !== true) return fail((result && result.error) || '清单文件无法识别');
+
+    const incoming = incomingCourses(result);
+    if (!incoming.length) return fail('清单文件里没有任何课程');
+    // 单课程包就是这门课；多课程包只认当前课程，一门都对不上就报错、不写库。
+    const picked = incoming.length === 1
+      ? incoming
+      : incoming.filter((item) => String(item.courseId) === String(courseId));
+    if (!picked.length) return fail('这份清单里没有当前课程的记录');
+
+    let merged = state.manifest;
+    let imported = 0;
+    try {
+      for (const item of picked) {
+        // 导入结果的课程对象是 { courseId, manifest }：记录在 manifest.files 里，不是在 files 上。
+        imported += recordCount(item && item.manifest);
+        // 导入产出的清单不含 scans：必须先合并，否则扫描历史被清空。
+        merged = mergeManifests(merged, item && item.manifest) || merged;
+      }
+    } catch (err) {
+      return fail('清单文件无法合并');
+    }
+    state.manifest = merged;
+    await saveManifestNow();
+    pushHistory();
+    const total = recordCount(merged);
+    if (incoming.length === 1) panel.setNotice('已导入 ' + imported + ' 条记录（合并 ' + total + ' 条）');
+    else panel.setNotice('已导入 ' + picked.length + ' 门课（合并 ' + total + ' 条）');
+    return state.manifest;
+  }
+
+  /** importManifestPack 的两种成功形状：多课程给 courses，单课程给 course。 */
+  function incomingCourses(result) {
+    const r = result || {};
+    if (Array.isArray(r.courses)) return r.courses.filter((item) => item && typeof item === 'object');
+    if (r.course && typeof r.course === 'object') return [r.course];
+    return [];
+  }
+
+  /** 一份清单里的记录条数：files 是本工具唯一的记录容器。 */
+  function recordCount(manifest) {
+    const files = manifest && manifest.files && typeof manifest.files === 'object' ? manifest.files : null;
+    return files ? Object.keys(files).length : 0;
+  }
+
+  /** 记录条数：清单 files 是本工具唯一的记录容器。 */
+  function packFileCount(pack) {
+    const courses = pack && Array.isArray(pack.courses) ? pack.courses : [];
+    let total = 0;
+    for (const item of courses) {
+      const files = item && item.files && typeof item.files === 'object' ? item.files : null;
+      if (files) total += Object.keys(files).length;
+    }
+    return total;
+  }
+
   /* ---------------- 继续上次 ---------------- */
 
   /**
@@ -915,11 +1163,24 @@ export function createController(config) {
       diskChecked: state.diskChecked,
       diskTruncated: state.diskTruncated,
       /** 停机快照（给「刷新后继续」用）；非停机状态一律空数组。 */
-      haltedPending: state.haltedPending
+      haltedPending: state.haltedPending,
+      /** 扫描历史（newest first）：面板与验收都只看这一份。 */
+      scans: scans()
     };
   }
 
-  return { startScan, startDownload, onRetryFailed, resumePending, getState, ready, panel, flushRecords };
+  return {
+    startScan,
+    startDownload,
+    onRetryFailed,
+    resumePending,
+    getState,
+    ready,
+    panel,
+    flushRecords,
+    exportManifest,
+    importManifest
+  };
 }
 
 /**
@@ -939,6 +1200,10 @@ async function loadContractModules() {
     deps: {
       planSkips: planning.planSkips,
       updateRecords: manifestMod.updateRecords,
+      appendScanHistory: manifestMod.appendScanHistory,
+      exportManifestPack: manifestMod.exportManifestPack,
+      importManifestPack: manifestMod.importManifestPack,
+      mergeManifests: manifestMod.mergeManifests,
       ensureDirectoryPermission: permissions.ensureDirectoryPermission
     }
   };

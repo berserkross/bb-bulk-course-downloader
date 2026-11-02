@@ -101,17 +101,22 @@ test('resolveRepo：环境变量优先，但坏掉的候选会回落到 package.
   );
 });
 
-test('repoUrls：两个 URL 完全相同，都指向 releases/latest/download（产物不入库、分支名不参与）', () => {
-  const asset = 'https://github.com/alice/bb-dl/releases/latest/download/bb-bulk-course-downloader.user.js';
+test('repoUrls：两个 URL 逐字相同，都指向 raw 的 main 分支（产物入库自托管，不再走 Release）', () => {
+  const raw = 'https://raw.githubusercontent.com/alice/bb-dl/main/bb-bulk-course-downloader.user.js';
   const urls = repoUrls({ owner: 'alice', repo: 'bb-dl' });
 
-  assert.deepEqual(urls, { updateUrl: asset, downloadUrl: asset });
+  assert.deepEqual(urls, { updateUrl: raw, downloadUrl: raw });
+  // 逐字相同：篡改猴同时用这两行取更新，任何差异都会让两路指向不同内容。
   assert.equal(urls.updateUrl, urls.downloadUrl);
-  assert.doesNotMatch(urls.updateUrl, /raw\.githubusercontent/);
-  assert.doesNotMatch(urls.downloadUrl, /raw\.githubusercontent/);
-  assert.doesNotMatch(urls.updateUrl, /\/(main|master)\//);
-  assert.equal(repoUrls(null), null);
-  assert.equal(repoUrls({ owner: 'alice' }), null);
+  assert.match(urls.updateUrl, /\/main\//);
+  assert.doesNotMatch(urls.updateUrl, /releases\/latest/);
+  assert.doesNotMatch(urls.downloadUrl, /releases\/latest/);
+});
+
+test('repoUrls：仓库信息不全或解析不出时返回 null（调用方据此两行都不写）', () => {
+  for (const slug of [null, undefined, {}, { owner: 'alice' }, { repo: 'bb-dl' }, { owner: '', repo: 'bb-dl' }]) {
+    assert.equal(repoUrls(slug), null, JSON.stringify(slug));
+  }
 });
 
 test('buildBanner：没有仓库信息时逐字等于历史产物（无 @updateURL/@downloadURL）', () => {
@@ -127,17 +132,18 @@ test('buildBanner：有 github 仓库时两行同时出现，且其余行一个�
 
   assert.ok(
     lines.includes(
-      '// @updateURL    https://github.com/alice/bb-dl/releases/latest/download/bb-bulk-course-downloader.user.js'
+      '// @updateURL    https://raw.githubusercontent.com/alice/bb-dl/main/bb-bulk-course-downloader.user.js'
     ),
     banner
   );
   assert.ok(
     lines.includes(
-      '// @downloadURL  https://github.com/alice/bb-dl/releases/latest/download/bb-bulk-course-downloader.user.js'
+      '// @downloadURL  https://raw.githubusercontent.com/alice/bb-dl/main/bb-bulk-course-downloader.user.js'
     ),
     banner
   );
   assert.equal(lines.filter((l) => /@(update|download)URL/.test(l)).length, 2);
+  assert.doesNotMatch(banner, /releases\/latest/);
 
   // 去掉这两行必须精确还原无仓库版本。
   const stripped = lines.filter((l) => !/@(update|download)URL/.test(l)).join('\n');

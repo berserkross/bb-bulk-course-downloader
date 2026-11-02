@@ -32,6 +32,17 @@ export function redactUrlText(value) {
 }
 
 /**
+ * 比 redactUrlText 更狠：整个 URL 拿掉，只留人话（HTTP 500 https://.../xid-1_1 -> HTTP 500）。
+ * 失败清单里文件名和相对路径都已经单独显示了，再贴一条绝对 URL 只会在面板里刷屏。
+ */
+const ABSOLUTE_URL_LOOSE = /(?:https?:)?\/\/[^\s?#]*(?:\?[^\s#]*)?(?:#[^\s]*)?/gi;
+
+export function stripUrlText(value) {
+  const text = value == null ? '' : String(value);
+  return text.replace(ABSOLUTE_URL_LOOSE, '').replace(/\s{2,}/g, ' ').trim();
+}
+
+/**
  * 「重试后仍失败」类的错误：给一句下一步建议，其余失败项一个字都不加。
  * 只认这三类文案（停滞 / 文件不完整 / 重试），别的错误照原样展示。
  */
@@ -158,6 +169,41 @@ function safePathText(value) {
 
 function finiteNumber(value) {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+/** 扫描历史只列最近 5 条：面板是常驻浮层，历史一长就把下载按钮挤出屏幕。 */
+export const MAX_HISTORY_ROWS = 5;
+/** 每条历史展开后最多 20 行变更路径。 */
+export const MAX_HISTORY_PATHS = 20;
+
+/** 历史行的时间戳：MM-DD HH:mm（本地时区），拿不到时间就返回空串。 */
+function formatScanTime(at) {
+  const n = finiteNumber(at);
+  if (n == null || n <= 0) return '';
+  const date = new Date(Math.floor(n));
+  if (Number.isNaN(date.getTime())) return '';
+  const pad = (value) => (value < 10 ? '0' + value : String(value));
+  return pad(date.getMonth() + 1) + '-' + pad(date.getDate()) + ' ' + pad(date.getHours()) + ':' + pad(date.getMinutes());
+}
+
+/** 计数一律落地成非负整数：缺键 / NaN / 负数都按 0，绝不把 undefined 写进 DOM。 */
+function countText(value) {
+  const n = finiteNumber(value);
+  return String(n == null || n < 0 ? 0 : Math.floor(n));
+}
+
+/** 一条历史的摘要行：「08-21 14:32 · 新增 18 · 变更 1 · 改名 1 · 未变 1 · 未知 1 · 疑似删除 2」。 */
+export function historyLineText(scan) {
+  const s = scan || {};
+  const time = formatScanTime(s.at);
+  const counts =
+    '新增 ' + countText(s.added) +
+    ' · 变更 ' + countText(s.changed) +
+    ' · 改名 ' + countText(s.moved) +
+    ' · 未变 ' + countText(s.unchanged) +
+    ' · 未知 ' + countText(s.unknown) +
+    ' · 疑似删除 ' + countText(s.stale);
+  return time ? time + ' · ' + counts : counts;
 }
 
 /** 行身份只看 id / entryId：两者都没有的条目没法按 entryId 更新，直接不种行。 */
@@ -298,6 +344,8 @@ function reusePanel(root, opts) {
     setHalted: noop,
     clearHalted: noop,
     showSummary: noop,
+    setCourse: noop,
+    setHistory: noop,
     rebind: noop,
     fail(message) {
       if (statusEl) statusEl.textContent = '出错了：' + redactUrlText(message);
@@ -321,6 +369,9 @@ export function mountPanel(options) {
   let onResume = typeof opts.onResume === 'function' ? opts.onResume : null;
   /** 停机横幅上海一个按钮的回调；缺省时不渲染那个按钮。 */
   let onResumePending = typeof opts.onResumePending === 'function' ? opts.onResumePending : null;
+  /** 导出 / 导入清单：缺省时这两个控件一个都不渲染（不是禁用，是不存在）。 */
+  let onExportManifest = typeof opts.onExportManifest === 'function' ? opts.onExportManifest : null;
+  let onImportManifest = typeof opts.onImportManifest === 'function' ? opts.onImportManifest : null;
 
   injectStyles();
 
@@ -358,6 +409,9 @@ export function mountPanel(options) {
   head.appendChild(collapseBtn);
 
   const body = node('div', 'bbdl-panel__body');
+  // 课程标识常驻第一行：换课程时它是唯一能一眼看出来的东西。
+  const courseEl = node('p', 'bbdl-course');
+  courseEl.hidden = true;
   const statusEl = node('p', 'bbdl-status');
 
   const progressEl = node('div', 'bbdl-progress');
@@ -397,6 +451,13 @@ export function mountPanel(options) {
   filesEl.appendChild(filesBodyEl);
   filesEl.appendChild(filesMoreEl);
 
+  // 可折叠「扫描历史」：没有历史时整块 hidden（见 setHistory），最多 MAX_HISTORY_ROWS 条。
+  const historyEl = node('details', 'bbdl-history');
+  historyEl.hidden = true;
+  historyEl.appendChild(node('summary', 'bbdl-history__summary', '扫描历史'));
+  const historyBodyEl = node('div', 'bbdl-history__body');
+  historyEl.appendChild(historyBodyEl);
+
   // 上次的目录是「继续上次」的唯一入口：只有 hydrate 拿到句柄才会显示。
   const resumeEl = node('div', 'bbdl-resume');
   resumeEl.hidden = true;
@@ -426,12 +487,44 @@ export function mountPanel(options) {
   settingsEl.appendChild(concRow);
   settingsEl.appendChild(node('p', 'bbdl-note', '目录结构开关在「选择并下载」对话框里。'));
 
+  // 导出清单：纯本地动作（生成 Blob 下载），结果只走 notice 行，不弹窗。
+  const exportRow = node('div', 'bbdl-settings__row');
+  const exportBtn = button('bbdl-btn bbdl-btn--small', 'export-manifest', '导出清单');
+  exportBtn.title = '把本课程的下载清单存成 JSON 文件（不含任何链接）';
+  exportRow.appendChild(exportBtn);
+  exportRow.hidden = !onExportManifest;
+  settingsEl.appendChild(exportRow);
+
+  // 导入清单：选一个 JSON 文件交给上层合并，结果同样只走 notice 行。
+  const importRow = node('label', 'bbdl-settings__row');
+  importRow.appendChild(node('span', null, '导入清单'));
+  const importInput = node('input', 'bbdl-settings__file');
+  importInput.type = 'file';
+  importInput.accept = '.json,application/json';
+  importRow.appendChild(importInput);
+  importRow.hidden = !onImportManifest;
+  settingsEl.appendChild(importRow);
+
+  importInput.addEventListener('change', function () {
+    const picked = importInput.files && importInput.files.length ? importInput.files[0] : null;
+    // 立刻清空 value：同一个文件连着选两次也要能再触发一次 change。
+    importInput.value = '';
+    if (!picked || !onImportManifest) return;
+    try {
+      const pending = onImportManifest(picked);
+      if (pending && typeof pending.catch === 'function') pending.catch(function () {});
+    } catch (err) {
+      render('error', { message: (err && err.message) || String(err) });
+    }
+  });
+
   const modeEl = node('p', 'bbdl-mode');
   modeEl.hidden = true;
 
   const summaryEl = node('div', 'bbdl-summary');
   summaryEl.hidden = true;
 
+  body.appendChild(courseEl);
   body.appendChild(statusEl);
   body.appendChild(noticeEl);
   body.appendChild(haltEl);
@@ -439,6 +532,7 @@ export function mountPanel(options) {
   body.appendChild(resumeEl);
   body.appendChild(actionsEl);
   body.appendChild(filesEl);
+  body.appendChild(historyEl);
   body.appendChild(settingsEl);
   body.appendChild(modeEl);
   body.appendChild(summaryEl);
@@ -578,6 +672,9 @@ export function mountPanel(options) {
         // 唯一调用点：一次点击只进一次这里，绝不另挂第二个监听器（否则会调两次）。
         if (onResumePending) onResumePending();
         break;
+      case 'export-manifest':
+        if (onExportManifest) onExportManifest();
+        break;
       case 'cancel':
         requestCancel();
         break;
@@ -647,6 +744,47 @@ export function mountPanel(options) {
     noticeEl.title = value;
   }
 
+  /** 当前课程标识：优先课程名，取不到就用 courseId；两个都拿不到就整行收起。 */
+  function setCourse(courseId, courseName) {
+    if (destroyed) return;
+    const id = safePathText(courseId);
+    const name = safeNameText(courseName);
+    const text = name ? '当前课程：' + name + (id && name !== id ? '（' + id + '）' : '') : id ? '当前课程：' + id : '';
+    courseEl.textContent = text;
+    courseEl.title = text;
+    courseEl.hidden = !text;
+  }
+
+  /** 扫描历史：最多 MAX_HISTORY_ROWS 条，每条可展开看最多 MAX_HISTORY_PATHS 行变更路径。 */
+  function setHistory(scans) {
+    if (destroyed) return;
+    historyBodyEl.textContent = '';
+    const list = Array.isArray(scans) ? scans.slice(0, MAX_HISTORY_ROWS) : [];
+    let rows = 0;
+    for (const scan of list) {
+      if (!scan || typeof scan !== 'object') continue;
+      const item = node('details', 'bbdl-history__item');
+      const rowText = historyLineText(scan);
+      const rowEl = node('summary', 'bbdl-history__row', rowText);
+      rowEl.title = rowText;
+      item.appendChild(rowEl);
+      const paths = Array.isArray(scan.changedPaths) ? scan.changedPaths.slice(0, MAX_HISTORY_PATHS) : [];
+      const ul = node('ul', 'bbdl-history__paths');
+      for (const pathItem of paths) {
+        const raw = pathItem && typeof pathItem === 'object' ? pathItem.path : pathItem;
+        const text = safePathText(raw);
+        if (!text) continue;
+        const li = node('li', 'bbdl-history__path', text);
+        li.title = text;
+        ul.appendChild(li);
+      }
+      if (ul.childNodes.length) item.appendChild(ul);
+      historyBodyEl.appendChild(item);
+      rows += 1;
+    }
+    historyEl.hidden = rows === 0;
+  }
+
   /** info = { dirName, granted }；没有上次目录时传 null 收起整块。 */
   function setResume(info) {
     if (destroyed) return;
@@ -686,7 +824,7 @@ export function mountPanel(options) {
         const entry = (item && item.entry) || {};
         const path = entryPath(entry);
         const name = redactUrlText(entry.name || '(未命名文件)');
-        const reason = redactUrlText((item && item.error) || '未知错误');
+        const reason = stripUrlText((item && item.error) || '未知错误');
         return (path ? path + ' / ' + name : name) + '\t' + reason;
       })
       .join('\n');
@@ -776,7 +914,7 @@ export function mountPanel(options) {
       nameEl.title = entry.name || '';
       const pathEl = node('span', 'bbdl-failed__path', path);
       pathEl.title = path;
-      const reasonEl = node('span', 'bbdl-failed__reason', redactUrlText((item && item.error) || '未知错误'));
+      const reasonEl = node('span', 'bbdl-failed__reason', stripUrlText((item && item.error) || '未知错误'));
       reasonEl.title = reasonEl.textContent;
       li.appendChild(nameEl);
       li.appendChild(pathEl);
@@ -1055,6 +1193,10 @@ export function mountPanel(options) {
     if (typeof o.onRetryFailed === 'function') onRetryFailed = o.onRetryFailed;
     if (typeof o.onResume === 'function') onResume = o.onResume;
     if (typeof o.onResumePending === 'function') onResumePending = o.onResumePending;
+    if (typeof o.onExportManifest === 'function') onExportManifest = o.onExportManifest;
+    if (typeof o.onImportManifest === 'function') onImportManifest = o.onImportManifest;
+    exportRow.hidden = !onExportManifest;
+    importRow.hidden = !onImportManifest;
     if (haltText) paintHalt();
     if (!summaryEl.hidden) renderSummary();
   }
@@ -1081,6 +1223,8 @@ export function mountPanel(options) {
     setHalted: setHalted,
     clearHalted: clearHalted,
     showSummary: showSummary,
+    setCourse: setCourse,
+    setHistory: setHistory,
     rebind: rebind,
     fail: fail,
     destroy: destroy

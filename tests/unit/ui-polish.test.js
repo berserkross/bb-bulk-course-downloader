@@ -141,7 +141,10 @@ test('失败清单：逐条渲染名称+路径+原因，且不把 URL query 渲�
   assert.equal(items.length, 2);
   assert.equal(items[0].querySelector('.bbdl-failed__name').textContent, 'week1.pdf');
   assert.equal(items[0].querySelector('.bbdl-failed__path').textContent, 'Week 1');
-  assert.match(items[0].querySelector('.bbdl-failed__reason').textContent, /HTTP 403/);
+  const reasonText = items[0].querySelector('.bbdl-failed__reason').textContent;
+  assert.match(reasonText, /HTTP 403/);
+  // 失败原因里文件名和相对路径都单独显示了，绝对 URL 不该再刷屏（同一条理由也写进了 M4 §4 红线）。
+  assert.doesNotMatch(reasonText, /https?:|bbcswebdav|content_id|token/);
 
   const summaryText = document.querySelector('.bbdl-summary').textContent;
   assert.doesNotMatch(summaryText, /content_id|token|secret/);

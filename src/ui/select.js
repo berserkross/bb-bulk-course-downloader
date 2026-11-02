@@ -1,6 +1,65 @@
 import { injectStyles } from './styles.js';
 import { redactUrlText } from './panel.js';
 
+/** 勾选记忆的 key 前缀：按 (courseId, pageId) 分桶，换课程 / 换内容页各记各的。 */
+const SELECTION_KEY_PREFIX = 'bbdl:sel:';
+
+/** 记忆 key；两段 id 缺一就不记忆——宁可不记，也不能把两门课的勾选串到一起。 */
+export function selectionStorageKey(courseId, pageId) {
+  const course = courseId == null ? '' : String(courseId).trim();
+  const page = pageId == null ? '' : String(pageId).trim();
+  if (!course || !page) return '';
+  return SELECTION_KEY_PREFIX + course + ':' + page;
+}
+
+/** sessionStorage 在这里只能被「尝试」：隐私模式 / 被策略禁用时连访问属性都会抛。 */
+function selectionStore() {
+  try {
+    const store = typeof globalThis !== 'undefined' ? globalThis.sessionStorage : null;
+    return store && typeof store.getItem === 'function' && typeof store.setItem === 'function' ? store : null;
+  } catch (err) {
+    return null;
+  }
+}
+
+/** 读记忆：只认非空 id 的数组；解析失败、类型不对一律当「没有记忆」。 */
+export function readSelection(key) {
+  if (!key) return null;
+  const store = selectionStore();
+  if (!store) return null;
+  let raw = null;
+  try {
+    raw = store.getItem(key);
+  } catch (err) {
+    return null;
+  }
+  if (typeof raw !== 'string' || !raw) return null;
+  let parsed = null;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    return null;
+  }
+  if (!Array.isArray(parsed)) return null;
+  const ids = [];
+  for (const item of parsed) {
+    const id = typeof item === 'string' ? item : typeof item === 'number' ? String(item) : '';
+    if (id) ids.push(id);
+  }
+  return ids;
+}
+
+function writeSelection(key, ids) {
+  if (!key) return;
+  const store = selectionStore();
+  if (!store) return;
+  try {
+    store.setItem(key, JSON.stringify(ids));
+  } catch (err) {
+    // 配额 / 禁用：记忆只是便利，写不进去也不该影响勾选本身。
+  }
+}
+
 /**
  * 扩展名归并成 6 个类型：勾选「pdf」比让用户面对 20 种后缀要省事，
  * ext 列表之外的一切都落进「其他」，所以任何文件永远属于且只属于一个类型。
@@ -231,6 +290,7 @@ export function openSelectDialog(entries, options) {
   };
   // 跳过摘要由 index.js 用 planSkips 算好传进来；对话框自己不做磁盘或清单判断。
   // 选完目录后整份摘要会换掉，所以这里是 let 而不是 const。
+  const selectionKey = selectionStorageKey(opts.courseId, opts.pageId);
   let skipInfo = normalizeSkipInfo(opts.skipInfo);
   let skipExisting = skipInfo.total > 0;
   /** 用户亲手动过复选框就不再替他改回来；没人动过时默认值跟随比对结果。 */
@@ -250,9 +310,21 @@ export function openSelectDialog(entries, options) {
     const sizes = new Map();
     const selected = new Set();
 
+    // 记忆里一条都对不上（换版后文件全变了）就当没有记忆，回落「默认全选」。
+    // 只有在 list 里还活着的 id 会被恢复，已消失的 id 因此是静默丢弃。
+    const remembered = readSelection(selectionKey);
+    let restored = null;
+    if (remembered && remembered.length) {
+      const alive = new Set();
+      for (const entry of list) {
+        if (entry && remembered.indexOf(entry.id) >= 0) alive.add(entry.id);
+      }
+      if (alive.size) restored = alive;
+    }
+
     for (const entry of list) {
       if (!entry) continue;
-      selected.add(entry.id);
+      if (!restored || restored.has(entry.id)) selected.add(entry.id);
       if (typeof entry.size === 'number' && Number.isFinite(entry.size)) sizes.set(entry.id, entry.size);
     }
 
@@ -854,8 +926,19 @@ export function openSelectDialog(entries, options) {
       });
     }
 
+    /** 勾选一变就落 sessionStorage：关对话框、切走再回来都能恢复。 */
+    function persistSelection() {
+      writeSelection(
+        selectionKey,
+        collectSelected().map(function (entry) {
+          return entry.id;
+        })
+      );
+    }
+
     function renderTotals() {
       const chosen = collectSelected();
+      persistSelection();
       let bytes = 0;
       let known = 0;
       for (const entry of chosen) {
@@ -898,6 +981,8 @@ export function openSelectDialog(entries, options) {
     function close(value) {
       if (closed) return;
       closed = true;
+      // 关闭这一刻的勾选才是「这次的选择」：确认与取消都要记，取消也不能丢。
+      persistSelection();
       // 关掉对话框等于放弃这次比对：让还在跑的目录枚举立刻中止，别在后台继续扫盘。
       pickGeneration += 1;
       if (onDialogClose) {

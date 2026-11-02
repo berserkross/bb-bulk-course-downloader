@@ -110,3 +110,59 @@ export function parseContentList(doc, pageUrl) {
 
   return result;
 }
+// 与 src/sinks/download.js 的 REVOKE_DELAY_MS 同值：浏览器真实下载要几秒才把 blob 读完。
+const REVOKE_DELAY_MS = 60 * 1000;
+
+/** 导出文件名：<courseId>-manifest.json；courseId 里的路径分隔符 / 空白一律换成下划线。 */
+export function manifestFileName(courseId) {
+  const raw = courseId == null ? '' : String(courseId).trim();
+  const safe = raw.replace(/[^\w.-]+/g, '_');
+  return (safe || 'course') + '-manifest.json';
+}
+
+/**
+ * 触发一次本地下载：Blob + a[download]，返回被点击的 <a>（拿不到 document 时返回 null）。
+ * 只生成 blob: 地址，绝不把课程链接写进 DOM。
+ */
+export function downloadTextFile(doc, text, fileName, mime) {
+  const target = doc || (typeof document === 'undefined' ? null : document);
+  if (!target || typeof target.createElement !== 'function') return null;
+  const body = String(text == null ? '' : text);
+  const type = mime || 'application/json';
+  let href = '';
+  let blobUrl = null;
+  const BlobCtor = typeof Blob === 'function' ? Blob : null;
+  const canBlob =
+    Boolean(BlobCtor) && typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function';
+  if (canBlob) {
+    blobUrl = URL.createObjectURL(new BlobCtor([body], { type: type }));
+    href = blobUrl;
+  } else {
+    href = 'data:' + type + ';charset=utf-8,' + encodeURIComponent(body);
+  }
+
+  const anchor = target.createElement('a');
+  anchor.href = href;
+  anchor.download = fileName || 'download.json';
+  anchor.rel = 'noopener';
+  anchor.style.display = 'none';
+  const host = target.body || target.documentElement;
+  if (host) host.appendChild(anchor);
+  try {
+    if (typeof anchor.click === 'function') anchor.click();
+  } finally {
+    if (anchor.parentNode) anchor.parentNode.removeChild(anchor);
+    // 立刻 revoke 会把还在途中的下载掐断（真实 Chrome 验收：0ms 收不回清单文件），
+    // 延迟值与下载 sink 的 REVOKE_DELAY_MS 保持一致；blob 不占多少内存，兜底由页面关闭承担。
+    if (blobUrl) {
+      setTimeout(function () {
+        try {
+          URL.revokeObjectURL(blobUrl);
+        } catch (err) {
+          /* 环境不支持回收就算了：blob 地址随页面关闭释放。 */
+        }
+      }, REVOKE_DELAY_MS);
+    }
+  }
+  return anchor;
+}

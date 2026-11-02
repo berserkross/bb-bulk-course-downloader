@@ -795,6 +795,60 @@ export const CSS = `
   font-size: 11.5px;
 }
 
+.bbdl-course {
+  margin: 0 0 2px;
+  color: var(--bbdl-muted);
+  font-size: 11.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.bbdl-history__summary,
+.bbdl-history__row {
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.bbdl-history__body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+.bbdl-history__item {
+  border-left: 2px solid var(--bbdl-border, #3a3a3a);
+  padding-left: 6px;
+}
+
+.bbdl-history__row {
+  color: var(--bbdl-text);
+  font-variant-numeric: tabular-nums;
+}
+
+.bbdl-history__paths {
+  margin: 3px 0 0;
+  padding-left: 16px;
+  max-height: 180px;
+  overflow: auto;
+}
+
+.bbdl-history__path {
+  color: var(--bbdl-muted);
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.bbdl-settings__file {
+  max-width: 150px;
+  font-size: 11px;
+  color: var(--bbdl-muted);
+}
+
 @media (prefers-color-scheme: light) {
   .bbdl-panel,
   .bbdl-overlay {

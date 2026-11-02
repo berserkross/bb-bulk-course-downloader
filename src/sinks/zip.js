@@ -7,7 +7,8 @@ import {
   toFailure,
   isAbort,
   createFileEmitter,
-  retryReason
+  retryReason,
+  withHalted
 } from './shared.js';
 import { createIdleReader, withFileRetry, createMutex, isRetriableError, TruncatedError, DEFAULT_IDLE_MS } from './guard.js';
 import {
@@ -32,6 +33,11 @@ const REVOKE_DELAY_MS = 60000;
 const DEFAULT_ZIP_CHUNK_BYTES = 200 * 1024 * 1024;
 /** 没有顶层文件夹可分组的文件（不保留目录结构时就是整批）落在这一组。 */
 const FALLBACK_GROUP_NAME = 'course';
+/**
+ * partial seal：包内出现「重试用尽」的条目之后，剩下的条目不再开始下载。
+ * 这条文案就是它们的失败原因（已脱敏，不含 URL / query），下次只重下这几条。
+ */
+const SKIPPED_AFTER_FAILURE = '同一个压缩包里已经有文件彻底失败，本次未下载；可以稍后重试';
 
 function pickIdleMs(value) {
   const n = Number(value);
@@ -266,6 +272,8 @@ export function createZipSink({
     const totalCount = total || list.length;
     const ok = [];
     const failed = [];
+    // 契约 §2：普通可枚举字段，形如 [{ name: 'Week 1.zip', saved: 3, missing: 2 }]，没有部分交付时为 []
+    const partialPackages = [];
     const report = createReporter({ onProgress });
     const progress = createProgressTracker(totalCount);
     // 逐文件事件出口（契约 §1）：createFileEmitter(undefined) 本身就是 noop，
@@ -283,6 +291,11 @@ export function createZipSink({
 
     for (const group of groups) {
       let pkg = newPackage(group.name);
+      // partial seal 的包内账目：missing = 这个包里因为「彻底失败」而没能进包的条目数
+      // （失败那一条 + 之后没机会开始的那几条）；saved 直接用 pkg.entries.length。
+      let missing = 0;
+      // 一个包内一旦有条目把重试用尽，这个包就到此为止：后面的条目不再开始（契约 §2 partial seal）
+      let broken = false;
       for (const plan of group.plans) {
         if (stopNow() || (signal && signal.aborted)) break;
         const entry = plan.entry;
@@ -292,9 +305,25 @@ export function createZipSink({
         const nameLength = toBytes(name).length;
         const known = lookupSize(entry);
 
+        if (broken) {
+          // 失败的与尚未开始的条目全部进 failed：下次只重下这几条，已经交付的那个包不再重下
+          const failure = toFailure(entry, plan, new Error(SKIPPED_AFTER_FAILURE));
+          failed.push(failure);
+          missing += 1;
+          progress.endFile(true);
+          // 顺序契约（§1）无例外：没读过字节也算第 1 次尝试，start 先于 failed
+          emit('file-start', label, entryId, true);
+          emitFile({ type: 'start', entryId, path: label, name, attempt: 1 });
+          emitFile({ type: 'failed', entryId, path: label, name, error: failure.error });
+          emit('file-failed', label, entryId, true);
+          cursor += 1;
+          continue;
+        }
+
         if (shouldCut(pkg, nameLength, known)) {
           await flushPackage(pkg);
           pkg = newPackage(group.name);
+          missing = 0;
         }
 
         emit('file-start', label, entryId, true);
@@ -302,9 +331,13 @@ export function createZipSink({
         // 那条路一个字节都没读就直接进 failed，而契约 §1 要求任何 entryId 的 start 都先于其终态。
         emitFile({ type: 'start', entryId, path: label, name, attempt: 1 });
         let attemptBytes = 0;
+        // 闸门（体积预检）与真正的下载分开记账：闸门一个字节都没读过，算不上「withFileRetry 用尽」，
+        // 所以它只让这一条进 failed，包照旧继续往里收文件 —— 既有行为一条都没改。
+        let readAttempted = false;
         try {
           // 已知体积先过一遍 ZIP32 闸门：4 GiB 的文件根本不值得下载一遍再拒绝
           if (known !== undefined) assertEntrySize(known);
+          readAttempted = true;
           const { parts, crc, size } = await withFileRetry(
             // withFileRetry 把「本次是第几次」交回来：attempt 按文件各一份，重试后从 1 长到 2
             (attempt) => {
@@ -371,15 +404,23 @@ export function createZipSink({
           }
           const failure = toFailure(entry, plan, err);
           failed.push(failure);
+          missing += 1;
           progress.endFile(true);
           // 与失败清单同一句文案：已经过 redactUrls，不带 URL query
           emitFile({ type: 'failed', entryId, path: label, name, error: failure.error });
           emit('file-failed', label, entryId, true);
+          // 重试用尽 = 这个包收口（partial seal）：往里写了一半的字节早就丢了，包本身是合法的
+          if (readAttempted) broken = true;
         }
         cursor += 1;
       }
-      // 已经把字节拿到手的那些照旧交出去：停机不该丢掉前面下好的文件
-      await flushPackage(pkg);
+      // 封口：包里已经完整收下的条目照旧交出去（停机也不该丢掉前面下好的文件）。
+      // 只有「包内有条目彻底失败」才算 partial seal —— 停机/取消时 missing 恒为 0，绝不产出条目。
+      const savedCount = pkg.entries.length;
+      const delivered = await flushPackage(pkg); // 包里没有条目时返回 null，绝不交空包
+      if (delivered && savedCount > 0 && missing > 0) {
+        partialPackages.push({ name: delivered.name, saved: savedCount, missing });
+      }
     }
 
     if ((signal && signal.aborted) || aborted) {
@@ -399,7 +440,8 @@ export function createZipSink({
       });
     }
     emit('done', '', '', true);
-    return { ok, failed, aborted, halted };
+    // halted 与 fs/download 一致做成不可枚举：既有整对象断言靠这一点，也避免日志/展开时把 pending 里的 href 带出去
+    return withHalted({ ok, failed, aborted, partialPackages }, halted);
   }
 
   return { kind: 'zip', download };

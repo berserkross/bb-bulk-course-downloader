@@ -72,15 +72,15 @@ export function resolveRepo({ packageJson = {}, envUrl } = {}) {
 }
 
 /**
- * @updateURL 与 @downloadURL 指向同一个 Release 资产：构建产物不进仓库（dist/ 继续被 gitignore），
- * 分支名也就不再参与任何 URL。两者同生同灭。
+ * @updateURL 与 @downloadURL 指向同一份自托管 raw 产物：产物进仓库（仓库根那份被提交），
+ * 分支固定 main，不再依赖 Release 资产。两者同生同灭。
  */
 export function repoUrls(slug) {
   const owner = slug && slug.owner;
   const repo = slug && slug.repo;
   if (!owner || !repo) return null;
-  const asset = `https://github.com/${owner}/${repo}/releases/latest/download/${DIST_NAME}`;
-  return { updateUrl: asset, downloadUrl: asset };
+  const raw = `https://raw.githubusercontent.com/${owner}/${repo}/main/${DIST_NAME}`;
+  return { updateUrl: raw, downloadUrl: raw };
 }
 
 /** 生成 ==UserScript== 头。repo 为 null 时整段 URL 行为空，其余行与历史产物逐字一致。 */
