@@ -186,6 +186,8 @@ function reusePanel(root, opts) {
     setScanProgress: noop,
     setDownloadProgress: noop,
     setMode: noop,
+    setNotice: noop,
+    setResume: noop,
     showSummary: noop,
     rebind: noop,
     fail(message) {
@@ -207,6 +209,7 @@ export function mountPanel(options) {
   let onCancel = typeof opts.onCancel === 'function' ? opts.onCancel : null;
   let onSettingsChange = typeof opts.onSettingsChange === 'function' ? opts.onSettingsChange : null;
   let onRetryFailed = typeof opts.onRetryFailed === 'function' ? opts.onRetryFailed : null;
+  let onResume = typeof opts.onResume === 'function' ? opts.onResume : null;
 
   injectStyles();
 
@@ -255,6 +258,17 @@ export function mountPanel(options) {
   actionsEl.appendChild(downloadBtn);
   actionsEl.appendChild(cancelBtn);
 
+  const noticeEl = node('p', 'bbdl-notice');
+  noticeEl.hidden = true;
+
+  // 上次的目录是「继续上次」的唯一入口：只有 hydrate 拿到句柄才会显示。
+  const resumeEl = node('div', 'bbdl-resume');
+  resumeEl.hidden = true;
+  const resumeTextEl = node('span', 'bbdl-resume__text');
+  const resumeBtn = button('bbdl-btn bbdl-btn--small', 'resume', '继续上次');
+  resumeEl.appendChild(resumeTextEl);
+  resumeEl.appendChild(resumeBtn);
+
   const settingsEl = node('details', 'bbdl-settings');
   settingsEl.appendChild(node('summary', null, '设置'));
   const probeRow = node('label', 'bbdl-settings__row');
@@ -283,7 +297,9 @@ export function mountPanel(options) {
   summaryEl.hidden = true;
 
   body.appendChild(statusEl);
+  body.appendChild(noticeEl);
   body.appendChild(progressEl);
+  body.appendChild(resumeEl);
   body.appendChild(actionsEl);
   body.appendChild(settingsEl);
   body.appendChild(modeEl);
@@ -412,6 +428,10 @@ export function mountPanel(options) {
       case 'download':
         if (onDownload) onDownload();
         break;
+      case 'resume':
+        // 铁律：这一层不许 await —— 处理器必须同步把 ensureDirectoryPermission 发出去。
+        if (onResume) onResume();
+        break;
       case 'cancel':
         requestCancel();
         break;
@@ -468,10 +488,33 @@ export function mountPanel(options) {
     if (!sample || now - sample.at >= 800) sample = { at: now, bytes: bytesDone };
   }
 
+  /** 临时提示（降级说明、跳过结果）。与状态行分开：render() 会重写状态行，不该把提示冲掉。 */
+  function setNotice(text) {
+    if (destroyed) return;
+    const value = text == null ? '' : redactUrlText(String(text));
+    noticeEl.textContent = value;
+    noticeEl.hidden = !value;
+    noticeEl.title = value;
+  }
+
+  /** info = { dirName, granted }；没有上次目录时传 null 收起整块。 */
+  function setResume(info) {
+    if (destroyed) return;
+    const visible = !!(info && info.dirName);
+    resumeEl.hidden = !visible;
+    if (!visible) {
+      resumeTextEl.textContent = '';
+      return;
+    }
+    const granted = info.granted !== false;
+    resumeTextEl.textContent = '上次保存到「' + info.dirName + '」，可继续' + (granted ? '' : '（需要再确认一次目录权限）');
+    resumeTextEl.title = resumeTextEl.textContent;
+  }
+
   const MODE_TEXT = {
     fs: '落盘方式：保存到文件夹（Chromium）——直接写入你选的目录，保留原目录结构。代价：每次下载都要重新选一次文件夹，且只有 Chromium 系浏览器支持。',
     download:
-      '落盘方式：逐文件下载（进浏览器默认下载目录）——网页拿不到目录写权限，文件名用 folder__ 前缀代替子目录。代价：所有文件都落在默认下载目录里，无法建子目录，文件多时会连续弹出多个下载。'
+      '落盘方式：逐文件下载（进浏览器默认下载目录）——网页拿不到目录写权限，文件名用 folder__ 前缀代替子目录。代价：所有文件都落在默认下载目录里，无法建子目录，文件多时会连续弹出多个下载。另外这里只能按下载清单跳过已下过的文件，无法核实磁盘文件。'
   };
 
   function setMode(kind) {
@@ -679,6 +722,7 @@ export function mountPanel(options) {
     if (typeof o.onCancel === 'function') onCancel = o.onCancel;
     if (typeof o.onSettingsChange === 'function') onSettingsChange = o.onSettingsChange;
     if (typeof o.onRetryFailed === 'function') onRetryFailed = o.onRetryFailed;
+    if (typeof o.onResume === 'function') onResume = o.onResume;
     if (!summaryEl.hidden) renderSummary();
   }
 
@@ -697,6 +741,8 @@ export function mountPanel(options) {
     setScanProgress: setScanProgress,
     setDownloadProgress: setDownloadProgress,
     setMode: setMode,
+    setNotice: setNotice,
+    setResume: setResume,
     showSummary: showSummary,
     rebind: rebind,
     fail: fail,

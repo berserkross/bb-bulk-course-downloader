@@ -81,6 +81,7 @@ export function redactUrls(message) {
  *   不是待下载总量；写失败被 abort 掉的那部分也计入，因为计数器只增不减（单调不减）。
  * - bytesTotal：已知总字节数；未知时恒为 0（响应没给长度就是未知，绝不出 NaN）
  * - currentPath：当前文件的相对路径；批次级事件为空串
+ * - entryId：当前文件在清单里的 id（plan.entry.id）；批次级事件为空串
  * - state / name / done / failed / total / bytes 是旧字段别名，保留给既有 UI
  */
 export function createProgressTracker(filesTotal = 0) {
@@ -89,7 +90,10 @@ export function createProgressTracker(filesTotal = 0) {
     filesDone: 0,
     bytesDone: 0,
     bytesTotal: 0,
-    failed: 0
+    failed: 0,
+    // 并发下真正的 entryId 由 progressPayload 的第四个参数显式传入：
+    // tracker 上的这个值只是「没有显式传参时」的默认值，避免共享 tracker 张冠李戴。
+    entryId: ''
   };
   tracker.addBytes = (delta) => {
     const n = Number(delta);
@@ -102,7 +106,8 @@ export function createProgressTracker(filesTotal = 0) {
   return tracker;
 }
 
-export function progressPayload(tracker, state, currentPath = '') {
+export function progressPayload(tracker, state, currentPath = '', entryId) {
+  const id = entryId == null ? tracker.entryId : entryId;
   return {
     state,
     name: currentPath,
@@ -110,6 +115,7 @@ export function progressPayload(tracker, state, currentPath = '') {
     failed: tracker.failed,
     total: tracker.filesTotal,
     bytes: tracker.bytesDone,
+    entryId: id == null ? '' : String(id),
     filesDone: tracker.filesDone,
     filesTotal: tracker.filesTotal,
     bytesDone: tracker.bytesDone,

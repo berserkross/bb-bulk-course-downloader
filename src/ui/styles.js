@@ -582,6 +582,61 @@ export const CSS = `
   border-radius: 8px;
 }
 
+/* ---------- 断点续传：跳过已存在 / 继续上次 / 临时提示 ---------- */
+.bbdl-notice {
+  margin: 0;
+  padding: 6px 8px;
+  border: 1px solid #6b4a12;
+  border-radius: 8px;
+  background: #241d10;
+  color: #f0c674;
+  font-size: 12px;
+  word-break: break-word;
+}
+
+.bbdl-resume {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--bbdl-line);
+  border-radius: 8px;
+  background: #171b21;
+}
+
+.bbdl-resume__text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--bbdl-muted);
+}
+
+.bbdl-switch--skip {
+  color: var(--bbdl-muted);
+}
+
+.bbdl-note--skip {
+  margin: 0;
+  padding: 0 14px 6px;
+  color: #f0c674;
+  font-size: 12px;
+  word-break: break-word;
+}
+
+/* 已存在的文件：整行压暗但不禁用勾选——用户仍然可以强行重下一次。 */
+.bbdl-row--skipped .bbdl-row__name,
+.bbdl-row--skipped .bbdl-row__path,
+.bbdl-row--skipped .bbdl-row__size {
+  color: #6b7280;
+}
+
+.bbdl-row--skipped .bbdl-row__name {
+  text-decoration: line-through;
+}
+
 @media (prefers-color-scheme: light) {
   .bbdl-panel,
   .bbdl-overlay {

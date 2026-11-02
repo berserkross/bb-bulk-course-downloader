@@ -90,9 +90,11 @@ export function createFsSink({ settings = {}, dirHandle, signal, total = 0, file
     const progress = createProgressTracker(totalCount);
     let aborted = false;
 
-    const emit = (state, path, force) => report(progressPayload(progress, state, path), force);
+    // entryId 显式传参：4 个并发文件共用一个 tracker，不能让 payload 取到别的文件的 id
+    const emit = (state, path, entryId = '', force = false) =>
+      report(progressPayload(progress, state, path, entryId), force);
 
-    emit('start', '', true);
+    emit('start', '', '', true);
 
     await runPool(
       plans,
@@ -104,32 +106,33 @@ export function createFsSink({ settings = {}, dirHandle, signal, total = 0, file
           return;
         }
         const label = relativePath(plan);
-        emit('file-start', label, true);
+        const entryId = entry && entry.id != null ? String(entry.id) : '';
+        emit('file-start', label, entryId, true);
         try {
           await writeEntry(fetcher, entry, plan, (_written, delta) => {
             progress.addBytes(delta); // 写完这一块才有资格计入 bytesDone
-            emit('progress', label, false);
+            emit('progress', label, entryId, false);
           });
           ok.push(entry);
           progress.endFile(false);
-          emit('file-done', label, true);
+          emit('file-done', label, entryId, true);
         } catch (err) {
           if ((signal && signal.aborted) || isAbort(err)) {
             // 半截文件写不出去，既不算成功也不进 failed
             aborted = true;
-            emit('aborted', label, true);
+            emit('aborted', label, entryId, true);
             return;
           }
           failed.push(toFailure(entry, plan, err));
           progress.endFile(true);
-          emit('file-failed', label, true);
+          emit('file-failed', label, entryId, true);
         }
       },
       { signal }
     );
 
     if (signal && signal.aborted) aborted = true;
-    emit('done', '', true);
+    emit('done', '', '', true);
     return { ok, failed, aborted };
   }
 

@@ -52,9 +52,11 @@ export function createDownloadSink({
     const progress = createProgressTracker(totalCount);
     let aborted = false;
 
-    const emit = (state, path, force) => report(progressPayload(progress, state, path), force);
+    // entryId 显式传参：并发文件共用一个 tracker，不能让 payload 取到别的文件的 id
+    const emit = (state, path, entryId = '', force = false) =>
+      report(progressPayload(progress, state, path, entryId), force);
 
-    emit('start', '', true);
+    emit('start', '', '', true);
 
     await runPool(
       plans,
@@ -69,7 +71,8 @@ export function createDownloadSink({
         const name = plan.fileName;
         const label = relativePath(plan);
         let objectUrl = null;
-        emit('file-start', label, true);
+        const entryId = entry && entry.id != null ? String(entry.id) : '';
+        emit('file-start', label, entryId, true);
         try {
           const response = await fetcher.fetchOk(entry.url, { signal });
           const blob = await response.blob();
@@ -89,7 +92,7 @@ export function createDownloadSink({
 
           ok.push(entry);
           progress.endFile(false);
-          emit('file-done', label, true);
+          emit('file-done', label, entryId, true);
         } catch (err) {
           if (objectUrl) {
             try {
@@ -100,19 +103,19 @@ export function createDownloadSink({
           }
           if ((signal && signal.aborted) || isAbort(err)) {
             aborted = true;
-            emit('aborted', label, true);
+            emit('aborted', label, entryId, true);
             return;
           }
           failed.push(toFailure(entry, plan, err));
           progress.endFile(true);
-          emit('file-failed', label, true);
+          emit('file-failed', label, entryId, true);
         }
       },
       { signal }
     );
 
     if (signal && signal.aborted) aborted = true;
-    emit('done', '', true);
+    emit('done', '', '', true);
     return { ok, failed, aborted };
   }
 

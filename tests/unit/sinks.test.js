@@ -749,3 +749,124 @@ test('download sink：bytesDone 按已交给浏览器的 blob 累加，failed �
   assert.equal(failure.error.includes('sig='), false);
   assert.equal(result.ok.length, 1);
 });
+// =========================== entryId（契约模块 B 的清单回写入口）===========================
+
+test('fs sink：file-start/file-done/file-failed 都带当前文件的 entryId，批次事件为空串', async () => {
+  const log = newLog();
+  const sink = createFsSink({ settings: { downloadConcurrency: 1 }, dirHandle: makeRoot(log), files, total: 2 });
+  const good = entry({ id: 'dt-content-rid-1', url: 'good', name: 'good.pdf' });
+  const bad = entry({ id: 'dt-content-rid-2', url: 'bad', name: 'bad.pdf' });
+  const fetcher = {
+    async fetchOk(url) {
+      if (url === 'bad') throw new Error('HttpError 500');
+      return chunkedResponse([4]);
+    }
+  };
+  const events = [];
+  const result = await sink.download([good, bad], fetcher, { onProgress: (p) => events.push(p) });
+
+  assert.deepEqual(result.failed.length, 1);
+  for (const p of events) {
+    assert.ok('entryId' in p, '进度负载缺 entryId 字段：' + JSON.stringify(p));
+  }
+  const byState = (s) => events.filter((p) => p.state === s);
+  assert.equal(byState('start')[0].entryId, '', '批次开始事件没有「当前文件」，entryId 必须是空串');
+  assert.equal(byState('done')[0].entryId, '', '批次结束事件 entryId 必须是空串');
+  assert.equal(byState('file-start')[0].entryId, 'dt-content-rid-1');
+  assert.equal(byState('file-done')[0].entryId, 'dt-content-rid-1');
+  assert.equal(byState('file-start')[1].entryId, 'dt-content-rid-2');
+  assert.equal(byState('file-failed')[0].entryId, 'dt-content-rid-2');
+  console.log('  [证据] file-done 事件：', JSON.stringify(byState('file-done')[0]));
+});
+
+test('fs sink：并发两个文件的 entryId 不串号（共用 tracker 也不能张冠李戴）', async () => {
+  const log = newLog();
+  const sink = createFsSink({ settings: { downloadConcurrency: 2 }, dirHandle: makeRoot(log), files, total: 2 });
+  const a = entry({ id: 'id-a', url: 'a', name: 'a.pdf' });
+  const b = entry({ id: 'id-b', url: 'b', name: 'b.pdf' });
+  const fetcher = {
+    async fetchOk() {
+      return chunkedResponse([4]);
+    }
+  };
+  const events = [];
+  await sink.download([a, b], fetcher, { onProgress: (p) => events.push(p) });
+
+  const done = events.filter((p) => p.state === 'file-done');
+  const map = new Map(done.map((p) => [p.currentPath, p.entryId]));
+  assert.deepEqual([...map.entries()].sort(), [
+    ['a.pdf', 'id-a'],
+    ['b.pdf', 'id-b']
+  ]);
+});
+
+test('download sink：file-start/file-failed 也带 entryId', async () => {
+  const { doc } = fakeDoc();
+  const urlApi = fakeUrlApi();
+  const sink = createDownloadSink({
+    settings: { downloadConcurrency: 1 },
+    files,
+    doc,
+    urlApi,
+    schedule: (fn) => {
+      fn();
+      return 0;
+    },
+    total: 2
+  });
+  const good = entry({ id: 'g-1', url: 'good', name: 'good.pdf' });
+  const bad = entry({ id: 'b-1', url: 'bad', name: 'bad.pdf' });
+  const fetcher = {
+    async fetchOk(url) {
+      if (url === 'bad') throw new Error('HttpError 404');
+      return {
+        ok: true,
+        async blob() {
+          return { size: 4 };
+        }
+      };
+    }
+  };
+  const events = [];
+  await sink.download([good, bad], fetcher, { onProgress: (p) => events.push(p) });
+
+  const byState = (s) => events.filter((p) => p.state === s);
+  assert.equal(byState('file-start')[0].entryId, 'g-1');
+  assert.equal(byState('file-done')[0].entryId, 'g-1');
+  assert.equal(byState('file-start')[1].entryId, 'b-1');
+  assert.equal(byState('file-failed')[0].entryId, 'b-1');
+  assert.equal(byState('done')[0].entryId, '');
+});
+
+test('progressPayload：entryId 新增但旧字段别名 state/name/done/failed/total/bytes 原样保留', async () => {
+  const shared = await import('../../src/sinks/shared.js');
+  const tracker = shared.createProgressTracker(3);
+  assert.equal(tracker.entryId, '', 'createProgressTracker 必须带 entryId 字段，默认空串');
+  tracker.addBytes(10);
+  tracker.addBytes(5);
+  tracker.endFile(false);
+  tracker.endFile(true);
+
+  const p = shared.progressPayload(tracker, 'file-done', 'Week 1/a.pdf', 'id-x');
+  assert.deepEqual(p, {
+    state: 'file-done',
+    name: 'Week 1/a.pdf',
+    done: 2,
+    failed: 1,
+    total: 3,
+    bytes: 15,
+    entryId: 'id-x',
+    filesDone: 2,
+    filesTotal: 3,
+    bytesDone: 15,
+    bytesTotal: 0,
+    currentPath: 'Week 1/a.pdf'
+  });
+
+  // 不传 entryId 时退回 tracker 上的默认值（旧调用点仍然可用）
+  assert.equal(shared.progressPayload(tracker, 'done', '').entryId, '');
+  // 老的三参调用点不需要改签名也能跑
+  const legacy = shared.progressPayload(tracker, 'start');
+  assert.equal(legacy.currentPath, '');
+  assert.equal(legacy.entryId, '');
+});

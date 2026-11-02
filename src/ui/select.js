@@ -70,6 +70,68 @@ function button(act, text, className) {
   return el;
 }
 
+/** 把 index.js 算好的跳过摘要归一化；缺字段一律当「没有可跳过的」处理。 */
+export function normalizeSkipInfo(raw) {
+  const info = raw || {};
+  const byId = new Map();
+  const source = info.byId instanceof Map ? Array.from(info.byId.entries()) : info.byId && typeof info.byId === 'object' ? Object.entries(info.byId) : [];
+  for (const pair of source) {
+    const id = pair[0];
+    const hit = pair[1];
+    if (!id || !hit) continue;
+    const reason = hit.reason === 'disk' || hit.reason === 'disk-unverified' || hit.reason === 'manifest' ? hit.reason : 'manifest';
+    const size = typeof hit.size === 'number' && Number.isFinite(hit.size) && hit.size >= 0 ? hit.size : null;
+    byId.set(String(id), { reason: reason, size: size });
+  }
+  let disk = 0;
+  let manifest = 0;
+  let unverified = 0;
+  byId.forEach(function (hit) {
+    if (hit.reason === 'manifest') manifest += 1;
+    else {
+      disk += 1;
+      if (hit.reason === 'disk-unverified') unverified += 1;
+    }
+  });
+  return {
+    byId: byId,
+    disk: disk,
+    manifest: manifest,
+    unverified: unverified,
+    total: byId.size,
+    truncated: !!info.truncated,
+    diskChecked: !!info.diskChecked
+  };
+}
+
+/** 复选框文案：数量与「磁盘/清单」两个来源分开写，用户才知道凭什么跳过。 */
+export function skipLabelText(info) {
+  const data = normalizeSkipInfo(info);
+  const parts = [];
+  if (data.disk) parts.push('磁盘 ' + data.disk);
+  if (data.manifest) parts.push('清单 ' + data.manifest);
+  return '跳过已存在的文件（' + data.total + ' 个' + (parts.length ? '，' + parts.join(' / ') : '') + '）';
+}
+
+/** 行内灰标的 title：说清这一行为什么会被跳过。 */
+export function skipReasonText(hit) {
+  const reason = hit && hit.reason;
+  if (reason === 'disk') return '磁盘上已有同名同体积的文件，勾选「跳过已存在的文件」时不下这个。';
+  if (reason === 'disk-unverified') return '磁盘上已有同名文件，但体积无法核实，按已存在处理。';
+  return '下载清单里这条已经是 done，勾选「跳过已存在的文件」时不下这个。';
+}
+
+/** 说明行：truncated / 无 FSA 两个降级路径必须显式说清楚，否则用户会以为「跳过」判断得很准。 */
+export function skipNoteText(info) {
+  const data = normalizeSkipInfo(info);
+  if (!data.total) return '';
+  const bits = [];
+  if (data.truncated) bits.push('目录里文件太多，本次只比对了前面一部分，可能漏判已存在的文件。');
+  if (!data.diskChecked) bits.push('还没有可核实的目录（或当前浏览器无法核实磁盘文件），只能按下载清单判断：清单里标着完成的才跳过。');
+  else if (data.unverified) bits.push('其中 ' + data.unverified + ' 个文件在磁盘上的体积无法核实，只能按文件名判断。');
+  return bits.join(' ');
+}
+
 export function openSelectDialog(entries, options) {
   const opts = options || {};
   const settings = opts.settings || {};
@@ -78,6 +140,9 @@ export function openSelectDialog(entries, options) {
   const pickDirectory = typeof opts.pickDirectory === 'function' ? opts.pickDirectory : function () {
     return null;
   };
+  // 跳过摘要由 index.js 用 planSkips 算好传进来；对话框自己不做磁盘或清单判断。
+  const skipInfo = normalizeSkipInfo(opts.skipInfo);
+  let skipExisting = skipInfo.total > 0;
 
   if (activeInstance) activeInstance.close(null);
   injectStyles();
@@ -143,6 +208,15 @@ export function openSelectDialog(entries, options) {
     treeSwitch.appendChild(treeInput);
     treeSwitch.appendChild(node('span', null, '保留原始目录结构'));
 
+    const skipSwitch = node('label', 'bbdl-switch bbdl-switch--skip');
+    const skipInput = node('input');
+    skipInput.type = 'checkbox';
+    skipInput.className = 'bbdl-check';
+    skipInput.checked = skipExisting;
+    skipSwitch.appendChild(skipInput);
+    skipSwitch.appendChild(node('span', null, skipLabelText(skipInfo)));
+    skipSwitch.title = skipNoteText(skipInfo) || '已存在（磁盘或清单里有记录）的文件不再重新下载';
+
     const sortSelect = node('select', 'bbdl-sort');
     sortSelect.setAttribute('aria-label', '排序方式');
     [
@@ -163,6 +237,7 @@ export function openSelectDialog(entries, options) {
     toolRow.appendChild(probeBtn);
     toolRow.appendChild(sortSelect);
     toolRow.appendChild(treeSwitch);
+    if (skipInfo.total) toolRow.appendChild(skipSwitch);
     toolRow.appendChild(hintEl);
 
     const searchInput = node('input', 'bbdl-search');
@@ -191,7 +266,11 @@ export function openSelectDialog(entries, options) {
     filterRow.appendChild(searchInput);
     filterRow.appendChild(typesEl);
 
+    const skipNoteEl = node('p', 'bbdl-note bbdl-note--skip', skipNoteText(skipInfo));
+    skipNoteEl.hidden = !skipNoteEl.textContent;
+
     toolbar.appendChild(toolRow);
+    if (!skipNoteEl.hidden) toolbar.appendChild(skipNoteEl);
     toolbar.appendChild(filterRow);
 
     const treeEl = node('div', 'bbdl-tree');
@@ -295,6 +374,13 @@ export function openSelectDialog(entries, options) {
 
         for (const entry of group.items) {
           const rowEl = node('label', 'bbdl-row bbdl-row--file');
+          const skipHit = skipInfo.byId.get(entry.id);
+          if (skipHit) {
+            // 灰标只是提示：这些行照样能勾选，「要不要跳过」由上面的复选框决定。
+            rowEl.classList.add('bbdl-row--skipped');
+            rowEl.dataset.skip = skipHit.reason;
+            rowEl.title = skipReasonText(skipHit);
+          }
           const input = node('input');
           input.type = 'checkbox';
           input.className = 'bbdl-check';
@@ -475,8 +561,13 @@ export function openSelectDialog(entries, options) {
       }
       const unknown = chosen.length - known;
       const amount = known ? formatBytes(bytes) : '—';
+      let skipped = 0;
+      if (skipExisting) {
+        for (const entry of chosen) if (skipInfo.byId.has(entry.id)) skipped += 1;
+      }
+      const skipText = skipped ? '，其中 ' + skipped + ' 个已存在会跳过' : '';
       totalsEl.textContent =
-        '已选 ' + chosen.length + ' / 共 ' + list.length + '，合计 ' + amount + (unknown ? '（' + unknown + ' 个体积未知）' : '');
+        '已选 ' + chosen.length + ' / 共 ' + list.length + '，合计 ' + amount + (unknown ? '（' + unknown + ' 个体积未知）' : '') + skipText;
       confirmBtn.disabled = chosen.length === 0;
       confirmBtn.title = chosen.length === 0 ? '至少选择一个文件' : '';
     }
@@ -527,7 +618,8 @@ export function openSelectDialog(entries, options) {
           entries: chosen,
           dirHandle: dirHandle,
           sizeRefresher: setRowSizeInternal,
-          expectedBytes: expectedTotalBytes(chosen)
+          expectedBytes: expectedTotalBytes(chosen),
+          skipExisting: skipExisting
         });
         return;
       }
@@ -536,7 +628,12 @@ export function openSelectDialog(entries, options) {
         showError('已取消选择文件夹，未开始下载。可再次点击「开始下载」，或改用默认下载。', true);
         return;
       }
-      close({ entries: chosen, sizeRefresher: setRowSizeInternal, expectedBytes: expectedTotalBytes(chosen) });
+      close({
+        entries: chosen,
+        sizeRefresher: setRowSizeInternal,
+        expectedBytes: expectedTotalBytes(chosen),
+        skipExisting: skipExisting
+      });
     }
 
     function onDirectoryFailed(err) {
@@ -555,7 +652,12 @@ export function openSelectDialog(entries, options) {
         showError('请至少选择一个文件。');
         return;
       }
-      close({ entries: chosen, sizeRefresher: setRowSizeInternal, expectedBytes: expectedTotalBytes(chosen) });
+      close({
+        entries: chosen,
+        sizeRefresher: setRowSizeInternal,
+        expectedBytes: expectedTotalBytes(chosen),
+        skipExisting: skipExisting
+      });
     });
 
     function handleConfirm() {
@@ -672,6 +774,13 @@ export function openSelectDialog(entries, options) {
       }
       renderPaths();
       renderMode();
+      renderTotals();
+    });
+
+    skipInput.addEventListener('change', function () {
+      skipExisting = skipInput.checked;
+      // 只影响「提交哪些 todo」，行渲染不动：勾选状态由 index.js 在下载前过滤。
+      setHint(skipExisting ? '已存在的文件会跳过，只下载缺的。' : '已取消跳过：选中的文件会全部重新下载。');
       renderTotals();
     });
 

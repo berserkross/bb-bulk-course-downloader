@@ -2,8 +2,9 @@ import { buildEntryPath, sanitizeSegment, dedupePaths } from '../bb/files.js';
 import { pickDirectory } from './picker.js';
 import { createFsSink } from './fs.js';
 import { createDownloadSink } from './download.js';
+import { listExistingFiles } from './existing.js';
 
-export { pickDirectory };
+export { pickDirectory, listExistingFiles };
 
 /** files.js 是纯函数模块，注入给 sink 而不是让 sink 自己 import，便于单测脱离 FSA 运行。 */
 const files = { buildEntryPath, sanitizeSegment, dedupePaths };
