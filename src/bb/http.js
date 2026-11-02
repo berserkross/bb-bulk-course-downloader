@@ -24,6 +24,22 @@ export class SessionExpiredError extends Error {
   }
 }
 
+/**
+ * 可疑响应：文件请求回了 text/html，但正文不像登录页（限流 / WAF 拦截 / 读不懂的异常页）。
+ * 这类失败多半是瞬时的，会话还活着 —— 所以既不判会话失效，也不能当场判死。
+ * message 固定文案，绝不复显原始 HTML、完整 URL 或 query。
+ */
+export class SuspectResponseError extends Error {
+  constructor(detail) {
+    const info = detail || {};
+    super('服务器返回了异常页面（疑似限流）');
+    this.name = 'SuspectResponseError';
+    this.htmlKind = info.htmlKind === 'login' || info.htmlKind === 'blocked' ? info.htmlKind : 'other';
+    this.status = Number.isFinite(Number(info.status)) ? Number(info.status) : 0;
+    this.path = pathnameOnly(info.path);
+  }
+}
+
 export class AbortError extends Error {
   constructor(message) {
     super(message || '操作已取消');
@@ -37,6 +53,11 @@ export function isAbortError(error) {
 
 export function isSessionExpired(error) {
   return !!error && (error instanceof SessionExpiredError || error.name === 'SessionExpiredError');
+}
+
+/** 只认 name：跨模块/跨上下文（userscript 包装层）时 instanceof 不一定成立。 */
+export function isSuspectResponse(error) {
+  return !!error && error.name === 'SuspectResponseError';
 }
 
 function linkSignals() {
@@ -109,16 +130,83 @@ function discardBody(response) {
   }
 }
 
-function assertAlive(response, requestedUrl) {
+/** 只取 pathname：错误里绝不放 query，更不放完整 URL。 */
+function pathnameOnly(value) {
+  const text = String(value == null ? '' : value);
+  if (!text) return '';
+  try {
+    return new URL(text).pathname || '';
+  } catch {
+    return text.split('#')[0].split('?')[0];
+  }
+}
+
+/** 三档归类的唯一出处：登录页 / 被拦 / 读不懂。只回种类，正文一个字都不外传。 */
+function htmlKindOf(text) {
+  const sample = String(text == null ? '' : text).slice(0, PROBE_HTML_LIMIT);
+  if (HTML_LOGIN_RE.test(sample)) return 'login';
+  if (HTML_BLOCKED_RE.test(sample)) return 'blocked';
+  return 'other';
+}
+
+/** 读够 PROBE_HTML_LIMIT 个字符就停：够判类，又不把整页塞进内存。读不动就按已读到的部分判。 */
+async function classifyHtmlKind(response) {
+  const body = response && response.body;
+  if (!body || typeof body.getReader !== 'function') {
+    let text = '';
+    try {
+      text = await response.text();
+    } catch {
+      text = '';
+    }
+    return htmlKindOf(text);
+  }
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let text = '';
+  try {
+    while (text.length < PROBE_HTML_LIMIT) {
+      const chunk = await reader.read();
+      if (!chunk || chunk.done) break;
+      text += decoder.decode(chunk.value, { stream: true });
+    }
+  } catch {
+    /* 读不动就按已读到的部分判类 */
+  } finally {
+    try {
+      const pending = reader.cancel();
+      if (pending && typeof pending.catch === 'function') pending.catch(() => {});
+    } catch {
+      /* 丢掉主体失败无需处理 */
+    }
+  }
+  return htmlKindOf(text);
+}
+
+/**
+ * 三档判定（契约 docs/m6-login.md §1.3）：
+ * - 重定向落到登录页 → 会话失效（保持不动）；
+ * - 文件请求回 text/html 且是登录页 → 会话失效（保持不动）；
+ * - 文件请求回 text/html 且是被拦 / 读不懂的异常页 → 可疑响应，交给上层的可疑预算慢重试；
+ * - 非 webdav 的 text/html 按现状不在这里判死（不改）。
+ */
+async function assertAlive(response, requestedUrl) {
   const finalUrl = String((response && response.url) || requestedUrl || '');
   const type = String((response && response.headers && response.headers.get('content-type')) || '').toLowerCase();
   const wantsFile = WEBDAV_RE.test(requestedUrl || '') || WEBDAV_RE.test(finalUrl);
   if (SESSION_URL_RE.test(finalUrl)) {
     throw new SessionExpiredError('会话已失效：请求被重定向到登录页 ' + finalUrl, { finalUrl });
   }
-  if (wantsFile && type.indexOf('text/html') !== -1) {
+  if (!wantsFile || type.indexOf('text/html') === -1) return;
+  const htmlKind = await classifyHtmlKind(response);
+  if (htmlKind === 'login') {
     throw new SessionExpiredError('会话已失效：文件请求返回了 HTML 页面 ' + finalUrl, { finalUrl, contentType: type });
   }
+  throw new SuspectResponseError({
+    htmlKind,
+    status: Number(response && response.status) || 0,
+    path: finalUrl || requestedUrl
+  });
 }
 
 function sizeFromHeaders(response) {
@@ -167,7 +255,7 @@ export function createFetcher(options) {
         throw error;
       }
       try {
-        assertAlive(response, requestedUrl);
+        await assertAlive(response, requestedUrl);
         if (!response.ok) throw new HttpError(response.status, response.url || requestedUrl);
       } catch (error) {
         discardBody(response);
@@ -256,9 +344,7 @@ export async function probeAlive(options) {
   text = String(text == null ? '' : text);
   if (text.length > PROBE_HTML_LIMIT) text = text.slice(0, PROBE_HTML_LIMIT);
   result.bytes = text.length;
-  if (HTML_LOGIN_RE.test(text)) result.htmlKind = 'login';
-  else if (HTML_BLOCKED_RE.test(text)) result.htmlKind = 'blocked';
-  else result.htmlKind = 'other';
+  result.htmlKind = htmlKindOf(text);
   return result;
 }
 

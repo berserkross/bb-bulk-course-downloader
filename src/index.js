@@ -373,7 +373,29 @@ export function createController(config) {
     return state.abort.signal;
   }
 
+  /**
+   * 清单里记住的真名（召回侧）：只有「下完了 + 版本指纹 href 没变 + 名字非空」三条同时成立才敢用。
+   * href 就是版本指纹 —— 上游换了一版，旧名字立刻作废，宁可退回页面标题。
+   */
+  function rememberedName(entry) {
+    const id = entry && entry.id !== null && entry.id !== undefined ? String(entry.id) : '';
+    if (!id) return '';
+    const recordedFiles = state.manifest && typeof state.manifest.files === 'object' ? state.manifest.files : null;
+    const record = recordedFiles && Object.prototype.hasOwnProperty.call(recordedFiles, id) ? recordedFiles[id] : null;
+    if (!record || record.status !== 'done') return '';
+    const name = typeof record.name === 'string' ? record.name : '';
+    if (!name) return '';
+    const recordedHref = record.href === null || record.href === undefined ? '' : String(record.href).trim();
+    const href = entry.href === null || entry.href === undefined ? '' : String(entry.href).trim();
+    return recordedHref === href ? name : '';
+  }
+
   function buildPlans(entries) {
+    // 就地覆盖：对话框预览、plan.fileName、失败文案读的都是 entry.name，改这一处三处同时对齐。
+    for (const entry of Array.isArray(entries) ? entries : []) {
+      const name = rememberedName(entry);
+      if (name) entry.name = name;
+    }
     return planBatch(entries, { preserveTree: settings.preserveTree !== false, files: files });
   }
 
@@ -873,6 +895,8 @@ export function createController(config) {
       panel.showSummary(resultForPanel(result, state.haltedPending));
     }
     noticePartialPackages(result);
+    // 降速提示放在最后：它是「本批次正在发生」的状态，盖住前一条静态提示也不会丢信息
+    noticeDegraded(result);
     return result;
   }
 
@@ -1011,6 +1035,21 @@ export function createController(config) {
   }
 
   /**
+   * 池子在疑似限流时自己降了速（docs/m6-login.md §3.4）：一句非阻塞提示，不弹窗、不阻断、不改终态。
+   * degraded 与 halted 一样是不可枚举属性，只能直接读 result.degraded。
+   * 文案里只允许出现数字：绝不带 URL / 参数 / 文件名。
+   */
+  function noticeDegraded(result) {
+    const degraded = result && result.degraded ? result.degraded : null;
+    if (!degraded || typeof panel.setNotice !== 'function') return;
+    const from = Math.floor(Number(degraded.from));
+    const to = Math.floor(Number(degraded.to));
+    if (!Number.isFinite(from) || !Number.isFinite(to)) return;
+    if (to >= from) return; // 没真的降就别说话
+    panel.setNotice('服务器似乎在限流，已把并发从 ' + from + ' 降到 ' + to + ' 继续下载。');
+  }
+
+  /**
    * 记下停机快照并竖横幅，返回快照数组（没停机就是空数组）。
    * halt 事件里的 pending 是数字，halted 里才是 entry 列表；zip sink 的 halted 干脆没有 pendingCount，
    * 所以这里按 pending.length 兜底，绝不把一个 undefined 递给面板。
@@ -1131,10 +1170,22 @@ export function createController(config) {
     return size;
   }
 
+  /**
+   * 清单写回：done 时把落盘真名一起写进去。sink 在 emit file-done 之前已把 plan.fileName 改成真名，
+   * 所以 payload.currentPath 就是落盘相对路径；路径末段即文件名（两者都要，见 store/db.js 的浅合并）。
+   */
   function noteRecord(p) {
     const id = p.entryId ? String(p.entryId) : '';
     if (!id) return;
-    state.pendingRecords.push({ id: id, status: p.state === FILE_DONE ? 'done' : 'failed', size: recordSizeOf(id) });
+    const done = p.state === FILE_DONE;
+    const record = { id: id, status: done ? 'done' : 'failed', size: recordSizeOf(id) };
+    const path = done && typeof p.currentPath === 'string' ? p.currentPath : '';
+    if (path) {
+      const at = path.lastIndexOf('/');
+      record.path = path;
+      record.name = at < 0 ? path : path.slice(at + 1);
+    }
+    state.pendingRecords.push(record);
     scheduleFlush();
   }
 

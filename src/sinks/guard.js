@@ -4,7 +4,19 @@
  * 于是这一层可以脱离 jsdom、用 node:test 直接跑纯时序逻辑。
  */
 
+import { isSuspectResponse } from '../bb/http.js';
+
 export const DEFAULT_IDLE_MS = 30000;
+
+/**
+ * 可疑响应（疑似限流 / WAF 拦截页）的独立预算：总尝试次数（1 + 2 次重试）。
+ * 它和调用方传入的 attempts（普通预算）互不占用 —— 限流不该吃掉「文件坏了再来一次」的额度。
+ */
+export const SUSPECT_ATTEMPTS = 3;
+/** 可疑重试的退避（毫秒）：不做随机抖动，限流下要的是慢下来，不是被打散。 */
+export const SUSPECT_DELAYS = [1500, 4000, 8000];
+/** 可疑重试的固定文案：面板据此显示「重试中（第 N 次）」，绝不带 URL。 */
+export const RETRY_SUSPECT_TEXT = '服务器返回异常页面，稍后重试';
 
 /** HTTP 状态里值得「整份文件再来一次」的那几个：限流与网关/服务端瞬时故障。 */
 const RETRIABLE_STATUS = new Set([429, 500, 502, 503, 504]);
@@ -48,6 +60,7 @@ export function isSessionExpiredError(err) {
 /**
  * 值得重试吗？
  * - AbortError / SessionExpiredError：重试没有意义（用户取消、会话已失效），立即放弃；
+ * - SuspectResponseError：会话还活着，只是被限流/被拦，值得慢一点再来一次（走可疑预算）；
  * - StallError / TruncatedError / TypeError（网络层）：典型的内容没到手，重试有效；
  * - 没有 status 的错误：分不清是网络层还是别的，按「值得再试一次」处理；
  * - HttpError：只有 429 与 5xx 网关类状态值得重试，其余 4xx 一定是权限/路径问题。
@@ -56,6 +69,7 @@ export function isRetriableError(err) {
   if (!err) return false;
   if (isAbortLike(err)) return false;
   if (isSessionExpiredError(err)) return false;
+  if (isSuspectResponse(err)) return true;
   if (err instanceof StallError || err.name === 'StallError') return true;
   if (err instanceof TruncatedError || err.name === 'TruncatedError') return true;
   if (err instanceof TypeError) return true;
@@ -152,28 +166,60 @@ export function createMutex() {
   };
 }
 
+/** 可疑重试的默认等待：只有可疑预算才睡，普通预算沿用既有「立刻再来」的节奏。 */
+function waitMs(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function countOf(value, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : fallback;
+}
+
+function notify(onRetry, info) {
+  if (typeof onRetry !== 'function') return;
+  try {
+    onRetry(info);
+  } catch {
+    /* 上报失败不该打断重试 */
+  }
+}
+
 /**
- * 整份文件级的重试：attempts 是总次数（1 = 不重试）。
+ * 整份文件级的重试：attempts 是普通预算的总次数（1 = 不重试）。
+ * 两本账分开记（docs/m6-login.md §2.2）：
+ * - 普通失败只扣普通预算，退避照旧由上层 fetch 层负责，这里不睡；
+ * - SuspectResponseError 只扣可疑预算（SUSPECT_ATTEMPTS），退避按 SUSPECT_DELAYS 睡，不抖动；
+ * - 任何一本账耗尽就结束，并把最后一次错误原样抛出。
  * AbortError 立即透传（用户取消不该被重试掩盖）；每次重试前先回调 onRetry。
  */
-export async function withFileRetry(fn, { attempts = 2, isRetriable = isRetriableError, onRetry } = {}) {
-  const total = Number.isFinite(Number(attempts)) && Number(attempts) >= 1 ? Math.floor(Number(attempts)) : 1;
-  let last = 0;
-  for (let attempt = 1; attempt <= total; attempt += 1) {
-    last = attempt;
+export async function withFileRetry(fn, { attempts = 2, isRetriable = isRetriableError, onRetry, sleep = waitMs } = {}) {
+  const total = countOf(attempts, 1);
+  const suspectTotal = SUSPECT_ATTEMPTS;
+  let attempt = 0;
+  let normal = 0;
+  let suspect = 0;
+  for (;;) {
+    attempt += 1;
     try {
       return await fn(attempt);
     } catch (err) {
       if (isAbortLike(err)) throw err;
-      if (attempt >= total || !isRetriable(err)) throw err;
-      if (typeof onRetry === 'function') {
-        try {
-          onRetry({ attempt, error: err });
-        } catch {
-          /* 上报失败不该打断重试 */
-        }
+      if (isSuspectResponse(err)) {
+        if (!isRetriable(err)) throw err;
+        suspect += 1;
+        if (suspect >= suspectTotal) throw err;
+        const delayMs = SUSPECT_DELAYS[Math.min(suspect - 1, SUSPECT_DELAYS.length - 1)];
+        notify(onRetry, { attempt, error: err, reason: RETRY_SUSPECT_TEXT, suspect: true, delayMs });
+        await sleep(delayMs);
+        continue;
       }
+      if (!isRetriable(err)) throw err;
+      normal += 1;
+      if (normal >= total) throw err;
+      notify(onRetry, { attempt, error: err });
     }
   }
-  throw new Error('withFileRetry：未进入任何一次尝试（attempts=' + last + '）');
 }

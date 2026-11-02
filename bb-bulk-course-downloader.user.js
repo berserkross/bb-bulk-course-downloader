@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BB 课件批量下载
 // @namespace    bb-bulk-course-downloader
-// @version      2.6.0
+// @version      2.7.0
 // @description  扫描 Blackboard 课程内容，勾选后按原始目录结构批量下载课件
 // @updateURL    https://raw.githubusercontent.com/berserkross/bb-bulk-course-downloader/main/bb-bulk-course-downloader.user.js
 // @downloadURL  https://raw.githubusercontent.com/berserkross/bb-bulk-course-downloader/main/bb-bulk-course-downloader.user.js
@@ -153,9 +153,94 @@
       }
     };
   }
+  function createEntryNamer({ files: files3, resolveFileName: resolveFileName2 } = {}) {
+    const resolve = typeof resolveFileName2 === "function" ? resolveFileName2 : null;
+    const dedupe = files3 && typeof files3.dedupePaths === "function" ? files3.dedupePaths : null;
+    const sanitize = files3 && typeof files3.sanitizeSegment === "function" ? files3.sanitizeSegment : null;
+    const dirs = /* @__PURE__ */ new Map();
+    const resolvedNames = /* @__PURE__ */ new Map();
+    function dirOf(plan) {
+      const segments = Array.isArray(plan && plan.segments) ? plan.segments : [];
+      const key = segments.join("\0");
+      let bucket = dirs.get(key);
+      if (!bucket) {
+        bucket = /* @__PURE__ */ new Map();
+        dirs.set(key, bucket);
+      }
+      return bucket;
+    }
+    function claim(plan, name) {
+      const bucket = dirOf(plan);
+      const taken = [];
+      for (const [owner, used] of bucket) if (owner !== plan) taken.push(String(used));
+      let chosen = name;
+      if (dedupe && taken.length) {
+        const seeded = taken.map((used) => ({ segments: [], fileName: used }));
+        seeded.push({ segments: [], fileName: name });
+        chosen = String(dedupe(seeded)[seeded.length - 1].fileName);
+      }
+      bucket.set(plan, chosen);
+      return chosen;
+    }
+    return {
+      /** 批次开始就把计划名登记上：还没开始的那些名字同样要挡住「后解析出来的真名」。 */
+      reserve(plan) {
+        if (!plan) return "";
+        if (plan.fileName) claim(plan, String(plan.fileName));
+        return String(plan.fileName);
+      },
+      /**
+       * 响应到达之后按契约 §1.3 解析真名，成功就就地替换 plan.fileName。
+       * 既无 disposition 又无 url 时一概不动：只有 title 兜底时，preserveTree=false 的
+       * 「folder__name」计划名会被改回裸名，那是既有行为的倒退。
+       */
+      resolve(plan, entry, response) {
+        if (!plan) return "";
+        const current = String(plan.fileName);
+        if (!resolve) return current;
+        const headers = response && response.headers;
+        const header = (field) => {
+          const raw2 = headers && typeof headers.get === "function" ? headers.get(field) : "";
+          return raw2 == null ? "" : String(raw2);
+        };
+        const disposition = header("content-disposition");
+        const finalUrl = response && typeof response.url === "string" ? response.url : "";
+        if (!disposition && !finalUrl) return current;
+        let raw = "";
+        try {
+          raw = resolve({
+            disposition,
+            finalUrl,
+            href: entry && entry.href != null ? String(entry.href) : "",
+            title: entry && entry.name != null ? String(entry.name) : "",
+            mime: header("content-type").split(";")[0].trim().toLowerCase()
+          });
+        } catch {
+          return current;
+        }
+        const name = raw == null ? "" : String(raw);
+        if (!name) return current;
+        if (resolvedNames.get(plan) === name) return current;
+        const clean = sanitize ? sanitize(name) : name;
+        if (!clean || clean === current) return current;
+        resolvedNames.set(plan, name);
+        plan.fileName = claim(plan, clean);
+        return String(plan.fileName);
+      }
+    };
+  }
   function withHalted(result, halted) {
     Object.defineProperty(result, "halted", {
       value: halted == null ? null : halted,
+      enumerable: false,
+      writable: true,
+      configurable: true
+    });
+    return result;
+  }
+  function withDegraded(result, degraded) {
+    Object.defineProperty(result, "degraded", {
+      value: degraded == null ? null : degraded,
       enumerable: false,
       writable: true,
       configurable: true
@@ -598,6 +683,11 @@
   function recordPathOf(record) {
     return record && record.path !== null && record.path !== void 0 ? String(record.path) : "";
   }
+  function lastSegmentOf(path) {
+    const text = String(path);
+    const at = text.lastIndexOf("/");
+    return at < 0 ? text : text.slice(at + 1);
+  }
   function recordFromPlan(plan, { status, size, now } = {}) {
     return {
       id: planId2(plan),
@@ -623,12 +713,15 @@
       const plan = byId.get(id) || null;
       const fresh = recordFromPlan(plan, { status: result.status, size: result.size, now });
       const previous = files3[id] && typeof files3[id] === "object" ? files3[id] : {};
+      const donePath = result.status === "done" && typeof result.path === "string" && result.path ? result.path : "";
+      const keptPath = plan ? fresh.path : recordPathOf(previous);
+      const keptName = plan ? fresh.name : String(previous.name === void 0 || previous.name === null ? "" : previous.name);
       files3[id] = {
         id,
         // plan 缺席（理论上不该发生）时保留上一版的 href / path，不能让清单丢字段变成死记录。
         href: plan ? fresh.href : recordHrefOf(previous),
-        path: plan ? fresh.path : recordPathOf(previous),
-        name: plan ? fresh.name : String(previous.name === void 0 || previous.name === null ? "" : previous.name),
+        path: donePath || keptPath,
+        name: donePath ? textOf(result.name) || lastSegmentOf(donePath) || keptName : keptName,
         size: fresh.size,
         status: fresh.status,
         updatedAt: fresh.updatedAt
@@ -798,6 +891,16 @@
       if (detail) Object.assign(this, detail);
     }
   };
+  var SuspectResponseError = class extends Error {
+    constructor(detail) {
+      const info = detail || {};
+      super("\u670D\u52A1\u5668\u8FD4\u56DE\u4E86\u5F02\u5E38\u9875\u9762\uFF08\u7591\u4F3C\u9650\u6D41\uFF09");
+      this.name = "SuspectResponseError";
+      this.htmlKind = info.htmlKind === "login" || info.htmlKind === "blocked" ? info.htmlKind : "other";
+      this.status = Number.isFinite(Number(info.status)) ? Number(info.status) : 0;
+      this.path = pathnameOnly(info.path);
+    }
+  };
   var AbortError = class extends Error {
     constructor(message) {
       super(message || "\u64CD\u4F5C\u5DF2\u53D6\u6D88");
@@ -809,6 +912,9 @@
   }
   function isSessionExpired(error) {
     return !!error && (error instanceof SessionExpiredError || error.name === "SessionExpiredError");
+  }
+  function isSuspectResponse(error) {
+    return !!error && error.name === "SuspectResponseError";
   }
   function linkSignals() {
     const list = [];
@@ -875,16 +981,69 @@
     } catch {
     }
   }
-  function assertAlive(response, requestedUrl) {
+  function pathnameOnly(value) {
+    const text = String(value == null ? "" : value);
+    if (!text) return "";
+    try {
+      return new URL(text).pathname || "";
+    } catch {
+      return text.split("#")[0].split("?")[0];
+    }
+  }
+  function htmlKindOf(text) {
+    const sample = String(text == null ? "" : text).slice(0, PROBE_HTML_LIMIT);
+    if (HTML_LOGIN_RE.test(sample)) return "login";
+    if (HTML_BLOCKED_RE.test(sample)) return "blocked";
+    return "other";
+  }
+  async function classifyHtmlKind(response) {
+    const body = response && response.body;
+    if (!body || typeof body.getReader !== "function") {
+      let text2 = "";
+      try {
+        text2 = await response.text();
+      } catch {
+        text2 = "";
+      }
+      return htmlKindOf(text2);
+    }
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let text = "";
+    try {
+      while (text.length < PROBE_HTML_LIMIT) {
+        const chunk = await reader.read();
+        if (!chunk || chunk.done) break;
+        text += decoder.decode(chunk.value, { stream: true });
+      }
+    } catch {
+    } finally {
+      try {
+        const pending = reader.cancel();
+        if (pending && typeof pending.catch === "function") pending.catch(() => {
+        });
+      } catch {
+      }
+    }
+    return htmlKindOf(text);
+  }
+  async function assertAlive(response, requestedUrl) {
     const finalUrl = String(response && response.url || requestedUrl || "");
     const type = String(response && response.headers && response.headers.get("content-type") || "").toLowerCase();
     const wantsFile = WEBDAV_RE.test(requestedUrl || "") || WEBDAV_RE.test(finalUrl);
     if (SESSION_URL_RE.test(finalUrl)) {
       throw new SessionExpiredError("\u4F1A\u8BDD\u5DF2\u5931\u6548\uFF1A\u8BF7\u6C42\u88AB\u91CD\u5B9A\u5411\u5230\u767B\u5F55\u9875 " + finalUrl, { finalUrl });
     }
-    if (wantsFile && type.indexOf("text/html") !== -1) {
+    if (!wantsFile || type.indexOf("text/html") === -1) return;
+    const htmlKind = await classifyHtmlKind(response);
+    if (htmlKind === "login") {
       throw new SessionExpiredError("\u4F1A\u8BDD\u5DF2\u5931\u6548\uFF1A\u6587\u4EF6\u8BF7\u6C42\u8FD4\u56DE\u4E86 HTML \u9875\u9762 " + finalUrl, { finalUrl, contentType: type });
     }
+    throw new SuspectResponseError({
+      htmlKind,
+      status: Number(response && response.status) || 0,
+      path: finalUrl || requestedUrl
+    });
   }
   function sizeFromHeaders(response) {
     if (!response || !response.headers) return void 0;
@@ -926,7 +1085,7 @@
           throw error;
         }
         try {
-          assertAlive(response, requestedUrl);
+          await assertAlive(response, requestedUrl);
           if (!response.ok) throw new HttpError(response.status, response.url || requestedUrl);
         } catch (error) {
           discardBody(response);
@@ -999,9 +1158,7 @@
     text = String(text == null ? "" : text);
     if (text.length > PROBE_HTML_LIMIT) text = text.slice(0, PROBE_HTML_LIMIT);
     result.bytes = text.length;
-    if (HTML_LOGIN_RE.test(text)) result.htmlKind = "login";
-    else if (HTML_BLOCKED_RE.test(text)) result.htmlKind = "blocked";
-    else result.htmlKind = "other";
+    result.htmlKind = htmlKindOf(text);
     return result;
   }
   function createHeartbeat(options) {
@@ -1184,6 +1341,80 @@
       out.push(Object.assign({}, source, { segments, fileName: candidate }));
     }
     return out;
+  }
+  var MIME_EXTENSIONS = /* @__PURE__ */ new Map([
+    ["application/pdf", ".pdf"],
+    ["application/vnd.openxmlformats-officedocument.wordprocessingml.document", ".docx"],
+    ["application/vnd.openxmlformats-officedocument.presentationml.presentation", ".pptx"],
+    ["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", ".xlsx"],
+    ["application/msword", ".doc"],
+    ["application/vnd.ms-powerpoint", ".ppt"],
+    ["application/vnd.ms-excel", ".xls"],
+    ["application/zip", ".zip"],
+    ["text/plain", ".txt"],
+    ["text/csv", ".csv"],
+    ["image/png", ".png"],
+    ["image/jpeg", ".jpg"],
+    ["image/gif", ".gif"],
+    ["application/octet-stream", ""]
+  ]);
+  function extensionForMime(mime) {
+    if (typeof mime !== "string") return "";
+    const key = mime.trim().toLowerCase();
+    const ext = MIME_EXTENSIONS.get(key);
+    return ext == null ? "" : ext;
+  }
+  var EXT_TAIL = /\.([A-Za-z0-9]{1,8})$/;
+  var PLACEHOLDER_STEM = /^(?:xid|pid)-/i;
+  function looksLikeFileName(name) {
+    if (typeof name !== "string" || name === "") return false;
+    if (/[\\/]/.test(name)) return false;
+    if (!EXT_TAIL.test(name)) return false;
+    return !PLACEHOLDER_STEM.test(name);
+  }
+  var RFC5987_VALUE = /^[^']*'[^']*'(.*)$/;
+  var STAR_FILENAME = /filename\*\s*=\s*(?:"([^"]*)"|([^;]*))/i;
+  var PLAIN_FILENAME = /filename\s*=\s*(?:"([^"]*)"|([^;]*))/i;
+  function headerValue(match) {
+    if (!match) return "";
+    const raw = match[1] != null ? match[1] : match[2];
+    return raw == null ? "" : raw.trim();
+  }
+  function starFileName(disposition) {
+    const value = headerValue(STAR_FILENAME.exec(disposition));
+    if (!value) return "";
+    const encoded = RFC5987_VALUE.exec(value);
+    return decodeName((encoded ? encoded[1] : value).trim());
+  }
+  function plainFileName(disposition) {
+    return decodeName(headerValue(PLAIN_FILENAME.exec(disposition)));
+  }
+  function lastSegmentHasDot(name) {
+    const parts = String(name).split(/[\\/]/);
+    const last = parts[parts.length - 1];
+    return last.includes(".");
+  }
+  function resolveFileName(input) {
+    const source = input || {};
+    const disposition = typeof source.disposition === "string" ? source.disposition : "";
+    const title = typeof source.title === "string" ? source.title.trim() : "";
+    const mime = typeof source.mime === "string" ? source.mime : "";
+    let name = disposition ? starFileName(disposition) || plainFileName(disposition) : "";
+    if (!name) {
+      const fromUrl = nameFromUrl(source.finalUrl);
+      if (fromUrl && looksLikeFileName(fromUrl) && fromUrl !== nameFromUrl(source.href)) name = fromUrl;
+    }
+    if (!name) name = title;
+    if (!name) return "";
+    if (title && !lastSegmentHasDot(name)) {
+      if (lastSegmentHasDot(title)) {
+        name = title;
+      } else {
+        const ext = extensionForMime(mime);
+        if (ext) name = title + ext;
+      }
+    }
+    return name;
   }
 
   // src/bb/dom.js
@@ -1525,10 +1756,33 @@
   }
 
   // src/sinks/pool.js
-  function createControl() {
+  var MIN_WIDTH = 1;
+  var MAX_DEGRADES = 2;
+  function normalizeWidth(value) {
+    const n = Math.floor(Number(value));
+    return Number.isFinite(n) && n >= MIN_WIDTH ? n : 0;
+  }
+  function createControl({ width } = {}) {
+    let steps = 0;
     const control = {
+      // 0 = 还没播种：runPool 一进来就用它收到的 concurrency 填上（契约 §3.1「初始值 = concurrency」）
+      width: normalizeWidth(width),
       stopped: false,
       reason: "",
+      /**
+       * 疑似限流时降一档：宽度减半向下取整（4→2→1），最低 1，单批次最多 2 次，之后是空操作。
+       * 返回降级后的 width（本次没降也返回当前 width），调用方据此判断「这次真的降了吗」。
+       */
+      degrade() {
+        if (control.width < MIN_WIDTH) control.width = MIN_WIDTH;
+        const from = control.width;
+        if (steps >= MAX_DEGRADES) return from;
+        const to = Math.max(MIN_WIDTH, Math.floor(from / 2));
+        if (to >= from) return from;
+        steps += 1;
+        control.width = to;
+        return to;
+      },
       stop(reason) {
         if (control.stopped) return;
         control.stopped = true;
@@ -1536,6 +1790,17 @@
       }
     };
     return control;
+  }
+  function degradeForSuspect(control, previous) {
+    const last = previous && typeof previous === "object" ? previous : null;
+    if (!control || typeof control.degrade !== "function") return last;
+    const from = Math.floor(Number(control.width));
+    if (!(from > MIN_WIDTH)) return last;
+    const to = control.degrade();
+    if (!(Number.isFinite(from) && Number.isFinite(to)) || to >= from) return last;
+    console.info("[bbdl] \u964D\u901F", { from, to, reason: "suspect-response" });
+    const kept = last && Number.isFinite(Number(last.from)) ? last.from : from;
+    return { from: kept, to };
   }
   function toList(items) {
     if (!items) return [];
@@ -1546,19 +1811,27 @@
   async function runPool(items, concurrency, worker, { signal, control } = {}) {
     const jobs = toList(items);
     if (!jobs.length) return;
-    const width = Math.min(Math.max(1, Math.floor(concurrency) || 1), jobs.length);
+    const requested = Math.max(1, Math.floor(concurrency) || 1);
+    const initial = Math.min(requested, jobs.length);
+    if (control && !(control.width >= 1)) control.width = requested;
     let cursor = 0;
     const stopped = () => Boolean(control && control.stopped) || Boolean(signal && signal.aborted);
-    async function drain() {
+    function widthNow() {
+      const raw = control ? Number(control.width) : NaN;
+      const w = Number.isFinite(raw) ? Math.floor(raw) : 0;
+      return Math.min(w >= 1 ? w : initial, jobs.length);
+    }
+    async function drain(index) {
       while (cursor < jobs.length) {
         if (stopped()) return;
+        if (index >= widthNow()) return;
         const job = jobs[cursor];
         cursor += 1;
         await worker(job);
       }
     }
     const workers = [];
-    for (let i = 0; i < width; i += 1) workers.push(drain());
+    for (let i = 0; i < initial; i += 1) workers.push(drain(i));
     await Promise.all(workers);
   }
 
@@ -1567,6 +1840,9 @@
 
   // src/sinks/guard.js
   var DEFAULT_IDLE_MS = 3e4;
+  var SUSPECT_ATTEMPTS = 3;
+  var SUSPECT_DELAYS = [1500, 4e3, 8e3];
+  var RETRY_SUSPECT_TEXT = "\u670D\u52A1\u5668\u8FD4\u56DE\u5F02\u5E38\u9875\u9762\uFF0C\u7A0D\u540E\u91CD\u8BD5";
   var RETRIABLE_STATUS = /* @__PURE__ */ new Set([429, 500, 502, 503, 504]);
   var StallError = class extends Error {
     constructor(message) {
@@ -1594,6 +1870,7 @@
     if (!err) return false;
     if (isAbortLike(err)) return false;
     if (isSessionExpiredError(err)) return false;
+    if (isSuspectResponse(err)) return true;
     if (err instanceof StallError || err.name === "StallError") return true;
     if (err instanceof TruncatedError || err.name === "TruncatedError") return true;
     if (err instanceof TypeError) return true;
@@ -1667,25 +1944,49 @@
       }
     };
   }
-  async function withFileRetry(fn, { attempts = 2, isRetriable = isRetriableError, onRetry } = {}) {
-    const total = Number.isFinite(Number(attempts)) && Number(attempts) >= 1 ? Math.floor(Number(attempts)) : 1;
-    let last = 0;
-    for (let attempt = 1; attempt <= total; attempt += 1) {
-      last = attempt;
+  function waitMs(ms) {
+    return new Promise((resolve) => {
+      setTimeout(resolve, ms);
+    });
+  }
+  function countOf(value, fallback) {
+    const n = Number(value);
+    return Number.isFinite(n) && n >= 1 ? Math.floor(n) : fallback;
+  }
+  function notify(onRetry, info) {
+    if (typeof onRetry !== "function") return;
+    try {
+      onRetry(info);
+    } catch {
+    }
+  }
+  async function withFileRetry(fn, { attempts = 2, isRetriable = isRetriableError, onRetry, sleep: sleep2 = waitMs } = {}) {
+    const total = countOf(attempts, 1);
+    const suspectTotal = SUSPECT_ATTEMPTS;
+    let attempt = 0;
+    let normal = 0;
+    let suspect = 0;
+    for (; ; ) {
+      attempt += 1;
       try {
         return await fn(attempt);
       } catch (err) {
         if (isAbortLike(err)) throw err;
-        if (attempt >= total || !isRetriable(err)) throw err;
-        if (typeof onRetry === "function") {
-          try {
-            onRetry({ attempt, error: err });
-          } catch {
-          }
+        if (isSuspectResponse(err)) {
+          if (!isRetriable(err)) throw err;
+          suspect += 1;
+          if (suspect >= suspectTotal) throw err;
+          const delayMs = SUSPECT_DELAYS[Math.min(suspect - 1, SUSPECT_DELAYS.length - 1)];
+          notify(onRetry, { attempt, error: err, reason: RETRY_SUSPECT_TEXT, suspect: true, delayMs });
+          await sleep2(delayMs);
+          continue;
         }
+        if (!isRetriable(err)) throw err;
+        normal += 1;
+        if (normal >= total) throw err;
+        notify(onRetry, { attempt, error: err });
       }
     }
-    throw new Error("withFileRetry\uFF1A\u672A\u8FDB\u5165\u4EFB\u4F55\u4E00\u6B21\u5C1D\u8BD5\uFF08attempts=" + last + "\uFF09");
   }
 
   // src/sinks/fs.js
@@ -1740,12 +2041,13 @@
       for (const seg of segments) dir = await dir.getDirectoryHandle(seg, { create: true });
       return dir;
     }
-    async function writeAttempt(fetcher, entry, plan, onChunk) {
+    async function writeAttempt(fetcher, entry, plan, onChunk, onName) {
       const response = await fetcher.fetchOk(entry.url, { signal });
       const body = response && response.body;
       if (!body || typeof body.getReader !== "function") {
         throw new Error("\u54CD\u5E94\u6CA1\u6709\u53EF\u8BFB\u4E3B\u4F53\uFF0C\u62D2\u7EDD\u5199\u5165\u7A7A\u6587\u4EF6");
       }
+      if (typeof onName === "function") onName(response);
       const dir = await dirFor(plan.segments);
       const fileHandle = await dir.getFileHandle(plan.fileName, { create: true });
       const writable = await fileHandle.createWritable();
@@ -1778,17 +2080,23 @@
       }
       return written;
     }
-    function writeEntry(fetcher, entry, plan, onChunk, { onRetry, onAttempt, onFileRetry, rollback } = {}) {
+    function writeEntry(fetcher, entry, plan, onChunk, { onRetry, onAttempt, onFileRetry, rollback, onName } = {}) {
       let attemptBytes = 0;
       return withFileRetry(
         // withFileRetry 把「本次是第几次」交回来：attempt 计数天然按文件各一份，并发下互不污染
         (attempt) => {
           attemptBytes = 0;
           if (typeof onAttempt === "function") onAttempt(attempt);
-          return writeAttempt(fetcher, entry, plan, (written, delta) => {
-            attemptBytes += delta;
-            onChunk(written, delta);
-          });
+          return writeAttempt(
+            fetcher,
+            entry,
+            plan,
+            (written, delta) => {
+              attemptBytes += delta;
+              onChunk(written, delta);
+            },
+            onName
+          );
         },
         {
           attempts: 1 + fileRetries,
@@ -1810,11 +2118,14 @@
       const totalCount = total || list.length;
       const ok = [];
       const failed = [];
+      const namer = createEntryNamer({ files: files3, resolveFileName });
+      for (const plan of plans) namer.reserve(plan);
       const report = createReporter({ onProgress });
       const progress = createProgressTracker(totalCount);
       const emitFile = createFileEmitter(onFileEvent);
       const control = createControl();
       let aborted = false;
+      let degraded = null;
       let workerStarted = 0;
       const emit = (state, path, entryId = "", force = false) => report(progressPayload(progress, state, path, entryId), force);
       emit("start", "", "", true);
@@ -1828,10 +2139,16 @@
             return;
           }
           if (control.stopped) return;
-          const label = relativePath(plan);
+          let label = relativePath(plan);
+          let fileName = plan.fileName;
           workerStarted += 1;
           const entryId = entry && entry.id != null ? String(entry.id) : "";
-          const fileName = plan.fileName;
+          const onName = (response) => {
+            const resolved = namer.resolve(plan, entry, response);
+            if (resolved === fileName) return;
+            fileName = resolved;
+            label = relativePath(plan);
+          };
           emit("file-start", label, entryId, true);
           try {
             const written = await writeEntry(
@@ -1843,10 +2160,15 @@
                 emit("progress", label, entryId, false);
               },
               {
+                onName,
                 // 重试会把上一次 abort 掉的字节扣回去，bytesDone 才等于最终落盘量
                 rollback: (n) => progress.rollbackBytes(n),
                 // 只报状态，不改旧字段：'file-retry' 是新增字符串，UI 认识就显示、不认识就忽略
-                onRetry: () => emit("file-retry", label, entryId, true),
+                // 可疑响应 = 疑似限流：这里只转达一次降速（次数由 control 自己封顶）
+                onRetry: (info) => {
+                  if (info && info.suspect) degraded = degradeForSuspect(control, degraded);
+                  emit("file-retry", label, entryId, true);
+                },
                 onAttempt: (attempt) => emitFile({ type: "start", entryId, path: label, name: fileName, attempt }),
                 onFileRetry: (info) => emitFile({
                   type: "retry",
@@ -1891,9 +2213,9 @@
           "\u843D\u76D8\u5C42\u6CA1\u6709\u5904\u7406\u4EFB\u4F55\u6587\u4EF6\uFF1A\u63D0\u4EA4 " + list.length + " \u4E2A\u3001\u8BA1\u5212 " + plans.length + " \u4E2A\u3001\u5E76\u53D1 " + concurrency + "\u3002"
         );
       }
-      return withHalted(
-        { ok, failed, aborted },
-        halted ? { reason: halted, pending, pendingCount: pending.length } : null
+      return withDegraded(
+        withHalted({ ok, failed, aborted }, halted ? { reason: halted, pending, pendingCount: pending.length } : null),
+        degraded
       );
     }
     return { kind: "fs", download };
@@ -2018,6 +2340,7 @@
       const emitFile = createFileEmitter(onFileEvent);
       const control = createControl();
       let aborted = false;
+      let degraded = null;
       const emit = (state, path, entryId = "", force = false) => report(progressPayload(progress, state, path, entryId), force);
       emit("start", "", "", true);
       async function attemptOnce(entry, deliver) {
@@ -2085,6 +2408,7 @@
                 attempts: 1 + fileRetries,
                 // 只报状态，不改旧字段：'file-retry' 是新增字符串，UI 认识就显示、不认识就忽略
                 onRetry: (info) => {
+                  if (info && info.suspect) degraded = degradeForSuspect(control, degraded);
                   emitFile({
                     type: "retry",
                     entryId,
@@ -2131,9 +2455,9 @@
       const pending = halted ? listPending(list, ok, failed) : [];
       if (halted) emitFile({ type: "halt", entryId: "", path: "", name: "", reason: halted, pending: pending.length });
       emit("done", "", "", true);
-      return withHalted(
-        { ok, failed, aborted },
-        halted ? { reason: halted, pending, pendingCount: pending.length } : null
+      return withDegraded(
+        withHalted({ ok, failed, aborted }, halted ? { reason: halted, pending, pendingCount: pending.length } : null),
+        degraded
       );
     }
     return { kind: "download", download };
@@ -2388,12 +2712,13 @@
       const expected = estimated === void 0 ? 0 : estimated;
       return sealedSize(pkg) + projectedGrowth(nameLength, expected) > chunkBytes;
     }
-    async function readEntry(fetcher, entry, onBytes) {
+    async function readEntry(fetcher, entry, onBytes, onName) {
       const response = await fetcher.fetchOk(entry.url, { signal });
       const body = response && response.body;
       if (!body || typeof body.getReader !== "function") {
         throw new Error("\u54CD\u5E94\u6CA1\u6709\u53EF\u8BFB\u4E3B\u4F53\uFF0C\u62D2\u7EDD\u5199\u5165\u7A7A\u6587\u4EF6");
       }
+      if (typeof onName === "function") onName(response);
       const reader = createIdleReader(body.getReader(), { idleMs });
       const parts = [];
       let size = 0;
@@ -2462,6 +2787,8 @@
     async function download(entries, fetcher, { onProgress, onFileEvent } = {}) {
       const list = Array.from(entries || []);
       const plans = planBatch(list, { preserveTree, files: files3 });
+      const namer = createEntryNamer({ files: files3, resolveFileName });
+      for (const plan of plans) namer.reserve(plan);
       const groups = groupPlans(plans);
       const ordered = groups.reduce((acc, group) => acc.concat(group.plans), []);
       const totalCount = total || list.length;
@@ -2471,8 +2798,10 @@
       const report = createReporter({ onProgress });
       const progress = createProgressTracker(totalCount);
       const emitFile = createFileEmitter(onFileEvent);
+      const control = createControl({ width: 1 });
       let aborted = false;
       let halted = null;
+      let degraded = null;
       let cursor = 0;
       const emit = (state, path, entryId = "", force = false) => report(progressPayload(progress, state, path, entryId), force);
       const stopNow = () => aborted || halted !== null;
@@ -2485,9 +2814,9 @@
           if (stopNow() || signal && signal.aborted) break;
           const entry = plan.entry;
           const entryId = entry && entry.id != null ? String(entry.id) : "";
-          const label = relativePath(plan);
-          const name = zipPath(plan);
-          const nameLength = toBytes(name).length;
+          let label = relativePath(plan);
+          let name = zipPath(plan);
+          const plannedNameLength = toBytes(name).length;
           const known = lookupSize(entry);
           if (broken) {
             const failure = toFailure(entry, plan, new Error(SKIPPED_AFTER_FAILURE));
@@ -2501,7 +2830,7 @@
             cursor += 1;
             continue;
           }
-          if (shouldCut(pkg, nameLength, known)) {
+          if (shouldCut(pkg, plannedNameLength, known)) {
             await flushPackage(pkg);
             pkg = newPackage(group.name);
             missing = 0;
@@ -2518,11 +2847,20 @@
               (attempt) => {
                 attemptBytes = 0;
                 if (attempt > 1) emitFile({ type: "start", entryId, path: label, name, attempt });
-                return readEntry(fetcher, entry, (delta) => {
-                  attemptBytes += delta;
-                  progress.addBytes(delta);
-                  emit("progress", label, entryId, false);
-                });
+                return readEntry(
+                  fetcher,
+                  entry,
+                  (delta) => {
+                    attemptBytes += delta;
+                    progress.addBytes(delta);
+                    emit("progress", label, entryId, false);
+                  },
+                  (response) => {
+                    namer.resolve(plan, entry, response);
+                    name = zipPath(plan);
+                    label = relativePath(plan);
+                  }
+                );
               },
               {
                 attempts: 1 + fileRetries,
@@ -2531,6 +2869,7 @@
                 onRetry: (info) => {
                   progress.rollbackBytes(attemptBytes);
                   attemptBytes = 0;
+                  if (info && info.suspect) degraded = degradeForSuspect(control, degraded);
                   emitFile({
                     type: "retry",
                     entryId,
@@ -2544,6 +2883,7 @@
               }
             );
             const stamp2 = dosDateTime(now());
+            const nameLength = toBytes(name).length;
             const header = localHeader({ name, time: stamp2.time, date: stamp2.date });
             const offset = pkg.bytes;
             pkg.parts.push(header);
@@ -2602,7 +2942,7 @@
         });
       }
       emit("done", "", "", true);
-      return withHalted({ ok, failed, aborted, partialPackages }, halted);
+      return withDegraded(withHalted({ ok, failed, aborted, partialPackages }, halted), degraded);
     }
     return { kind: "zip", download };
   }
@@ -3786,6 +4126,17 @@
     const raw = entry && typeof entry.status === "string" ? entry.status : "";
     return Object.prototype.hasOwnProperty.call(FILE_STATUS_TEXT, raw) ? raw : "waiting";
   }
+  function adoptResolvedName(record, event) {
+    const e = event || {};
+    const absolute = function(value) {
+      return /^[a-z][a-z0-9+.-]*:\/\//i.test(String(value == null ? "" : value).trim());
+    };
+    const name = absolute(e.name) ? "" : safeNameText(e.name);
+    if (name) record.name = name;
+    if (absolute(e.path)) return;
+    const dir = safePathText(e.path).replace(/^\/+|\/+$/g, "").replace(/\/[^/]*$/, "");
+    if (dir) record.path = dir;
+  }
   function entryPathText(entry) {
     const e = entry || {};
     const segments = Array.isArray(e.folderPath) ? e.folderPath : [];
@@ -4619,8 +4970,10 @@
         record.status = "done";
         const bytes = finiteNumber(e.bytes);
         if (bytes != null && bytes >= 0) record.bytes = bytes;
+        adoptResolvedName(record, e);
       } else {
         record.status = "failed";
+        adoptResolvedName(record, e);
       }
       paintFileRow(record);
     }
@@ -5942,7 +6295,23 @@
       state.abort = new AbortController();
       return state.abort.signal;
     }
+    function rememberedName(entry) {
+      const id = entry && entry.id !== null && entry.id !== void 0 ? String(entry.id) : "";
+      if (!id) return "";
+      const recordedFiles = state.manifest && typeof state.manifest.files === "object" ? state.manifest.files : null;
+      const record = recordedFiles && Object.prototype.hasOwnProperty.call(recordedFiles, id) ? recordedFiles[id] : null;
+      if (!record || record.status !== "done") return "";
+      const name = typeof record.name === "string" ? record.name : "";
+      if (!name) return "";
+      const recordedHref = record.href === null || record.href === void 0 ? "" : String(record.href).trim();
+      const href = entry.href === null || entry.href === void 0 ? "" : String(entry.href).trim();
+      return recordedHref === href ? name : "";
+    }
     function buildPlans(entries) {
+      for (const entry of Array.isArray(entries) ? entries : []) {
+        const name = rememberedName(entry);
+        if (name) entry.name = name;
+      }
       return planBatch(entries, { preserveTree: settings.preserveTree !== false, files: files2 });
     }
     async function existingSnapshot(dirHandle, signal, force) {
@@ -6334,6 +6703,7 @@
         panel.showSummary(resultForPanel(result, state.haltedPending));
       }
       noticePartialPackages(result);
+      noticeDegraded(result);
       return result;
     }
     function waitAbortable(ms, signal) {
@@ -6441,6 +6811,15 @@
         "\u672C\u6B21\u6709 " + list.length + " \u4E2A\u5305\u53EA\u4EA4\u4ED8\u4E86\u90E8\u5206\u6587\u4EF6\uFF08\u5171\u7F3A " + missing + " \u4E2A\uFF09\uFF0C\u5176\u4F59\u5DF2\u8BB0\u4E3A\u5931\u8D25\u53EF\u91CD\u8BD5\u3002"
       );
     }
+    function noticeDegraded(result) {
+      const degraded = result && result.degraded ? result.degraded : null;
+      if (!degraded || typeof panel.setNotice !== "function") return;
+      const from = Math.floor(Number(degraded.from));
+      const to = Math.floor(Number(degraded.to));
+      if (!Number.isFinite(from) || !Number.isFinite(to)) return;
+      if (to >= from) return;
+      panel.setNotice("\u670D\u52A1\u5668\u4F3C\u4E4E\u5728\u9650\u6D41\uFF0C\u5DF2\u628A\u5E76\u53D1\u4ECE " + from + " \u964D\u5230 " + to + " \u7EE7\u7EED\u4E0B\u8F7D\u3002");
+    }
     function rememberHalted(halted) {
       if (!halted) {
         clearHaltedBanner();
@@ -6528,7 +6907,15 @@
     function noteRecord(p) {
       const id = p.entryId ? String(p.entryId) : "";
       if (!id) return;
-      state.pendingRecords.push({ id, status: p.state === FILE_DONE ? "done" : "failed", size: recordSizeOf(id) });
+      const done = p.state === FILE_DONE;
+      const record = { id, status: done ? "done" : "failed", size: recordSizeOf(id) };
+      const path = done && typeof p.currentPath === "string" ? p.currentPath : "";
+      if (path) {
+        const at = path.lastIndexOf("/");
+        record.path = path;
+        record.name = at < 0 ? path : path.slice(at + 1);
+      }
+      state.pendingRecords.push(record);
       scheduleFlush();
     }
     function scheduleFlush() {

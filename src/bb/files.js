@@ -158,3 +158,105 @@ export function dedupePaths(list) {
   }
   return out;
 }
+
+const MIME_EXTENSIONS = new Map([
+  ['application/pdf', '.pdf'],
+  ['application/vnd.openxmlformats-officedocument.wordprocessingml.document', '.docx'],
+  ['application/vnd.openxmlformats-officedocument.presentationml.presentation', '.pptx'],
+  ['application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', '.xlsx'],
+  ['application/msword', '.doc'],
+  ['application/vnd.ms-powerpoint', '.ppt'],
+  ['application/vnd.ms-excel', '.xls'],
+  ['application/zip', '.zip'],
+  ['text/plain', '.txt'],
+  ['text/csv', '.csv'],
+  ['image/png', '.png'],
+  ['image/jpeg', '.jpg'],
+  ['image/gif', '.gif'],
+  ['application/octet-stream', '']
+]);
+
+/**
+ * MIME → 带点后缀。未知类型返回空串，调用方据此决定是否补后缀。
+ * @param {string} mime content-type 去掉 charset 之后的小写 MIME
+ * @returns {string}
+ */
+export function extensionForMime(mime) {
+  if (typeof mime !== 'string') return '';
+  const key = mime.trim().toLowerCase();
+  const ext = MIME_EXTENSIONS.get(key);
+  return ext == null ? '' : ext;
+}
+
+const EXT_TAIL = /\.([A-Za-z0-9]{1,8})$/;
+const PLACEHOLDER_STEM = /^(?:xid|pid)-/i;
+
+/**
+ * 判断一个 URL 末段/字符串是否像真文件名（BB 的 xid-/pid- 末段是资源 id，不是名字）。
+ * @param {string} name
+ * @returns {boolean}
+ */
+export function looksLikeFileName(name) {
+  if (typeof name !== 'string' || name === '') return false;
+  if (/[\\/]/.test(name)) return false;
+  if (!EXT_TAIL.test(name)) return false;
+  return !PLACEHOLDER_STEM.test(name);
+}
+
+const RFC5987_VALUE = /^[^']*'[^']*'(.*)$/;
+const STAR_FILENAME = /filename\*\s*=\s*(?:"([^"]*)"|([^;]*))/i;
+const PLAIN_FILENAME = /filename\s*=\s*(?:"([^"]*)"|([^;]*))/i;
+
+function headerValue(match) {
+  if (!match) return '';
+  const raw = match[1] != null ? match[1] : match[2];
+  return raw == null ? '' : raw.trim();
+}
+
+function starFileName(disposition) {
+  const value = headerValue(STAR_FILENAME.exec(disposition));
+  if (!value) return '';
+  const encoded = RFC5987_VALUE.exec(value);
+  return decodeName((encoded ? encoded[1] : value).trim());
+}
+
+function plainFileName(disposition) {
+  return decodeName(headerValue(PLAIN_FILENAME.exec(disposition)));
+}
+
+function lastSegmentHasDot(name) {
+  const parts = String(name).split(/[\\/]/);
+  const last = parts[parts.length - 1];
+  return last.includes('.');
+}
+
+/**
+ * 按 fork 原实现的顺序定名：Content-Disposition → 重定向后的 URL 末段 → 显示标题。
+ * 只产名字，不负责 sanitizeSegment；拿不到任何线索返回空串，由调用方保留原文件名。
+ * @param {{ disposition?: string, finalUrl?: string, href?: string, title?: string, mime?: string }} [input]
+ * @returns {string}
+ */
+export function resolveFileName(input) {
+  const source = input || {};
+  const disposition = typeof source.disposition === 'string' ? source.disposition : '';
+  const title = typeof source.title === 'string' ? source.title.trim() : '';
+  const mime = typeof source.mime === 'string' ? source.mime : '';
+
+  let name = disposition ? starFileName(disposition) || plainFileName(disposition) : '';
+  if (!name) {
+    const fromUrl = nameFromUrl(source.finalUrl);
+    if (fromUrl && looksLikeFileName(fromUrl) && fromUrl !== nameFromUrl(source.href)) name = fromUrl;
+  }
+  if (!name) name = title;
+  if (!name) return '';
+
+  if (title && !lastSegmentHasDot(name)) {
+    if (lastSegmentHasDot(title)) {
+      name = title;
+    } else {
+      const ext = extensionForMime(mime);
+      if (ext) name = title + ext;
+    }
+  }
+  return name;
+}

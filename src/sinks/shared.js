@@ -191,6 +191,93 @@ export function createFileEmitter(onFileEvent) {
 }
 
 /**
+ * 运行期名字登记 + 服务器真名解析（docs/m5-naming.md §2）。
+ * planBatch 的 dedupePaths 在解析之前就跑完了：响应到达之后改名必须重新登记一次冲突，
+ * 否则两个条目解析出同名会互相覆盖（fs 里 create:true 后写覆盖先写，zip 里包内出现重复路径）。
+ */
+export function createEntryNamer({ files, resolveFileName } = {}) {
+  const resolve = typeof resolveFileName === 'function' ? resolveFileName : null;
+  const dedupe = files && typeof files.dedupePaths === 'function' ? files.dedupePaths : null;
+  const sanitize = files && typeof files.sanitizeSegment === 'function' ? files.sanitizeSegment : null;
+  const dirs = new Map(); // 目录键 -> Map<plan, 已认领的名字>
+  const resolvedNames = new Map(); // plan -> 上一次解析出的原始名字（重试时必须幂等）
+
+  function dirOf(plan) {
+    const segments = Array.isArray(plan && plan.segments) ? plan.segments : [];
+    const key = segments.join('\u0000');
+    let bucket = dirs.get(key);
+    if (!bucket) {
+      bucket = new Map();
+      dirs.set(key, bucket);
+    }
+    return bucket;
+  }
+
+  /** 认领一个名字：目录内已被别的条目占住时，照样按 dedupePaths 的 (2)/(3) 规则顺延。 */
+  function claim(plan, name) {
+    const bucket = dirOf(plan);
+    const taken = [];
+    for (const [owner, used] of bucket) if (owner !== plan) taken.push(String(used));
+    let chosen = name;
+    if (dedupe && taken.length) {
+      const seeded = taken.map((used) => ({ segments: [], fileName: used }));
+      seeded.push({ segments: [], fileName: name });
+      chosen = String(dedupe(seeded)[seeded.length - 1].fileName);
+    }
+    bucket.set(plan, chosen);
+    return chosen;
+  }
+
+  return {
+    /** 批次开始就把计划名登记上：还没开始的那些名字同样要挡住「后解析出来的真名」。 */
+    reserve(plan) {
+      if (!plan) return '';
+      if (plan.fileName) claim(plan, String(plan.fileName));
+      return String(plan.fileName);
+    },
+    /**
+     * 响应到达之后按契约 §1.3 解析真名，成功就就地替换 plan.fileName。
+     * 既无 disposition 又无 url 时一概不动：只有 title 兜底时，preserveTree=false 的
+     * 「folder__name」计划名会被改回裸名，那是既有行为的倒退。
+     */
+    resolve(plan, entry, response) {
+      if (!plan) return '';
+      const current = String(plan.fileName);
+      if (!resolve) return current;
+      const headers = response && response.headers;
+      const header = (field) => {
+        const raw = headers && typeof headers.get === 'function' ? headers.get(field) : '';
+        return raw == null ? '' : String(raw);
+      };
+      const disposition = header('content-disposition');
+      const finalUrl = response && typeof response.url === 'string' ? response.url : '';
+      if (!disposition && !finalUrl) return current;
+      let raw = '';
+      try {
+        raw = resolve({
+          disposition,
+          finalUrl,
+          href: entry && entry.href != null ? String(entry.href) : '',
+          title: entry && entry.name != null ? String(entry.name) : '',
+          mime: header('content-type').split(';')[0].trim().toLowerCase()
+        });
+      } catch {
+        return current; // 契约 §2.5：解析不出名字就保持原值，绝不产出空名
+      }
+      const name = raw == null ? '' : String(raw);
+      if (!name) return current;
+      // 文件级重试会把同一个响应再解析一遍：同一个原始名字只能认领一次
+      if (resolvedNames.get(plan) === name) return current;
+      const clean = sanitize ? sanitize(name) : name;
+      if (!clean || clean === current) return current;
+      resolvedNames.set(plan, name);
+      plan.fileName = claim(plan, clean);
+      return String(plan.fileName);
+    }
+  };
+}
+
+/**
  * 批次返回值上的 halted（契约 §2）。
  * 既有测试用 deepEqual 断言「ok / failed / aborted 三字段」，而 deepEqual 只比较可枚举的自身属性：
  * 于是 halted 以**不可枚举**属性挂上去 —— result.halted 照常可读，旧契约的等值断言一字不改。
@@ -198,6 +285,21 @@ export function createFileEmitter(onFileEvent) {
 export function withHalted(result, halted) {
   Object.defineProperty(result, 'halted', {
     value: halted == null ? null : halted,
+    enumerable: false,
+    writable: true,
+    configurable: true
+  });
+  return result;
+}
+
+/**
+ * 批次返回值上的 degraded（docs/m6-login.md §3.3）：{ from, to } | null。
+ * 与 halted 同法挂成**不可枚举**属性：result.degraded 照常可读，
+ * 而既有 sinks / zip-sink 的整对象 deepEqual 断言一字不用改。
+ */
+export function withDegraded(result, degraded) {
+  Object.defineProperty(result, 'degraded', {
+    value: degraded == null ? null : degraded,
     enumerable: false,
     writable: true,
     configurable: true

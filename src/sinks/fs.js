@@ -1,4 +1,5 @@
-import { runPool, createControl } from './pool.js';
+import { runPool, createControl, degradeForSuspect } from './pool.js';
+import { resolveFileName } from '../bb/files.js';
 import {
   planBatch,
   createReporter,
@@ -9,7 +10,9 @@ import {
   isAbort,
   retryReason,
   createFileEmitter,
+  createEntryNamer,
   withHalted,
+  withDegraded,
   listPending
 } from './shared.js';
 import { createIdleReader, withFileRetry, TruncatedError, DEFAULT_IDLE_MS, isSessionExpiredError } from './guard.js';
@@ -90,12 +93,15 @@ export function createFsSink({ settings = {}, dirHandle, signal, total = 0, file
    * 一次完整的落盘尝试：建 writable → 读流 → 完整性校验 → close。
    * 任何一步失败都会 cancel reader + abort writable，半截文件绝不留在磁盘上被当成成功。
    */
-  async function writeAttempt(fetcher, entry, plan, onChunk) {
+  async function writeAttempt(fetcher, entry, plan, onChunk, onName) {
     const response = await fetcher.fetchOk(entry.url, { signal });
     const body = response && response.body;
     if (!body || typeof body.getReader !== 'function') {
       throw new Error('响应没有可读主体，拒绝写入空文件');
     }
+
+    // 契约 §2.1：响应已经到手、writable 和文件句柄都还没建 —— 真名恰好在这一点落地
+    if (typeof onName === 'function') onName(response);
 
     const dir = await dirFor(plan.segments);
     const fileHandle = await dir.getFileHandle(plan.fileName, { create: true });
@@ -143,17 +149,23 @@ export function createFsSink({ settings = {}, dirHandle, signal, total = 0, file
    * attemptBytes 是「本次尝试已经计入 tracker 的字节数」：被 abort 的那一份没有落地，
    * 重试前必须按它回退，否则 bytesDone 会大于真实落盘量（一个文件重试成功却显示 32/28）。
    */
-  function writeEntry(fetcher, entry, plan, onChunk, { onRetry, onAttempt, onFileRetry, rollback } = {}) {
+  function writeEntry(fetcher, entry, plan, onChunk, { onRetry, onAttempt, onFileRetry, rollback, onName } = {}) {
     let attemptBytes = 0;
     return withFileRetry(
       // withFileRetry 把「本次是第几次」交回来：attempt 计数天然按文件各一份，并发下互不污染
       (attempt) => {
         attemptBytes = 0;
         if (typeof onAttempt === 'function') onAttempt(attempt);
-        return writeAttempt(fetcher, entry, plan, (written, delta) => {
-          attemptBytes += delta;
-          onChunk(written, delta);
-        });
+        return writeAttempt(
+          fetcher,
+          entry,
+          plan,
+          (written, delta) => {
+            attemptBytes += delta;
+            onChunk(written, delta);
+          },
+          onName
+        );
       },
       {
         attempts: 1 + fileRetries,
@@ -178,6 +190,9 @@ export function createFsSink({ settings = {}, dirHandle, signal, total = 0, file
     const totalCount = total || list.length;
     const ok = [];
     const failed = [];
+    // 契约 §2.3：解析出来的真名要重新做一次冲突登记（planBatch 的 dedupe 在解析之前就跑完了）
+    const namer = createEntryNamer({ files, resolveFileName });
+    for (const plan of plans) namer.reserve(plan);
     const report = createReporter({ onProgress });
     const progress = createProgressTracker(totalCount);
     // 停机闸门无条件开启：会话过期是「停机」而不是「文件下载失败」，这个记录语义绝不能取决于
@@ -185,6 +200,8 @@ export function createFsSink({ settings = {}, dirHandle, signal, total = 0, file
     const emitFile = createFileEmitter(onFileEvent);
     const control = createControl();
     let aborted = false;
+    // 疑似限流引发的降速记录（契约 §3.3）：{ from, to } | null，最终挂成不可枚举属性
+    let degraded = null;
     // 诊断计数：worker 到底有没有被调用。入口计数是「计划存在但池子没跑」与「池子跑了却什么都没记」的唯一分界。
     let workerStarted = 0;
 
@@ -205,10 +222,17 @@ export function createFsSink({ settings = {}, dirHandle, signal, total = 0, file
         }
         // 会话过期停机之后不再启动新文件（在飞的那几个自然结束）
         if (control.stopped) return;
-        const label = relativePath(plan);
+        // 契约 §2.2：盘上的名字、事件里的 name、进度里的 path 末段必须同源，所以这两个都读可变绑定
+        let label = relativePath(plan);
+        let fileName = plan.fileName;
         workerStarted += 1;
         const entryId = entry && entry.id != null ? String(entry.id) : '';
-        const fileName = plan.fileName;
+        const onName = (response) => {
+          const resolved = namer.resolve(plan, entry, response);
+          if (resolved === fileName) return;
+          fileName = resolved;
+          label = relativePath(plan);
+        };
         emit('file-start', label, entryId, true);
         try {
           const written = await writeEntry(
@@ -220,10 +244,15 @@ export function createFsSink({ settings = {}, dirHandle, signal, total = 0, file
               emit('progress', label, entryId, false);
             },
             {
+              onName,
               // 重试会把上一次 abort 掉的字节扣回去，bytesDone 才等于最终落盘量
               rollback: (n) => progress.rollbackBytes(n),
               // 只报状态，不改旧字段：'file-retry' 是新增字符串，UI 认识就显示、不认识就忽略
-              onRetry: () => emit('file-retry', label, entryId, true),
+              // 可疑响应 = 疑似限流：这里只转达一次降速（次数由 control 自己封顶）
+              onRetry: (info) => {
+                if (info && info.suspect) degraded = degradeForSuspect(control, degraded);
+                emit('file-retry', label, entryId, true);
+              },
               onAttempt: (attempt) => emitFile({ type: 'start', entryId, path: label, name: fileName, attempt }),
               onFileRetry: (info) =>
                 emitFile({
@@ -276,9 +305,10 @@ export function createFsSink({ settings = {}, dirHandle, signal, total = 0, file
         '落盘层没有处理任何文件：提交 ' + list.length + ' 个、计划 ' + plans.length + ' 个、并发 ' + concurrency + '。'
       );
     }
-    return withHalted(
-      { ok, failed, aborted },
-      halted ? { reason: halted, pending, pendingCount: pending.length } : null
+    // degraded 与 halted 同法不可枚举：result.degraded 可读，既有整对象断言一字不改
+    return withDegraded(
+      withHalted({ ok, failed, aborted }, halted ? { reason: halted, pending, pendingCount: pending.length } : null),
+      degraded
     );
   }
 

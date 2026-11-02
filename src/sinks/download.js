@@ -1,4 +1,4 @@
-import { runPool, createControl } from './pool.js';
+import { runPool, createControl, degradeForSuspect } from './pool.js';
 import {
   planBatch,
   createReporter,
@@ -10,6 +10,7 @@ import {
   retryReason,
   createFileEmitter,
   withHalted,
+  withDegraded,
   listPending
 } from './shared.js';
 import { StallError, withFileRetry, createMutex, DEFAULT_IDLE_MS, isSessionExpiredError } from './guard.js';
@@ -162,6 +163,8 @@ export function createDownloadSink({
     const emitFile = createFileEmitter(onFileEvent);
     const control = createControl();
     let aborted = false;
+    // 疑似限流引发的降速记录（契约 §3.3）：{ from, to } | null，最终挂成不可枚举属性
+    let degraded = null;
 
     // entryId 显式传参：并发文件共用一个 tracker，不能让 payload 取到别的文件的 id
     const emit = (state, path, entryId = '', force = false) =>
@@ -250,6 +253,8 @@ export function createDownloadSink({
               attempts: 1 + fileRetries,
               // 只报状态，不改旧字段：'file-retry' 是新增字符串，UI 认识就显示、不认识就忽略
               onRetry: (info) => {
+                // 可疑响应 = 疑似限流：这里只转达一次降速（次数由 control 自己封顶）
+                if (info && info.suspect) degraded = degradeForSuspect(control, degraded);
                 // 此刻第 N 次已失败、第 N+1 次还没开始（契约 §1 的 retry 时机）
                 emitFile({
                   type: 'retry',
@@ -303,9 +308,10 @@ export function createDownloadSink({
     const pending = halted ? listPending(list, ok, failed) : [];
     if (halted) emitFile({ type: 'halt', entryId: '', path: '', name: '', reason: halted, pending: pending.length });
     emit('done', '', '', true);
-    return withHalted(
-      { ok, failed, aborted },
-      halted ? { reason: halted, pending, pendingCount: pending.length } : null
+    // degraded 与 halted 同法不可枚举：result.degraded 可读，既有整对象断言一字不改
+    return withDegraded(
+      withHalted({ ok, failed, aborted }, halted ? { reason: halted, pending, pendingCount: pending.length } : null),
+      degraded
     );
   }
 

@@ -43,6 +43,13 @@ function recordPathOf(record) {
   return record && record.path !== null && record.path !== undefined ? String(record.path) : '';
 }
 
+/** 落盘相对路径的末段就是落盘文件名（真名落盘后由 sink 填进进度载荷的 currentPath）。 */
+function lastSegmentOf(path) {
+  const text = String(path);
+  const at = text.lastIndexOf('/');
+  return at < 0 ? text : text.slice(at + 1);
+}
+
 /**
  * @param {{ entry: object, segments: string[], fileName: string }} plan
  * @param {{ status?: string, size?: number | null, now?: number }} [input]
@@ -63,7 +70,7 @@ export function recordFromPlan(plan, { status, size, now } = {}) {
 /**
  * @param {object | null} manifest 上一版清单（不改它）
  * @param {Array<object>} plans 本次的落盘计划，用来补 path / name / href
- * @param {Array<{ id: string, status: string, size?: number | null }>} results 下载结果
+ * @param {Array<{ id: string, status: string, size?: number | null, path?: string, name?: string }>} results 下载结果
  * @param {number} [now]
  * @returns {{ courseId: string, version: number, updatedAt: number, files: Record<string, object> }}
  */
@@ -81,12 +88,16 @@ export function updateRecords(manifest, plans, results, now) {
     const plan = byId.get(id) || null;
     const fresh = recordFromPlan(plan, { status: result.status, size: result.size, now });
     const previous = files[id] && typeof files[id] === 'object' ? files[id] : {};
+    // 只有「确实下完了」才认结果自带的名字：真名是落盘事实，plan 里的名字只是页面标题。
+    const donePath = result.status === 'done' && typeof result.path === 'string' && result.path ? result.path : '';
+    const keptPath = plan ? fresh.path : recordPathOf(previous);
+    const keptName = plan ? fresh.name : String(previous.name === undefined || previous.name === null ? '' : previous.name);
     files[id] = {
       id,
       // plan 缺席（理论上不该发生）时保留上一版的 href / path，不能让清单丢字段变成死记录。
       href: plan ? fresh.href : recordHrefOf(previous),
-      path: plan ? fresh.path : recordPathOf(previous),
-      name: plan ? fresh.name : String(previous.name === undefined || previous.name === null ? '' : previous.name),
+      path: donePath || keptPath,
+      name: donePath ? textOf(result.name) || lastSegmentOf(donePath) || keptName : keptName,
       size: fresh.size,
       status: fresh.status,
       updatedAt: fresh.updatedAt

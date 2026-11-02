@@ -219,6 +219,24 @@ function seedFileStatus(entry) {
   return Object.prototype.hasOwnProperty.call(FILE_STATUS_TEXT, raw) ? raw : 'waiting';
 }
 
+/**
+ * M5：落盘层在响应到达后才解析出服务器真名，完成/失败事件带的就是它。
+ * 行上的名字必须跟着改，否则「文件列表」显示页面标题、磁盘上却是真名，两边对不上。
+ * 事件字段先过 safeNameText / safePathText —— URL 与 query 因此仍然没有入口。
+ */
+function adoptResolvedName(record, event) {
+  const e = event || {};
+  // 绝对 URL 一律不采纳：落盘层给的真名里不可能有「协议://」，有就说明这字段不是名字。
+  const absolute = function (value) {
+    return /^[a-z][a-z0-9+.-]*:\/\//i.test(String(value == null ? '' : value).trim());
+  };
+  const name = absolute(e.name) ? '' : safeNameText(e.name);
+  if (name) record.name = name;
+  if (absolute(e.path)) return;
+  const dir = safePathText(e.path).replace(/^\/+|\/+$/g, '').replace(/\/[^/]*$/, '');
+  if (dir) record.path = dir;
+}
+
 /** 相对路径：目录段 + 文件名；绝对 URL 只留 pathname。 */
 function entryPathText(entry) {
   const e = entry || {};
@@ -1214,8 +1232,10 @@ export function mountPanel(options) {
       record.status = 'done';
       const bytes = finiteNumber(e.bytes);
       if (bytes != null && bytes >= 0) record.bytes = bytes;
+      adoptResolvedName(record, e);
     } else {
       record.status = 'failed';
+      adoptResolvedName(record, e);
     }
     paintFileRow(record);
   }

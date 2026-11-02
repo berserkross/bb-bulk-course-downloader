@@ -1,3 +1,4 @@
+import { resolveFileName } from '../bb/files.js';
 import {
   planBatch,
   createReporter,
@@ -7,9 +8,12 @@ import {
   toFailure,
   isAbort,
   createFileEmitter,
+  createEntryNamer,
   retryReason,
-  withHalted
+  withHalted,
+  withDegraded
 } from './shared.js';
+import { createControl, degradeForSuspect } from './pool.js';
 import { createIdleReader, withFileRetry, createMutex, isRetriableError, TruncatedError, DEFAULT_IDLE_MS } from './guard.js';
 import {
   crc32Update,
@@ -181,12 +185,14 @@ export function createZipSink({
   }
 
   /** 一次完整的读文件：CRC 边读边算，字节攒在本次尝试自己的 parts 里（失败即整体丢弃）。 */
-  async function readEntry(fetcher, entry, onBytes) {
+  async function readEntry(fetcher, entry, onBytes, onName) {
     const response = await fetcher.fetchOk(entry.url, { signal });
     const body = response && response.body;
     if (!body || typeof body.getReader !== 'function') {
       throw new Error('响应没有可读主体，拒绝写入空文件');
     }
+    // 契约 §2.1：响应已经到手、包里还一个字节都没写 —— 真名恰好在这一点落地
+    if (typeof onName === 'function') onName(response);
     const reader = createIdleReader(body.getReader(), { idleMs });
     const parts = [];
     let size = 0;
@@ -266,6 +272,9 @@ export function createZipSink({
   async function download(entries, fetcher, { onProgress, onFileEvent } = {}) {
     const list = Array.from(entries || []);
     const plans = planBatch(list, { preserveTree, files });
+    // 契约 §2.3：解析出来的真名要重新做一次冲突登记（planBatch 的 dedupe 在解析之前就跑完了）
+    const namer = createEntryNamer({ files, resolveFileName });
+    for (const plan of plans) namer.reserve(plan);
     const groups = groupPlans(plans);
     // 原始文件顺序的副本：停机时要按「还没开始的那些」数一下 pending
     const ordered = groups.reduce((acc, group) => acc.concat(group.plans), []);
@@ -279,8 +288,12 @@ export function createZipSink({
     // 逐文件事件出口（契约 §1）：createFileEmitter(undefined) 本身就是 noop，
     // 不传 onFileEvent 时行为与改动前逐字节相同。
     const emitFile = createFileEmitter(onFileEvent);
+    // zip 天生串行（包必须一个字节一个字节写完）：宽度恒为 1，degrade() 因此必然是空操作，
+    // 但仍然接上同一个控制面 —— 契约 §3.2 要求三个 sink 都只有这一个降速入口。
+    const control = createControl({ width: 1 });
     let aborted = false;
     let halted = null;
+    let degraded = null;
     let cursor = 0;
 
     const emit = (state, path, entryId = '', force = false) =>
@@ -300,9 +313,11 @@ export function createZipSink({
         if (stopNow() || (signal && signal.aborted)) break;
         const entry = plan.entry;
         const entryId = entry && entry.id != null ? String(entry.id) : '';
-        const label = relativePath(plan);
-        const name = zipPath(plan);
-        const nameLength = toBytes(name).length;
+        // 契约 §2.2：包内路径、事件里的 name、进度里的 path 末段必须同源，两者都读可变绑定；
+        // 解析发生在响应到达之后，所以这里先按计划名算一遍（封包闸门要用），解析后再重算。
+        let label = relativePath(plan);
+        let name = zipPath(plan);
+        const plannedNameLength = toBytes(name).length;
         const known = lookupSize(entry);
 
         if (broken) {
@@ -320,7 +335,7 @@ export function createZipSink({
           continue;
         }
 
-        if (shouldCut(pkg, nameLength, known)) {
+        if (shouldCut(pkg, plannedNameLength, known)) {
           await flushPackage(pkg);
           pkg = newPackage(group.name);
           missing = 0;
@@ -344,11 +359,21 @@ export function createZipSink({
               attemptBytes = 0;
               // 第 1 次的 start 已经发过（要盖住上面那条体积闸门），这里补的是每次重试的 start
               if (attempt > 1) emitFile({ type: 'start', entryId, path: label, name, attempt });
-              return readEntry(fetcher, entry, (delta) => {
-                attemptBytes += delta;
-                progress.addBytes(delta); // 边读边算 CRC 边统计，内存里只有当前这一块
-                emit('progress', label, entryId, false);
-              });
+              return readEntry(
+                fetcher,
+                entry,
+                (delta) => {
+                  attemptBytes += delta;
+                  progress.addBytes(delta); // 边读边算 CRC 边统计，内存里只有当前这一块
+                  emit('progress', label, entryId, false);
+                },
+                (response) => {
+                  // 解析出真名之后立即重算包内路径：local header、中央目录、事件、进度全用这一份
+                  namer.resolve(plan, entry, response);
+                  name = zipPath(plan);
+                  label = relativePath(plan);
+                }
+              );
             },
             {
               attempts: 1 + fileRetries,
@@ -357,6 +382,8 @@ export function createZipSink({
               onRetry: (info) => {
                 progress.rollbackBytes(attemptBytes); // 上一次尝试的字节没有进包，计数必须回退
                 attemptBytes = 0;
+                // 可疑响应 = 疑似限流：串行包没有并发可降，这里如实走同一条入口（永远是空操作）
+                if (info && info.suspect) degraded = degradeForSuspect(control, degraded);
                 // retry 先发：此刻第 N 次已经失败、第 N+1 次的 start 还没发（契约 §1 的时机）
                 emitFile({
                   type: 'retry',
@@ -372,6 +399,7 @@ export function createZipSink({
           );
 
           const stamp = dosDateTime(now());
+          const nameLength = toBytes(name).length; // 解析后的真名长度：offset 与中央目录都按它记账
           const header = localHeader({ name, time: stamp.time, date: stamp.date });
           const offset = pkg.bytes;
           pkg.parts.push(header);
@@ -441,7 +469,7 @@ export function createZipSink({
     }
     emit('done', '', '', true);
     // halted 与 fs/download 一致做成不可枚举：既有整对象断言靠这一点，也避免日志/展开时把 pending 里的 href 带出去
-    return withHalted({ ok, failed, aborted, partialPackages }, halted);
+    return withDegraded(withHalted({ ok, failed, aborted, partialPackages }, halted), degraded);
   }
 
   return { kind: 'zip', download };
