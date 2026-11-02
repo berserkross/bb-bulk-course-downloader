@@ -1,6 +1,6 @@
 {
   "name": "bb-bulk-course-downloader",
-  "version": "2.3.0",
+  "version": "2.3.1",
   "private": true,
   "type": "module",
   "description": "Tampermonkey userscript: scan a Blackboard Learn course, select files, download preserving folder tree",
@@ -12,5 +12,6 @@
   "devDependencies": {
     "esbuild": "^0.24.2",
     "jsdom": "^25.0.1"
-  }
+  },
+  "repository": "https://github.com/berserkross/bb-bulk-course-downloader.git"
 }
