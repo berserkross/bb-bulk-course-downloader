@@ -1,4 +1,9 @@
-import { createFetcher as defaultCreateFetcher, SessionExpiredError } from './bb/http.js';
+import {
+  createFetcher as defaultCreateFetcher,
+  createHeartbeat,
+  probeAlive as defaultProbeAlive,
+  SessionExpiredError
+} from './bb/http.js';
 import { createScanner as defaultCreateScanner } from './bb/scan.js';
 import {
   createSink as defaultCreateSink,
@@ -55,6 +60,69 @@ export function currentIds(loc) {
 function describe(err) {
   if (err instanceof SessionExpiredError) return '会话已失效：请重新登录 Blackboard，然后刷新本页再试。';
   return (err && err.message) || String(err);
+}
+
+/** 停机自检通过后，第 used+1 次重试前等多久（毫秒）：越界取最后一项。 */
+const AUTO_RESUME_DELAYS = [3000, 8000, 20000];
+/** settings 里缺 keepAliveMs / autoResumeMax 时的兜底：与 store.js 的 DEFAULTS 同值。 */
+const DEFAULT_KEEP_ALIVE_MS = 90 * 1000;
+const DEFAULT_AUTO_RESUME_MAX = 3;
+
+/**
+ * 该不该自动续跑：只认「会话过期」这一种停机，用户取消之后一次都不许再自己转。
+ * 纯函数（不读 state、不碰 DOM）：单测直接调。
+ * @param {{ halted?: any, aborted?: boolean, used?: number, max?: number }} [input]
+ * @returns {boolean}
+ */
+export function shouldAutoResume(input) {
+  const opts = input || {};
+  const halted = opts.halted || null;
+  if (!halted || halted.reason !== 'session-expired') return false;
+  if (opts.aborted) return false;
+  const used = Number.isFinite(opts.used) ? Math.max(0, Math.floor(opts.used)) : 0;
+  const max = Number.isFinite(opts.max) ? Math.max(0, Math.floor(opts.max)) : DEFAULT_AUTO_RESUME_MAX;
+  return used < max;
+}
+
+/**
+ * 第 used+1 次重试前的等待（毫秒）。
+ * @param {number} used 已经用掉的自动续跑次数
+ * @returns {number}
+ */
+export function autoResumeDelay(used) {
+  const index = Number.isFinite(used) && used > 0 ? Math.floor(used) : 0;
+  if (index >= AUTO_RESUME_DELAYS.length) return AUTO_RESUME_DELAYS[AUTO_RESUME_DELAYS.length - 1];
+  return AUTO_RESUME_DELAYS[index];
+}
+
+/** 心跳地址要丢掉的查询参数：它们改的是服务端视图状态（mode=reset 会重置进度、list_display 换视图），保活不该带。 */
+const KEEP_ALIVE_DROP_PARAMS = ['mode', 'list_display', 'pagelinks'];
+
+/**
+ * 保活心跳用哪个地址：同一个课程页，去掉会改视图状态的查询参数，其余参数与顺序原样保留，hash 保留。
+ * 非字符串 / 空串 / 没有查询串一律原样返回（空串返回空串）；这条路径在下载中跑，任何输入都不抛。
+ * @param {string} href
+ * @returns {string}
+ */
+export function keepAliveUrl(href) {
+  if (typeof href !== 'string' || !href) return '';
+  const hashAt = href.indexOf('#');
+  const hash = hashAt < 0 ? '' : href.slice(hashAt);
+  const before = hashAt < 0 ? href : href.slice(0, hashAt);
+  const queryAt = before.indexOf('?');
+  if (queryAt < 0) return href;
+  const query = before.slice(queryAt + 1);
+  if (!query) return href;
+  const kept = [];
+  for (const pair of query.split('&')) {
+    if (!pair) continue;
+    const eq = pair.indexOf('=');
+    const name = (eq < 0 ? pair : pair.slice(0, eq)).toLowerCase();
+    if (KEEP_ALIVE_DROP_PARAMS.indexOf(name) >= 0) continue;
+    kept.push(pair);
+  }
+  const base = before.slice(0, queryAt);
+  return kept.length ? base + '?' + kept.join('&') + hash : base + hash;
 }
 
 function permissionText(status) {
@@ -149,6 +217,8 @@ export function createController(config) {
   const exportManifestPack = typeof deps.exportManifestPack === 'function' ? deps.exportManifestPack : null;
   const importManifestPack = typeof deps.importManifestPack === 'function' ? deps.importManifestPack : null;
   const mergeManifests = typeof deps.mergeManifests === 'function' ? deps.mergeManifests : null;
+  /** 会话自检可注入：不注入就走真实 fetch（它绝不抛）。 */
+  const probeAlive = typeof deps.probeAlive === 'function' ? deps.probeAlive : defaultProbeAlive;
   /** 下载边界可注入：测试里换成收集器，真实运行时才碰 a[download]。 */
   const writeDownload = typeof cfg.downloadTextFile === 'function' ? cfg.downloadTextFile : null;
 
@@ -196,7 +266,11 @@ export function createController(config) {
     flushTimer: 0,
     batchPlans: [],
     /** 上一轮停机时没能下载的 entry 快照：只给「刷新后继续」用，不清清单、不重扫。 */
-    haltedPending: []
+    haltedPending: [],
+    /** 自动续跑已经用掉几次：用户新发起一批归零，续跑 / 重试继承当前计数。 */
+    autoResumeUsed: 0,
+    /** 自动续跑上限（settings.autoResumeMax，缺省 3）：撞满就交回用户。 */
+    autoResumeMax: autoResumeLimit()
   };
 
   const panel = mountPanel({
@@ -632,6 +706,9 @@ export function createController(config) {
 
   async function startDownload() {
     if (state.busy || !state.entries.length) return null;
+    // 用户新发起的一批：自动续跑计数归零（续跑 / 重试继承当前计数，不归零）。
+    state.autoResumeUsed = 0;
+    state.autoResumeMax = autoResumeLimit();
     // 上一轮对话框里选过的目录不能带进来：这次以用户新选的为准。
     state.pickHandle = null;
     abortPick();
@@ -697,8 +774,7 @@ export function createController(config) {
       }
       state.batchPlans = buildPlans(batch);
       panel.setState('downloading');
-      const result = await runDownload(batch, dirHandle, signal);
-      return await finishDownload(result);
+      return await runBatchWithAutoResume(batch, dirHandle, signal, { seedFiles: true });
     } catch (err) {
       panel.fail(signal.aborted ? '已取消' : describe(err));
       return null;
@@ -727,13 +803,20 @@ export function createController(config) {
       signalAborted: Boolean(signal && signal.aborted),
       downloadConcurrency: settings && settings.downloadConcurrency
     });
-    const result = await sink.download(entries, fetcher, {
-      onProgress,
-      // 原样转发：事件字段由 panel 解释，这里既不裁剪也不改形状。
-      onFileEvent(event) {
-        if (typeof panel.applyFileEvent === 'function') panel.applyFileEvent(event);
-      }
-    });
+    // 保活心跳只给门户会话续命与观测：它自己的失败绝不许影响本批结果，收尾必停。
+    const heartbeat = startKeepAlive(fetcher, signal);
+    let result;
+    try {
+      result = await sink.download(entries, fetcher, {
+        onProgress,
+        // 原样转发：事件字段由 panel 解释，这里既不裁剪也不改形状。
+        onFileEvent(event) {
+          if (typeof panel.applyFileEvent === 'function') panel.applyFileEvent(event);
+        }
+      });
+    } finally {
+      heartbeat.stop();
+    }
     console.info('[bbdl] 批次结束', {
       sink: sink.kind,
       ok: result && Array.isArray(result.ok) ? result.ok.length : 0,
@@ -791,6 +874,119 @@ export function createController(config) {
     }
     noticePartialPackages(result);
     return result;
+  }
+
+  /** 第 used+1 次重试前的等待：必须能被取消打断 —— 用户一停，绝不多等一秒。 */
+  function waitAbortable(ms, signal) {
+    return new Promise(function (resolve) {
+      if (signal && signal.aborted) {
+        resolve();
+        return;
+      }
+      let timer = 0;
+      let settled = false;
+      function done() {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (signal && typeof signal.removeEventListener === 'function') signal.removeEventListener('abort', done);
+        resolve();
+      }
+      timer = setTimeout(done, ms);
+      if (signal && typeof signal.addEventListener === 'function') signal.addEventListener('abort', done, { once: true });
+    });
+  }
+
+  /** 自检要一个能代表这一批的地址；条目上没有就退回正常收尾（不猜、不拼）。 */
+  function pendingUrl(entry) {
+    if (!entry) return '';
+    const raw = entry.url || entry.href || '';
+    return typeof raw === 'string' ? raw : '';
+  }
+
+  /**
+   * 保活心跳：只碰当前门户页（文件请求走 /bbcswebdav，未必给门户会话计时）。
+   * 没有地址、没有 fetchOk、间隔非正 —— 一律当没开，绝不因此拖慢或拖坏下载。
+   */
+  function startKeepAlive(fetcher, signal) {
+    const idle = { start() {}, stop() {}, count() { return 0; } };
+    // 心跳只碰「这门课这个页」，去掉 mode / list_display 这类会改视图状态的参数。
+    const url = keepAliveUrl(loc && typeof loc.href === 'string' ? loc.href : '');
+    if (!url) return idle;
+    const configured = settings ? settings.keepAliveMs : undefined;
+    const intervalMs = Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_KEEP_ALIVE_MS;
+    const beat = createHeartbeat({
+      fetcher: fetcher,
+      url: url,
+      intervalMs: intervalMs,
+      signal: signal,
+      onTick(outcome) {
+        // 白名单字段：ok / at / sessionExpired —— 不出现 URL、query 或任何路径。
+        const line = { ok: Boolean(outcome && outcome.ok), at: beat.count() };
+        if (outcome && outcome.sessionExpired) line.sessionExpired = true;
+        console.info('[bbdl] 保活', line);
+      }
+    });
+    beat.start();
+    return beat;
+  }
+
+  function autoResumeLimit() {
+    const configured = settings ? settings.autoResumeMax : undefined;
+    if (!Number.isFinite(configured) || configured < 0) return DEFAULT_AUTO_RESUME_MAX;
+    return Math.floor(configured);
+  }
+
+  /**
+   * 「一次 HTML 响应 = 整批停机」的解药：先自检真死假死，假死自动续跑（有上限），真死才收尾竖横幅。
+   * 用户取消（signal.aborted）立刻跳出：不再等、不再探、不再跑。
+   * @param {any[]} entries
+   * @param {any} dirHandle
+   * @param {AbortSignal} signal
+   * @param {{ seedFiles?: boolean, finish?: Function }} [options]
+   */
+  async function runBatchWithAutoResume(entries, dirHandle, signal, options) {
+    const opts = options || {};
+    const finish = typeof opts.finish === 'function' ? opts.finish : finishDownload;
+    let batch = entries;
+    let seedFiles = opts.seedFiles !== false;
+    for (;;) {
+      const result = await runDownload(batch, dirHandle, signal, { seedFiles: seedFiles });
+      const halted = result ? result.halted : null;
+      const aborted = Boolean((signal && signal.aborted) || (result && result.aborted));
+      const pending = halted && Array.isArray(halted.pending) ? halted.pending : [];
+      const target = pending.length ? pendingUrl(pending[0]) : '';
+      // 没有 pending、拿不到地址、或不该续跑：走原来的收尾，一个字都不改。
+      if (!target || !shouldAutoResume({ halted: halted, aborted: aborted, used: state.autoResumeUsed, max: state.autoResumeMax })) {
+        return await finish(result);
+      }
+      if (signal && signal.aborted) return await finish(result);
+      // 先落库再探：自检要发网络请求，待写记录不跨这一段。
+      await flushRecords();
+      const probe = await probeAlive({ url: target, signal: signal });
+      const line = { alive: Boolean(probe && probe.alive) };
+      if (probe && Number.isFinite(probe.status)) line.status = probe.status;
+      if (probe && typeof probe.contentType === 'string' && probe.contentType) line.contentType = probe.contentType;
+      if (probe && typeof probe.htmlKind === 'string' && probe.htmlKind) line.htmlKind = probe.htmlKind;
+      line.used = state.autoResumeUsed;
+      console.info('[bbdl] 停机自检', line);
+      // 探完再确认一次：等这一下的时间里用户可能已经点了取消。
+      if (signal && signal.aborted) return await finish(result);
+      if (!probe || !probe.alive) return await finish(result);
+      state.autoResumeUsed += 1;
+      if (typeof panel.setNotice === 'function') {
+        panel.setNotice('会话看起来还活着，已自动重试（第 ' + state.autoResumeUsed + ' 次）…');
+      }
+      // 撤横幅与切回 downloading 必须在等待之前：这段等待最长 20 秒，横幅不许和新 notice 同时挂着。
+      state.haltedPending = [];
+      clearHaltedBanner();
+      panel.setState('downloading');
+      await waitAbortable(autoResumeDelay(state.autoResumeUsed - 1), signal);
+      if (signal && signal.aborted) return await finish(result);
+      // 下一轮就是刚才 pending 的那几条：不重种行、不重扫。
+      batch = pending;
+      seedFiles = false;
+    }
   }
 
   /**
@@ -866,8 +1062,7 @@ export function createController(config) {
     panel.setState('downloading');
     return (async function () {
       try {
-        const result = await runDownload(pending, state.dirHandle, signal, { seedFiles: false });
-        return await finishDownload(result);
+        return await runBatchWithAutoResume(pending, state.dirHandle, signal, { seedFiles: false });
       } catch (err) {
         panel.fail(signal.aborted ? '已取消' : describe(err));
         return null;
@@ -887,11 +1082,15 @@ export function createController(config) {
     state.batchPlans = buildPlans(entries);
     panel.setState('downloading');
     try {
-      const result = await runDownload(entries, state.dirHandle, state.abort.signal);
-      // 重试批次一样可能撞上会话过期：横幅、快照、摘要摘除都得走同一条收尾路径。
-      const halted = result ? result.halted : null;
-      state.haltedPending = rememberHalted(halted);
-      return resultForPanel(result, state.haltedPending);
+      // 重试批次一样可能撞上会话过期：自检 / 自动续跑 / 横幅 / 快照 / 摘要摘除都走同一条链。
+      return await runBatchWithAutoResume(entries, state.dirHandle, state.abort.signal, {
+        seedFiles: true,
+        finish(result) {
+          const halted = result ? result.halted : null;
+          state.haltedPending = rememberHalted(halted);
+          return resultForPanel(result, state.haltedPending);
+        }
+      });
     } finally {
       await flushRecords();
       state.busy = false;

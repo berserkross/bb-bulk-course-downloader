@@ -82,6 +82,10 @@ function harness(over) {
             return (extra.probe || {})[url];
           }
         };
+      },
+      // 会话自检注入：halted 用例一旦带上 pending 就走进自动续跑的真实 fetch；这里彻底离线，永不触网
+      probeAlive: function () {
+        return Promise.resolve({ alive: false });
       }
     }
   });

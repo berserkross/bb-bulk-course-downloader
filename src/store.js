@@ -10,7 +10,11 @@ export const DEFAULTS = {
   // 面板默认收起：首次安装只留左下角一条，不把第三方页面挡住。
   panelCollapsed: true,
   // ZIP 降级落盘的单包上限（200 MiB）：一个包装满就封口交给浏览器，内存上界就是一个包
-  zipChunkBytes: 200 * 1024 * 1024
+  zipChunkBytes: 200 * 1024 * 1024,
+  // 保活心跳间隔：门户会话闲置太久必死，下载期间定期回敲一次最省事的续命手段
+  keepAliveMs: 90 * 1000,
+  // 停机自检判「假过期」时自动续跑的上限（次）：撞满就交回用户，不再自己转圈
+  autoResumeMax: 3
 };
 
 export function loadSettings() {

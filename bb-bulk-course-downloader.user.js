@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BB 课件批量下载
 // @namespace    bb-bulk-course-downloader
-// @version      2.5.4
+// @version      2.6.0
 // @description  扫描 Blackboard 课程内容，勾选后按原始目录结构批量下载课件
 // @updateURL    https://raw.githubusercontent.com/berserkross/bb-bulk-course-downloader/main/bb-bulk-course-downloader.user.js
 // @downloadURL  https://raw.githubusercontent.com/berserkross/bb-bulk-course-downloader/main/bb-bulk-course-downloader.user.js
@@ -961,6 +961,115 @@
     }
     return { fetchOk: request, probeSize };
   }
+  var PROBE_HTML_LIMIT = 64 * 1024;
+  var HTML_LOGIN_RE = /sign in|login|password|统一身份|登录/i;
+  var HTML_BLOCKED_RE = /blocked|denied|forbidden|rate limit|too many requests|拦截|访问受限/i;
+  async function probeAlive(options) {
+    const opts = options || {};
+    const url = String(opts.url || "");
+    if (!url) return { alive: false };
+    let response;
+    try {
+      response = await fetch(url, {
+        method: "GET",
+        headers: { Range: "bytes=0-0" },
+        credentials: "include",
+        cache: "no-store",
+        signal: opts.signal
+      });
+    } catch {
+      return { alive: false };
+    }
+    const status = Number(response && response.status) || 0;
+    const type = String(response && response.headers && response.headers.get("content-type") || "").toLowerCase();
+    const usable = status >= 200 && status < 300 || status === 206;
+    const result = { alive: false, status };
+    if (type) result.contentType = type;
+    if (type.indexOf("text/html") === -1) {
+      discardBody(response);
+      result.alive = usable;
+      return result;
+    }
+    let text = "";
+    try {
+      text = await response.text();
+    } catch {
+      text = "";
+    }
+    text = String(text == null ? "" : text);
+    if (text.length > PROBE_HTML_LIMIT) text = text.slice(0, PROBE_HTML_LIMIT);
+    result.bytes = text.length;
+    if (HTML_LOGIN_RE.test(text)) result.htmlKind = "login";
+    else if (HTML_BLOCKED_RE.test(text)) result.htmlKind = "blocked";
+    else result.htmlKind = "other";
+    return result;
+  }
+  function createHeartbeat(options) {
+    const opts = options || {};
+    const fetcher = opts.fetcher || null;
+    const url = String(opts.url || "");
+    const intervalMs = Number.isFinite(opts.intervalMs) ? Math.max(0, opts.intervalMs) : 0;
+    const onTick = typeof opts.onTick === "function" ? opts.onTick : null;
+    const signal = opts.signal;
+    const schedule = typeof opts.setTimeoutFn === "function" ? opts.setTimeoutFn : setTimeout;
+    const unschedule = typeof opts.clearTimeoutFn === "function" ? opts.clearTimeoutFn : clearTimeout;
+    let timer = null;
+    let ticks = 0;
+    let running = false;
+    function stop() {
+      running = false;
+      if (timer !== null) {
+        try {
+          unschedule(timer);
+        } catch {
+        }
+        timer = null;
+      }
+    }
+    function arm() {
+      if (!running) return;
+      timer = schedule(function() {
+        timer = null;
+        void tick();
+      }, intervalMs);
+    }
+    async function tick() {
+      if (!running) return;
+      if (signal && signal.aborted) {
+        stop();
+        return;
+      }
+      ticks += 1;
+      let outcome = { ok: false };
+      try {
+        const response = await fetcher.fetchOk(url, { method: "GET", cache: "no-store" });
+        discardBody(response);
+        outcome = { ok: true };
+      } catch (error) {
+        outcome = isSessionExpired(error) ? { ok: false, sessionExpired: true } : { ok: false };
+      }
+      if (!running) return;
+      if (onTick) {
+        try {
+          onTick(outcome);
+        } catch {
+        }
+      }
+      arm();
+    }
+    function start() {
+      if (running) return;
+      if (!fetcher || typeof fetcher.fetchOk !== "function") return;
+      if (!url || !(intervalMs > 0)) return;
+      if (signal && signal.aborted) return;
+      running = true;
+      arm();
+    }
+    function count() {
+      return ticks;
+    }
+    return { start, stop, count };
+  }
 
   // src/bb/files.js
   var ILLEGAL_CHARS = /[\\/:*?"<>|\u0000-\u001f\u007f]/g;
@@ -1436,21 +1545,9 @@
   }
   async function runPool(items, concurrency, worker, { signal, control } = {}) {
     const jobs = toList(items);
-    console.info("[bbdl] pool \u5165\u53E3", {
-      itemsType: typeof items,
-      itemsLen: items && typeof items.length === "number" ? items.length : -1,
-      isArray: Array.isArray(items),
-      jobsLen: jobs.length,
-      concurrency,
-      concurrencyType: typeof concurrency,
-      workerType: typeof worker,
-      controlStopped: Boolean(control && control.stopped),
-      signalAborted: Boolean(signal && signal.aborted)
-    });
     if (!jobs.length) return;
     const width = Math.min(Math.max(1, Math.floor(concurrency) || 1), jobs.length);
     let cursor = 0;
-    console.info("[bbdl] pool \u8D77\u70B9", { width, jobsLen: jobs.length });
     const stopped = () => Boolean(control && control.stopped) || Boolean(signal && signal.aborted);
     async function drain() {
       while (cursor < jobs.length) {
@@ -1463,7 +1560,6 @@
     const workers = [];
     for (let i = 0; i < width; i += 1) workers.push(drain());
     await Promise.all(workers);
-    console.info("[bbdl] pool \u7ED3\u675F", { jobsLen: jobs.length, cursor, width });
   }
 
   // src/sinks/fs.js
@@ -1733,16 +1829,6 @@
           }
           if (control.stopped) return;
           const label = relativePath(plan);
-          if (workerStarted === 0) {
-            console.info("[bbdl] fs \u9996\u4E2A worker", {
-              plans: plans.length,
-              concurrency,
-              entryKeys: entry ? Object.keys(entry).join(",") : "",
-              hasUrl: Boolean(entry && entry.url),
-              urlLooksWebdav: Boolean(entry && entry.url && /bbcswebdav/i.test(String(entry.url))),
-              path: label
-            });
-          }
           workerStarted += 1;
           const entryId = entry && entry.id != null ? String(entry.id) : "";
           const fileName = plan.fileName;
@@ -1796,15 +1882,6 @@
         { signal, control }
       );
       if (signal && signal.aborted) aborted = true;
-      console.info("[bbdl] fs \u6536\u5C3E", {
-        entries: list.length,
-        plans: plans.length,
-        concurrency,
-        workers: workerStarted,
-        ok: ok.length,
-        failed: failed.length,
-        aborted
-      });
       const halted = control.stopped && !aborted ? control.reason || "session-expired" : null;
       const pending = halted ? listPending(list, ok, failed) : [];
       if (halted) emitFile({ type: "halt", entryId: "", path: "", name: "", reason: halted, pending: pending.length });
@@ -2642,7 +2719,11 @@
     // 面板默认收起：首次安装只留左下角一条，不把第三方页面挡住。
     panelCollapsed: true,
     // ZIP 降级落盘的单包上限（200 MiB）：一个包装满就封口交给浏览器，内存上界就是一个包
-    zipChunkBytes: 200 * 1024 * 1024
+    zipChunkBytes: 200 * 1024 * 1024,
+    // 保活心跳间隔：门户会话闲置太久必死，下载期间定期回敲一次最省事的续命手段
+    keepAliveMs: 90 * 1e3,
+    // 停机自检判「假过期」时自动续跑的上限（次）：撞满就交回用户，不再自己转圈
+    autoResumeMax: 3
   };
   function loadSettings() {
     try {
@@ -5630,6 +5711,44 @@
     if (err instanceof SessionExpiredError) return "\u4F1A\u8BDD\u5DF2\u5931\u6548\uFF1A\u8BF7\u91CD\u65B0\u767B\u5F55 Blackboard\uFF0C\u7136\u540E\u5237\u65B0\u672C\u9875\u518D\u8BD5\u3002";
     return err && err.message || String(err);
   }
+  var AUTO_RESUME_DELAYS = [3e3, 8e3, 2e4];
+  var DEFAULT_KEEP_ALIVE_MS = 90 * 1e3;
+  var DEFAULT_AUTO_RESUME_MAX = 3;
+  function shouldAutoResume(input) {
+    const opts = input || {};
+    const halted = opts.halted || null;
+    if (!halted || halted.reason !== "session-expired") return false;
+    if (opts.aborted) return false;
+    const used = Number.isFinite(opts.used) ? Math.max(0, Math.floor(opts.used)) : 0;
+    const max = Number.isFinite(opts.max) ? Math.max(0, Math.floor(opts.max)) : DEFAULT_AUTO_RESUME_MAX;
+    return used < max;
+  }
+  function autoResumeDelay(used) {
+    const index = Number.isFinite(used) && used > 0 ? Math.floor(used) : 0;
+    if (index >= AUTO_RESUME_DELAYS.length) return AUTO_RESUME_DELAYS[AUTO_RESUME_DELAYS.length - 1];
+    return AUTO_RESUME_DELAYS[index];
+  }
+  var KEEP_ALIVE_DROP_PARAMS = ["mode", "list_display", "pagelinks"];
+  function keepAliveUrl(href) {
+    if (typeof href !== "string" || !href) return "";
+    const hashAt = href.indexOf("#");
+    const hash = hashAt < 0 ? "" : href.slice(hashAt);
+    const before = hashAt < 0 ? href : href.slice(0, hashAt);
+    const queryAt = before.indexOf("?");
+    if (queryAt < 0) return href;
+    const query = before.slice(queryAt + 1);
+    if (!query) return href;
+    const kept = [];
+    for (const pair of query.split("&")) {
+      if (!pair) continue;
+      const eq = pair.indexOf("=");
+      const name = (eq < 0 ? pair : pair.slice(0, eq)).toLowerCase();
+      if (KEEP_ALIVE_DROP_PARAMS.indexOf(name) >= 0) continue;
+      kept.push(pair);
+    }
+    const base = before.slice(0, queryAt);
+    return kept.length ? base + "?" + kept.join("&") + hash : base + hash;
+  }
   function permissionText(status) {
     return PERMISSION_TEXT[status] || "\u76EE\u5F55\u6743\u9650\u4E0D\u53EF\u7528";
   }
@@ -5700,6 +5819,7 @@
     const exportManifestPack2 = typeof deps.exportManifestPack === "function" ? deps.exportManifestPack : null;
     const importManifestPack2 = typeof deps.importManifestPack === "function" ? deps.importManifestPack : null;
     const mergeManifests2 = typeof deps.mergeManifests === "function" ? deps.mergeManifests : null;
+    const probeAlive2 = typeof deps.probeAlive === "function" ? deps.probeAlive : probeAlive;
     const writeDownload = typeof cfg.downloadTextFile === "function" ? cfg.downloadTextFile : null;
     const listExistingFiles2 = typeof cfg.listExistingFiles === "function" ? cfg.listExistingFiles : listExistingFiles;
     const pickDirectory2 = typeof cfg.pickDirectory === "function" ? cfg.pickDirectory : pickDirectory;
@@ -5742,7 +5862,11 @@
       flushTimer: 0,
       batchPlans: [],
       /** 上一轮停机时没能下载的 entry 快照：只给「刷新后继续」用，不清清单、不重扫。 */
-      haltedPending: []
+      haltedPending: [],
+      /** 自动续跑已经用掉几次：用户新发起一批归零，续跑 / 重试继承当前计数。 */
+      autoResumeUsed: 0,
+      /** 自动续跑上限（settings.autoResumeMax，缺省 3）：撞满就交回用户。 */
+      autoResumeMax: autoResumeLimit()
     };
     const panel = mountPanel2({
       document: doc,
@@ -6079,6 +6203,8 @@
     }
     async function startDownload() {
       if (state.busy || !state.entries.length) return null;
+      state.autoResumeUsed = 0;
+      state.autoResumeMax = autoResumeLimit();
       state.pickHandle = null;
       abortPick();
       let summary = state.skipSummary;
@@ -6133,8 +6259,7 @@
         }
         state.batchPlans = buildPlans(batch);
         panel.setState("downloading");
-        const result = await runDownload(batch, dirHandle, signal);
-        return await finishDownload(result);
+        return await runBatchWithAutoResume(batch, dirHandle, signal, { seedFiles: true });
       } catch (err) {
         panel.fail(signal.aborted ? "\u5DF2\u53D6\u6D88" : describe(err));
         return null;
@@ -6156,13 +6281,19 @@
         signalAborted: Boolean(signal && signal.aborted),
         downloadConcurrency: settings && settings.downloadConcurrency
       });
-      const result = await sink.download(entries, fetcher, {
-        onProgress,
-        // 原样转发：事件字段由 panel 解释，这里既不裁剪也不改形状。
-        onFileEvent(event) {
-          if (typeof panel.applyFileEvent === "function") panel.applyFileEvent(event);
-        }
-      });
+      const heartbeat = startKeepAlive(fetcher, signal);
+      let result;
+      try {
+        result = await sink.download(entries, fetcher, {
+          onProgress,
+          // 原样转发：事件字段由 panel 解释，这里既不裁剪也不改形状。
+          onFileEvent(event) {
+            if (typeof panel.applyFileEvent === "function") panel.applyFileEvent(event);
+          }
+        });
+      } finally {
+        heartbeat.stop();
+      }
       console.info("[bbdl] \u6279\u6B21\u7ED3\u675F", {
         sink: sink.kind,
         ok: result && Array.isArray(result.ok) ? result.ok.length : 0,
@@ -6204,6 +6335,97 @@
       }
       noticePartialPackages(result);
       return result;
+    }
+    function waitAbortable(ms, signal) {
+      return new Promise(function(resolve) {
+        if (signal && signal.aborted) {
+          resolve();
+          return;
+        }
+        let timer = 0;
+        let settled = false;
+        function done() {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          if (signal && typeof signal.removeEventListener === "function") signal.removeEventListener("abort", done);
+          resolve();
+        }
+        timer = setTimeout(done, ms);
+        if (signal && typeof signal.addEventListener === "function") signal.addEventListener("abort", done, { once: true });
+      });
+    }
+    function pendingUrl(entry) {
+      if (!entry) return "";
+      const raw = entry.url || entry.href || "";
+      return typeof raw === "string" ? raw : "";
+    }
+    function startKeepAlive(fetcher, signal) {
+      const idle = { start() {
+      }, stop() {
+      }, count() {
+        return 0;
+      } };
+      const url = keepAliveUrl(loc && typeof loc.href === "string" ? loc.href : "");
+      if (!url) return idle;
+      const configured = settings ? settings.keepAliveMs : void 0;
+      const intervalMs = Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_KEEP_ALIVE_MS;
+      const beat = createHeartbeat({
+        fetcher,
+        url,
+        intervalMs,
+        signal,
+        onTick(outcome) {
+          const line = { ok: Boolean(outcome && outcome.ok), at: beat.count() };
+          if (outcome && outcome.sessionExpired) line.sessionExpired = true;
+          console.info("[bbdl] \u4FDD\u6D3B", line);
+        }
+      });
+      beat.start();
+      return beat;
+    }
+    function autoResumeLimit() {
+      const configured = settings ? settings.autoResumeMax : void 0;
+      if (!Number.isFinite(configured) || configured < 0) return DEFAULT_AUTO_RESUME_MAX;
+      return Math.floor(configured);
+    }
+    async function runBatchWithAutoResume(entries, dirHandle, signal, options) {
+      const opts = options || {};
+      const finish = typeof opts.finish === "function" ? opts.finish : finishDownload;
+      let batch = entries;
+      let seedFiles = opts.seedFiles !== false;
+      for (; ; ) {
+        const result = await runDownload(batch, dirHandle, signal, { seedFiles });
+        const halted = result ? result.halted : null;
+        const aborted = Boolean(signal && signal.aborted || result && result.aborted);
+        const pending = halted && Array.isArray(halted.pending) ? halted.pending : [];
+        const target = pending.length ? pendingUrl(pending[0]) : "";
+        if (!target || !shouldAutoResume({ halted, aborted, used: state.autoResumeUsed, max: state.autoResumeMax })) {
+          return await finish(result);
+        }
+        if (signal && signal.aborted) return await finish(result);
+        await flushRecords();
+        const probe = await probeAlive2({ url: target, signal });
+        const line = { alive: Boolean(probe && probe.alive) };
+        if (probe && Number.isFinite(probe.status)) line.status = probe.status;
+        if (probe && typeof probe.contentType === "string" && probe.contentType) line.contentType = probe.contentType;
+        if (probe && typeof probe.htmlKind === "string" && probe.htmlKind) line.htmlKind = probe.htmlKind;
+        line.used = state.autoResumeUsed;
+        console.info("[bbdl] \u505C\u673A\u81EA\u68C0", line);
+        if (signal && signal.aborted) return await finish(result);
+        if (!probe || !probe.alive) return await finish(result);
+        state.autoResumeUsed += 1;
+        if (typeof panel.setNotice === "function") {
+          panel.setNotice("\u4F1A\u8BDD\u770B\u8D77\u6765\u8FD8\u6D3B\u7740\uFF0C\u5DF2\u81EA\u52A8\u91CD\u8BD5\uFF08\u7B2C " + state.autoResumeUsed + " \u6B21\uFF09\u2026");
+        }
+        state.haltedPending = [];
+        clearHaltedBanner();
+        panel.setState("downloading");
+        await waitAbortable(autoResumeDelay(state.autoResumeUsed - 1), signal);
+        if (signal && signal.aborted) return await finish(result);
+        batch = pending;
+        seedFiles = false;
+      }
     }
     function noticePartialPackages(result) {
       const list = result && Array.isArray(result.partialPackages) ? result.partialPackages : [];
@@ -6255,8 +6477,7 @@
       panel.setState("downloading");
       return async function() {
         try {
-          const result = await runDownload(pending, state.dirHandle, signal, { seedFiles: false });
-          return await finishDownload(result);
+          return await runBatchWithAutoResume(pending, state.dirHandle, signal, { seedFiles: false });
         } catch (err) {
           panel.fail(signal.aborted ? "\u5DF2\u53D6\u6D88" : describe(err));
           return null;
@@ -6273,10 +6494,14 @@
       state.batchPlans = buildPlans(entries);
       panel.setState("downloading");
       try {
-        const result = await runDownload(entries, state.dirHandle, state.abort.signal);
-        const halted = result ? result.halted : null;
-        state.haltedPending = rememberHalted(halted);
-        return resultForPanel(result, state.haltedPending);
+        return await runBatchWithAutoResume(entries, state.dirHandle, state.abort.signal, {
+          seedFiles: true,
+          finish(result) {
+            const halted = result ? result.halted : null;
+            state.haltedPending = rememberHalted(halted);
+            return resultForPanel(result, state.haltedPending);
+          }
+        });
       } finally {
         await flushRecords();
         state.busy = false;

@@ -204,3 +204,143 @@ export function createFetcher(options) {
 
   return { fetchOk: request, probeSize };
 }
+
+/* ---------------- 会话自检 / 保活（v2.6.0） ---------------- */
+
+/** HTML 自检最多读这么多字符：够判「登录页 / 被拦 / 其它」，又不把整页塞进内存。 */
+const PROBE_HTML_LIMIT = 64 * 1024;
+const HTML_LOGIN_RE = /sign in|login|password|统一身份|登录/i;
+const HTML_BLOCKED_RE = /blocked|denied|forbidden|rate limit|too many requests|拦截|访问受限/i;
+
+/**
+ * 探一次「会话是不是真的死了」。绝不抛：任何异常都当成「探不到」。
+ * alive 只看状态码与 content-type —— text/html 一律算死（登录页、WAF 拦截页、偶发错误页都长这样），
+ * 顺手把正文归类成 login / blocked / other；只回判据，绝不把正文带回调用方以外的地方。
+ * @param {{ url?: string, signal?: AbortSignal }} [options]
+ * @returns {Promise<{ alive: boolean, status?: number, contentType?: string, bytes?: number, htmlKind?: 'login'|'blocked'|'other' }>}
+ */
+export async function probeAlive(options) {
+  const opts = options || {};
+  const url = String(opts.url || '');
+  if (!url) return { alive: false };
+  let response;
+  try {
+    response = await fetch(url, {
+      method: 'GET',
+      headers: { Range: 'bytes=0-0' },
+      credentials: 'include',
+      cache: 'no-store',
+      signal: opts.signal
+    });
+  } catch {
+    return { alive: false };
+  }
+  const status = Number(response && response.status) || 0;
+  const type = String((response && response.headers && response.headers.get('content-type')) || '').toLowerCase();
+  const usable = (status >= 200 && status < 300) || status === 206;
+  const result = { alive: false, status: status };
+  if (type) result.contentType = type;
+  if (type.indexOf('text/html') === -1) {
+    // 不是 HTML：结论只看状态码，主体一个字都不读，直接丢掉。
+    discardBody(response);
+    result.alive = usable;
+    return result;
+  }
+  // 拿到 HTML 就归类（哪怕状态码本身就是 5xx）：alive 恒为 false，分类只用于诊断。
+  let text = '';
+  try {
+    text = await response.text();
+  } catch {
+    text = '';
+  }
+  text = String(text == null ? '' : text);
+  if (text.length > PROBE_HTML_LIMIT) text = text.slice(0, PROBE_HTML_LIMIT);
+  result.bytes = text.length;
+  if (HTML_LOGIN_RE.test(text)) result.htmlKind = 'login';
+  else if (HTML_BLOCKED_RE.test(text)) result.htmlKind = 'blocked';
+  else result.htmlKind = 'other';
+  return result;
+}
+
+/**
+ * 保活心跳：下载期间定期回敲门户页，给 /webapps 的会话续命。
+ * 它只负责续命与观测 —— 一次失败不许抛、不许停下载、不许改批次结果。
+ * @param {{ fetcher?: { fetchOk?: Function }, url?: string, intervalMs?: number, onTick?: Function,
+ *   signal?: AbortSignal, setTimeoutFn?: Function, clearTimeoutFn?: Function }} [options]
+ * @returns {{ start: () => void, stop: () => void, count: () => number }}
+ */
+export function createHeartbeat(options) {
+  const opts = options || {};
+  const fetcher = opts.fetcher || null;
+  const url = String(opts.url || '');
+  const intervalMs = Number.isFinite(opts.intervalMs) ? Math.max(0, opts.intervalMs) : 0;
+  const onTick = typeof opts.onTick === 'function' ? opts.onTick : null;
+  const signal = opts.signal;
+  const schedule = typeof opts.setTimeoutFn === 'function' ? opts.setTimeoutFn : setTimeout;
+  const unschedule = typeof opts.clearTimeoutFn === 'function' ? opts.clearTimeoutFn : clearTimeout;
+  let timer = null;
+  let ticks = 0;
+  let running = false;
+
+  function stop() {
+    running = false;
+    if (timer !== null) {
+      try {
+        unschedule(timer);
+      } catch {
+        /* 清定时器失败不该冒到下载链上 */
+      }
+      timer = null;
+    }
+  }
+
+  function arm() {
+    if (!running) return;
+    timer = schedule(function () {
+      timer = null;
+      void tick();
+    }, intervalMs);
+  }
+
+  async function tick() {
+    if (!running) return;
+    if (signal && signal.aborted) {
+      stop();
+      return;
+    }
+    ticks += 1;
+    let outcome = { ok: false };
+    try {
+      const response = await fetcher.fetchOk(url, { method: 'GET', cache: 'no-store' });
+      discardBody(response);
+      outcome = { ok: true };
+    } catch (error) {
+      outcome = isSessionExpired(error) ? { ok: false, sessionExpired: true } : { ok: false };
+    }
+    // stop() 之后一次都不许再回调：批次可能已经收尾，日志与计数都不该再动。
+    if (!running) return;
+    if (onTick) {
+      try {
+        onTick(outcome);
+      } catch {
+        /* 观察者自己出错不许影响心跳，更不许影响下载 */
+      }
+    }
+    arm();
+  }
+
+  function start() {
+    if (running) return;
+    if (!fetcher || typeof fetcher.fetchOk !== 'function') return;
+    if (!url || !(intervalMs > 0)) return;
+    if (signal && signal.aborted) return;
+    running = true;
+    arm();
+  }
+
+  function count() {
+    return ticks;
+  }
+
+  return { start: start, stop: stop, count: count };
+}

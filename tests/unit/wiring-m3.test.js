@@ -103,6 +103,10 @@ function harness(over) {
       },
       createFetcher: function () {
         return { async probeSize() { return undefined; } };
+      },
+      // 会话自检注入：这个文件里的 halted 用例会走自动续跑，真自检要发一次 fetch（DNS 失败约 300ms）
+      probeAlive: function () {
+        return Promise.resolve({ alive: false });
       }
     }
   });
