@@ -185,6 +185,8 @@ export function createFsSink({ settings = {}, dirHandle, signal, total = 0, file
     const emitFile = createFileEmitter(onFileEvent);
     const control = createControl();
     let aborted = false;
+    // 诊断计数：worker 到底有没有被调用。入口计数是「计划存在但池子没跑」与「池子跑了却什么都没记」的唯一分界。
+    let workerStarted = 0;
 
     // entryId 显式传参：4 个并发文件共用一个 tracker，不能让 payload 取到别的文件的 id
     const emit = (state, path, entryId = '', force = false) =>
@@ -204,6 +206,17 @@ export function createFsSink({ settings = {}, dirHandle, signal, total = 0, file
         // 会话过期停机之后不再启动新文件（在飞的那几个自然结束）
         if (control.stopped) return;
         const label = relativePath(plan);
+        if (workerStarted === 0) {
+          console.info('[bbdl] fs 首个 worker', {
+            plans: plans.length,
+            concurrency: concurrency,
+            entryKeys: entry ? Object.keys(entry).join(',') : '',
+            hasUrl: Boolean(entry && entry.url),
+            urlLooksWebdav: Boolean(entry && entry.url && /bbcswebdav/i.test(String(entry.url))),
+            path: label
+          });
+        }
+        workerStarted += 1;
         const entryId = entry && entry.id != null ? String(entry.id) : '';
         const fileName = plan.fileName;
         emit('file-start', label, entryId, true);
@@ -261,6 +274,15 @@ export function createFsSink({ settings = {}, dirHandle, signal, total = 0, file
     );
 
     if (signal && signal.aborted) aborted = true;
+    console.info('[bbdl] fs 收尾', {
+      entries: list.length,
+      plans: plans.length,
+      concurrency: concurrency,
+      workers: workerStarted,
+      ok: ok.length,
+      failed: failed.length,
+      aborted: aborted
+    });
     // 用户取消优先：aborted 与 halted 互斥，取消时连 halt 事件也不发
     const halted = control.stopped && !aborted ? control.reason || 'session-expired' : null;
     const pending = halted ? listPending(list, ok, failed) : [];
