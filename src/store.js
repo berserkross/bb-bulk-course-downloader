@@ -6,7 +6,9 @@ export const DEFAULTS = {
   probeConcurrency: 6,
   minDelayMs: 150,
   maxDelayMs: 400,
-  probeSizes: true
+  probeSizes: true,
+  // ZIP 降级落盘的单包上限（200 MiB）：一个包装满就封口交给浏览器，内存上界就是一个包
+  zipChunkBytes: 200 * 1024 * 1024
 };
 
 export function loadSettings() {

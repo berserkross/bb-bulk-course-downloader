@@ -21,9 +21,6 @@ const FILE_FAILED = 'file-failed';
 /** 清单落库节流：500ms 内的多条记录合并成一次写库，避免每个文件一次事务。 */
 const MANIFEST_FLUSH_MS = 500;
 
-/** 无 FSA 的体积闸值：超过就提醒「只能逐个交给浏览器」。只按「全部已知」判断，绝不拿未知凑合计。 */
-const NO_FSA_HINT_BYTES = 500 * 1024 * 1024;
-
 /** 落盘层参数只补默认值（不新增 UI 控件）：用户在面板里能看到的两项不在此列。 */
 const SINK_DEFAULTS = { idleTimeoutMs: 30000, fileRetries: 1, serializeOverBytes: 48 * 1024 * 1024 };
 
@@ -56,6 +53,12 @@ function permissionText(status) {
 function nonNegCount(value) {
   const n = Number(value);
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+}
+
+/** entry.id 归一化：缺失一律空串，「停机 pending ∩ 失败清单」的比对就不必关心 null / undefined。 */
+function entryIdOf(entry) {
+  const id = entry && entry.id;
+  return id === null || id === undefined || id === '' ? '' : String(id);
 }
 
 /**
@@ -173,7 +176,9 @@ export function createController(config) {
     /** 「获取体积」的结果：对话框只拿它刷行，落盘层的体积索引必须自己留一份。 */
     probedSizes: new Map(),
     flushTimer: 0,
-    batchPlans: []
+    batchPlans: [],
+    /** 上一轮停机时没能下载的 entry 快照：只给「刷新后继续」用，不清清单、不重扫。 */
+    haltedPending: []
   };
 
   const panel = mountPanel({
@@ -186,6 +191,7 @@ export function createController(config) {
     onDownload: startDownload,
     onRetryFailed,
     onResume: resumeLast,
+    onResumePending: resumePending,
     onCancel() {
       if (state.abort) state.abort.abort();
     }
@@ -604,18 +610,24 @@ export function createController(config) {
     const dirHandle = choice.dirHandle || null;
     state.dirHandle = dirHandle;
     state.expectedBytes = typeof choice.expectedBytes === 'number' ? choice.expectedBytes : 0;
-    panel.setMode(dirHandle ? 'fs' : 'download');
+    // 面板文案必须和真正走的 sink 一致：没有目录句柄时落盘层按 fallbackSink 选 zip（缺省）/ download。
+    // 就地算，不从 sinks/index.js 再导出一份选择逻辑，避免两处口径漂移。
+    const sinkKind = dirHandle ? 'fs' : (settings && settings.fallbackSink === 'files' ? 'download' : 'zip');
+    panel.setMode(sinkKind);
     panel.setNotice('');
-    // 没有目录句柄时浏览器给每个文件单独弹一次下载：体积大就先把话说清楚，别让用户以为是卡住了。
-    // 体积未知（含有一个未知）一律不提示 —— 猜出来的合计比不说更糟。
+    // 没有目录句柄时不再是「每个文件单独弹一次下载」：落盘层按文件夹打包成 .zip 交给浏览器，
+    // 所以那句 500 MB 弹窗警告已经不成立，改成一句实话。逐文件模式（fallbackSink='files'）仍是老行为，
+    // 但那是用户显式选的逃生口，同样不再吓唬人。
     if (!dirHandle) {
-      const pickedBytes = selectedBytes(choice.entries);
-      if (typeof pickedBytes === 'number' && pickedBytes > NO_FSA_HINT_BYTES) {
-        panel.setNotice(
-          '这批文件合计超过 500 MB：没有文件夹写入权限时会逐个交给浏览器下载（会连续弹窗），建议改用 Chrome/Edge 获得流式落盘。'
-        );
-      }
+      panel.setNotice(
+        sinkKind === 'download'
+          ? '没有目录写入权限，本次逐文件下载（不保留目录结构）。'
+          : '没有目录写入权限，本次按文件夹打包成 .zip 下载。'
+      );
     }
+    // 上一轮的停机横幅与 pending 快照只属于上一轮：新批次一开始就作废。
+    state.haltedPending = [];
+    clearHaltedBanner();
 
     const signal = begin();
     try {
@@ -628,9 +640,7 @@ export function createController(config) {
       state.batchPlans = buildPlans(batch);
       panel.setState('downloading');
       const result = await runDownload(batch, dirHandle, signal);
-      await flushRecords();
-      panel.showSummary(result);
-      return result;
+      return await finishDownload(result);
     } catch (err) {
       panel.fail(signal.aborted ? '已取消' : describe(err));
       return null;
@@ -639,10 +649,98 @@ export function createController(config) {
     }
   }
 
-  async function runDownload(entries, dirHandle, signal) {
+  async function runDownload(entries, dirHandle, signal, options) {
+    const opts = options || {};
     const sink = await createSink({ settings, dirHandle, signal, total: entries.length, sizeOf: sizeOf });
     const fetcher = createFetcher({ signal });
-    return sink.download(entries, fetcher, { onProgress });
+    // 种子行必须在 sink.download 之前、且只种这一次：panel 不为陌生 entryId 造行，
+    // 漏了这一步逐文件事件会全部落空。续跑（resumePending）传 seedFiles:false —— 列表原样保留。
+    if (opts.seedFiles !== false && typeof panel.setFiles === 'function') panel.setFiles(entries);
+    return sink.download(entries, fetcher, {
+      onProgress,
+      // 原样转发：事件字段由 panel 解释，这里既不裁剪也不改形状。
+      onFileEvent(event) {
+        if (typeof panel.applyFileEvent === 'function') panel.applyFileEvent(event);
+      }
+    });
+  }
+
+  /* ---------------- 停机 / 收尾 ---------------- */
+
+  /**
+   * 收尾：清单写回 → 读停机结果 → 横幅与 pending 快照 → 面板摘要。
+   * halted 在 download sink 上是 **不可枚举** 属性（shared.js:withHalted 用 defineProperty 挂上去的），
+   * {...result} / JSON.stringify 都看不见 —— 只能直接读 result.halted。
+   */
+  async function finishDownload(result) {
+    await flushRecords();
+    const halted = result ? result.halted : null;
+    state.haltedPending = rememberHalted(halted);
+    panel.showSummary(resultForPanel(result, state.haltedPending));
+    return result;
+  }
+
+  /**
+   * 记下停机快照并竖横幅，返回快照数组（没停机就是空数组）。
+   * halt 事件里的 pending 是数字，halted 里才是 entry 列表；zip sink 的 halted 干脆没有 pendingCount，
+   * 所以这里按 pending.length 兜底，绝不把一个 undefined 递给面板。
+   */
+  function rememberHalted(halted) {
+    if (!halted) {
+      clearHaltedBanner();
+      return [];
+    }
+    const pending = Array.isArray(halted.pending) ? halted.pending.slice() : [];
+    const pendingCount = Number.isFinite(halted.pendingCount) ? halted.pendingCount : pending.length;
+    if (typeof panel.setHalted === 'function') panel.setHalted({ reason: halted.reason, pendingCount });
+    return pending;
+  }
+
+  /** 停机时面板早退的那几条已经退回 waiting：它们既不是成功也不是失败，不能进失败清单。 */
+  function resultForPanel(result, pendingList) {
+    const res = result || { ok: [], failed: [], aborted: false };
+    const failed = Array.isArray(res.failed) ? res.failed : [];
+    if (!pendingList || !pendingList.length) return res;
+    const pendingIds = new Set(pendingList.map(entryIdOf));
+    const kept = failed.filter((item) => !pendingIds.has(entryIdOf(item && item.entry ? item.entry : item)));
+    if (kept.length === failed.length) return res;
+    // 只给面板一份摘过的副本：调用方拿到的仍是落盘层的原样结果。
+    return Object.assign({}, res, { failed: kept });
+  }
+
+  function clearHaltedBanner() {
+    if (typeof panel.clearHalted === 'function') panel.clearHalted();
+  }
+
+  /**
+   * 「刷新后继续」：只把上一轮停机时没能下载的 entry 再跑一轮。
+   * 不重新扫描、不重算跳过、不重种行 —— 面板里的清单原样保留，这正是它和「继续上次」的区别。
+   */
+  function resumePending() {
+    if (state.busy) return null;
+    const pending = state.haltedPending.slice();
+    if (!pending.length) return startScan();
+
+    state.busy = true;
+    state.abort = new AbortController();
+    const signal = state.abort.signal;
+    state.haltedPending = [];
+    clearHaltedBanner();
+    // 待下载集合变了：上一轮的分母与计划都不能再冒充这一轮。
+    state.expectedBytes = 0;
+    state.batchPlans = buildPlans(pending);
+    panel.setState('downloading');
+    return (async function () {
+      try {
+        const result = await runDownload(pending, state.dirHandle, signal, { seedFiles: false });
+        return await finishDownload(result);
+      } catch (err) {
+        panel.fail(signal.aborted ? '已取消' : describe(err));
+        return null;
+      } finally {
+        state.busy = false;
+      }
+    })();
   }
 
   /** 失败项重试：同一套目录句柄与并发设置，只是一次跑更少的文件。 */
@@ -655,7 +753,11 @@ export function createController(config) {
     state.batchPlans = buildPlans(entries);
     panel.setState('downloading');
     try {
-      return await runDownload(entries, state.dirHandle, state.abort.signal);
+      const result = await runDownload(entries, state.dirHandle, state.abort.signal);
+      // 重试批次一样可能撞上会话过期：横幅、快照、摘要摘除都得走同一条收尾路径。
+      const halted = result ? result.halted : null;
+      state.haltedPending = rememberHalted(halted);
+      return resultForPanel(result, state.haltedPending);
     } finally {
       await flushRecords();
       state.busy = false;
@@ -684,19 +786,6 @@ export function createController(config) {
     const record = files && Object.prototype.hasOwnProperty.call(files, id) ? files[id] : null;
     const size = record ? record.size : null;
     return isKnownSize(size) ? size : undefined;
-  }
-
-  /** 选中项体积合计：只要有一个未知就整批返回 null，绝不拿已知部分冒充「总计」。 */
-  function selectedBytes(entries) {
-    const list = Array.isArray(entries) ? entries : [];
-    if (!list.length) return null;
-    let sum = 0;
-    for (const entry of list) {
-      const size = sizeOf(entry);
-      if (typeof size !== 'number') return null;
-      sum += size;
-    }
-    return sum;
   }
 
   /* ---------------- 清单写回 ---------------- */
@@ -824,11 +913,13 @@ export function createController(config) {
       skipSummary: state.skipSummary,
       pendingRecords: state.pendingRecords,
       diskChecked: state.diskChecked,
-      diskTruncated: state.diskTruncated
+      diskTruncated: state.diskTruncated,
+      /** 停机快照（给「刷新后继续」用）；非停机状态一律空数组。 */
+      haltedPending: state.haltedPending
     };
   }
 
-  return { startScan, startDownload, onRetryFailed, getState, ready, panel, flushRecords };
+  return { startScan, startDownload, onRetryFailed, resumePending, getState, ready, panel, flushRecords };
 }
 
 /**

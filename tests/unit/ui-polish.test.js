@@ -226,12 +226,53 @@ test('对话框：类型勾选 + 文件名搜索过滤行，按体积排序把�
   sort.dispatchEvent(new dom.window.Event('change'));
   assert.deepEqual(visibleNames(), ['alpha.pdf', 'zulu.pdf', 'mike.pptx']);
 
-  // 落盘方式必须写明是哪一种，并附代价说明。
+  // 落盘方式必须写明是哪一种，并附代价说明：没选目录、也没把 fallbackSink 设成 files，缺省就是 zip。
   const mode = dlg.querySelector('.bbdl-mode').textContent;
-  assert.match(mode, /逐文件下载/);
+  assert.match(mode, /打包成 \.zip/);
   assert.match(mode, /代价/);
+  assert.doesNotMatch(mode, /逐文件下载|content_id|token|secret|https?:\/\//);
 
   document.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'Escape' }));
   assert.equal(await pending, null);
   dom.window.close();
 });
+
+test('对话框落盘方式跟真实 sink 走：缺省 zip / fallbackSink=files 逐文件 / 选到目录 fs', async () => {
+  const entries = [{ id: 'e1', name: 'a.pdf', folderPath: ['Week 1'], url: 'https://bb.example.edu/1' }];
+  const modeText = () => document.querySelector('.bbdl-mode').textContent;
+
+  // ① 没有目录句柄、settings 里没有 fallbackSink → zip（落盘层缺省按文件夹打包）
+  const domZip = setupDom();
+  const zipPending = openSelectDialog(entries, { settings: {}, pickDirectory: () => null });
+  assert.match(modeText(), /打包成 \.zip/);
+  assert.doesNotMatch(modeText(), /逐文件下载|content_id|token|secret|https?:\/\//);
+  document.querySelector('.bbdl-dialog button[data-act="cancel"]').click();
+  assert.equal(await zipPending, null);
+  domZip.window.close();
+
+  // ② 显式选了逐文件逃生口 → download
+  const domDl = setupDom();
+  const dlPending = openSelectDialog(entries, { settings: { fallbackSink: 'files' }, pickDirectory: () => null });
+  assert.match(modeText(), /逐文件下载/);
+  assert.doesNotMatch(modeText(), /打包成 \.zip/);
+  document.querySelector('.bbdl-dialog button[data-act="cancel"]').click();
+  assert.equal(await dlPending, null);
+  domDl.window.close();
+
+  // ③ 用户在对话框里选到了目录 → 同一会话内立刻变 fs，不靠重开对话框
+  const domFs = setupDom();
+  const fsPending = openSelectDialog(entries, {
+    settings: {},
+    pickDirectory: () => null,
+    onPickDirectory: async () => ({ dirHandle: { name: 'd1' }, name: 'd1' })
+  });
+  assert.match(modeText(), /打包成 \.zip/, '还没选目录时仍是 zip');
+  document.querySelector('.bbdl-dialog button[data-act="pick-dir"]').click();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.match(modeText(), /保存到文件夹/, '选到目录后文案必须当场变成 fs');
+  assert.doesNotMatch(modeText(), /打包成 \.zip|逐文件下载/);
+  document.querySelector('.bbdl-dialog button[data-act="cancel"]').click();
+  assert.equal(await fsPending, null);
+  domFs.window.close();
+});
+

@@ -1,4 +1,4 @@
-import { runPool } from './pool.js';
+import { runPool, createControl } from './pool.js';
 import {
   planBatch,
   createReporter,
@@ -6,9 +6,13 @@ import {
   progressPayload,
   relativePath,
   toFailure,
-  isAbort
+  isAbort,
+  retryReason,
+  createFileEmitter,
+  withHalted,
+  listPending
 } from './shared.js';
-import { StallError, withFileRetry, createMutex, DEFAULT_IDLE_MS } from './guard.js';
+import { StallError, withFileRetry, createMutex, DEFAULT_IDLE_MS, isSessionExpiredError } from './guard.js';
 
 /** 点击后延迟回收 blob URL：立刻 revoke 会在部分 Chrome 版本上打断下载。 */
 const REVOKE_DELAY_MS = 60000;
@@ -145,7 +149,7 @@ export function createDownloadSink({
   const lookupSize = makeSizeLookup(sizeOf);
   const serializeMutex = createMutex();
 
-  async function download(entries, fetcher, { onProgress } = {}) {
+  async function download(entries, fetcher, { onProgress, onFileEvent } = {}) {
     const list = Array.from(entries || []);
     const totalCount = total || list.length;
     const ok = [];
@@ -153,6 +157,10 @@ export function createDownloadSink({
     const plans = planBatch(list, { preserveTree: false, files });
     const report = createReporter({ onProgress });
     const progress = createProgressTracker(totalCount);
+    // 停机闸门无条件开启：会话过期是「停机」而不是「文件下载失败」，这个记录语义绝不能取决于
+    // 调用方有没有传 onFileEvent（createFileEmitter(undefined) 本身就是 noop）。
+    const emitFile = createFileEmitter(onFileEvent);
+    const control = createControl();
     let aborted = false;
 
     // entryId 显式传参：并发文件共用一个 tracker，不能让 payload 取到别的文件的 id
@@ -207,6 +215,8 @@ export function createDownloadSink({
           aborted = true;
           return;
         }
+        // 会话过期停机之后不再启动新文件（在飞的那几个自然结束）
+        if (control.stopped) return;
         // 无目录写权限：目录信息只能由 buildEntryPath 用 folder__ 前缀编码进文件名
         const name = plan.fileName;
         const label = relativePath(plan);
@@ -230,14 +240,34 @@ export function createDownloadSink({
             }, REVOKE_DELAY_MS);
           };
 
-          await withFileRetry(() => attemptOnce(entry, deliver), {
-            attempts: 1 + fileRetries,
-            // 只报状态，不改旧字段：'file-retry' 是新增字符串，UI 认识就显示、不认识就忽略
-            onRetry: () => emit('file-retry', label, entryId, true)
-          });
+          const blob = await withFileRetry(
+            // withFileRetry 把「本次是第几次」交回来：attempt 计数按文件各一份，并发下互不污染
+            (attempt) => {
+              emitFile({ type: 'start', entryId, path: label, name, attempt });
+              return attemptOnce(entry, deliver);
+            },
+            {
+              attempts: 1 + fileRetries,
+              // 只报状态，不改旧字段：'file-retry' 是新增字符串，UI 认识就显示、不认识就忽略
+              onRetry: (info) => {
+                // 此刻第 N 次已失败、第 N+1 次还没开始（契约 §1 的 retry 时机）
+                emitFile({
+                  type: 'retry',
+                  entryId,
+                  path: label,
+                  name,
+                  attempt: info.attempt + 1,
+                  reason: retryReason(info.error)
+                });
+                emit('file-retry', label, entryId, true);
+              }
+            }
+          );
 
           ok.push(entry);
           progress.endFile(false);
+          // 整份 blob 只交一次给浏览器：bytes 是这一份的大小，重试不累加
+          emitFile({ type: 'done', entryId, path: label, name, bytes: (blob && blob.size) || 0 });
           emit('file-done', label, entryId, true);
         } catch (err) {
           if (objectUrl) {
@@ -252,17 +282,31 @@ export function createDownloadSink({
             emit('aborted', label, entryId, true);
             return;
           }
-          failed.push(toFailure(entry, plan, err));
+          if (isSessionExpiredError(err)) {
+            // 会话已失效：停机，这个文件既不算成功也不进失败清单，交给 pending 接管
+            control.stop('session-expired');
+            return;
+          }
+          const failure = toFailure(entry, plan, err);
+          failed.push(failure);
           progress.endFile(true);
+          emitFile({ type: 'failed', entryId, path: label, name, error: failure.error });
           emit('file-failed', label, entryId, true);
         }
       },
-      { signal }
+      { signal, control }
     );
 
     if (signal && signal.aborted) aborted = true;
+    // 用户取消优先：aborted 与 halted 互斥，取消时连 halt 事件也不发
+    const halted = control.stopped && !aborted ? control.reason || 'session-expired' : null;
+    const pending = halted ? listPending(list, ok, failed) : [];
+    if (halted) emitFile({ type: 'halt', entryId: '', path: '', name: '', reason: halted, pending: pending.length });
     emit('done', '', '', true);
-    return { ok, failed, aborted };
+    return withHalted(
+      { ok, failed, aborted },
+      halted ? { reason: halted, pending, pendingCount: pending.length } : null
+    );
   }
 
   return { kind: 'download', download };

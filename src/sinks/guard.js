@@ -40,7 +40,8 @@ function isAbortLike(err) {
   return err.name === 'AbortError' || err.code === 20;
 }
 
-function isSessionExpiredLike(err) {
+/** 会话过期：重试不会自己好，只能停机（docs/m3-progress.md §2）。 */
+export function isSessionExpiredError(err) {
   return !!err && err.name === 'SessionExpiredError';
 }
 
@@ -54,7 +55,7 @@ function isSessionExpiredLike(err) {
 export function isRetriableError(err) {
   if (!err) return false;
   if (isAbortLike(err)) return false;
-  if (isSessionExpiredLike(err)) return false;
+  if (isSessionExpiredError(err)) return false;
   if (err instanceof StallError || err.name === 'StallError') return true;
   if (err instanceof TruncatedError || err.name === 'TruncatedError') return true;
   if (err instanceof TypeError) return true;

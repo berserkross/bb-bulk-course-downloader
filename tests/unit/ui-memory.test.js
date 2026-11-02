@@ -166,7 +166,7 @@ test('探测器报 0 / NaN 不算已知：索引里绝不出现 0', async () => 
   assert.equal(sizeOf(ENTRIES[1]), undefined);
 });
 
-test('无 FSA 且选中项体积合计 > 500MB：下载前只提示一次，且不含 URL', async () => {
+test('无 FSA：不再喊「逐个交给浏览器下载」，改成「按文件夹打包成 .zip」的一句实话，且不含 URL', async () => {
   const big = [
     { id: 'b1', name: 'v1.mp4', folderPath: [], url: 'https://bb.example.edu/f/b1?content_id=_9_1&token=secret' },
     { id: 'b2', name: 'v2.mp4', folderPath: [], url: 'https://bb.example.edu/f/b2?content_id=_9_2&token=secret' }
@@ -184,10 +184,12 @@ test('无 FSA 且选中项体积合计 > 500MB：下载前只提示一次，且�
   await h.controller.startScan();
   await h.controller.startDownload();
 
-  const notices = h.panel.texts('setNotice').filter(function (text) { return /Chrome\/Edge/.test(text); });
+  const all = h.panel.texts('setNotice').filter(Boolean);
+  // zip 流式路径下「没有目录就逐个弹窗」已经不成立，那句 500MB 警告必须彻底撤掉
+  assert.equal(all.filter(function (text) { return /Chrome\/Edge|逐个交给浏览器|500 MB/.test(text); }).length, 0);
+  const notices = all.filter(function (text) { return /打包成 \.zip/.test(text); });
   assert.equal(notices.length, 1, '提示必须只有一次');
-  assert.match(notices[0], /逐个交给浏览器下载/);
-  assert.match(notices[0], /流式落盘/);
+  assert.match(notices[0], /没有目录写入权限/);
   assert.doesNotMatch(notices[0], /content_id|token|secret|https?:\/\//);
   assert.ok(h.rec.sinkEntries.length > 0, '提示之后照常开始下载');
 });
@@ -274,4 +276,50 @@ test('失败项建议：只出现在「重试后仍失败」类错误旁，且�
   assert.equal(items[1].querySelector('.bbdl-failed__reason').textContent, '网络中断');
   api.destroy();
   dom.window.close();
+});
+
+test('落盘方式三档都有文案：fs / zip / download 各自可见且不为空', () => {
+  const dom = setupDom();
+  const api = mountPanel({ settings: {}, onScan() {}, onDownload() {}, onRetryFailed() { return null; } });
+  const modeEl = document.querySelector('.bbdl-mode');
+
+  const cases = [
+    { kind: 'fs', must: /保存到文件夹/ },
+    { kind: 'zip', must: /打包成 \.zip/ },
+    { kind: 'download', must: /逐文件/ }
+  ];
+  for (const item of cases) {
+    api.setMode(item.kind);
+    assert.equal(modeEl.hidden, false, item.kind + ' 不许把整块藏起来');
+    assert.ok(modeEl.textContent.length > 0, item.kind + ' 必须有文案');
+    assert.match(modeEl.textContent, item.must);
+    assert.doesNotMatch(modeEl.textContent, /content_id|token|secret|https?:\/\//);
+  }
+
+  api.destroy();
+  dom.window.close();
+});
+
+test('面板档位跟着真实 sink 走：缺省 zip，fallbackSink=files 才 download，有目录句柄仍是 fs', async () => {
+  const plain = harness({ entries: ENTRIES });
+  await plain.controller.ready;
+  await plain.controller.startScan();
+  await plain.controller.startDownload();
+  assert.deepEqual(plain.panel.texts('setMode'), ['zip'], '没有目录句柄且未设置 fallbackSink → zip');
+  assert.match(plain.panel.texts('setNotice')[0], /打包成 \.zip/);
+
+  const files = harness({ entries: ENTRIES, settings: { fallbackSink: 'files' } });
+  await files.controller.ready;
+  await files.controller.startScan();
+  await files.controller.startDownload();
+  assert.deepEqual(files.panel.texts('setMode'), ['download'], 'fallbackSink=files 才是逐文件');
+  assert.match(files.panel.texts('setNotice')[0], /逐文件下载/);
+  assert.doesNotMatch(files.panel.texts('setNotice')[0], /打包成 \.zip/);
+
+  const fsa = harness({ entries: ENTRIES, dirHandle: { name: '课件目录' } });
+  await fsa.controller.ready;
+  await fsa.controller.startScan();
+  await fsa.controller.startDownload();
+  assert.deepEqual(fsa.panel.texts('setMode'), ['fs'], '有目录句柄不变');
+  assert.deepEqual(fsa.panel.texts('setNotice').filter(Boolean), []);
 });

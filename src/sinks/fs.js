@@ -1,4 +1,4 @@
-import { runPool } from './pool.js';
+import { runPool, createControl } from './pool.js';
 import {
   planBatch,
   createReporter,
@@ -6,9 +6,13 @@ import {
   progressPayload,
   relativePath,
   toFailure,
-  isAbort
+  isAbort,
+  retryReason,
+  createFileEmitter,
+  withHalted,
+  listPending
 } from './shared.js';
-import { createIdleReader, withFileRetry, TruncatedError, DEFAULT_IDLE_MS } from './guard.js';
+import { createIdleReader, withFileRetry, TruncatedError, DEFAULT_IDLE_MS, isSessionExpiredError } from './guard.js';
 
 /** settings 由接线层注入；读不到就落回契约默认值（fileRetries=1 表示首次失败后额外重试 1 次）。 */
 function pickIdleMs(value) {
@@ -139,11 +143,13 @@ export function createFsSink({ settings = {}, dirHandle, signal, total = 0, file
    * attemptBytes 是「本次尝试已经计入 tracker 的字节数」：被 abort 的那一份没有落地，
    * 重试前必须按它回退，否则 bytesDone 会大于真实落盘量（一个文件重试成功却显示 32/28）。
    */
-  function writeEntry(fetcher, entry, plan, onChunk, { onRetry, rollback } = {}) {
+  function writeEntry(fetcher, entry, plan, onChunk, { onRetry, onAttempt, onFileRetry, rollback } = {}) {
     let attemptBytes = 0;
     return withFileRetry(
-      () => {
+      // withFileRetry 把「本次是第几次」交回来：attempt 计数天然按文件各一份，并发下互不污染
+      (attempt) => {
         attemptBytes = 0;
+        if (typeof onAttempt === 'function') onAttempt(attempt);
         return writeAttempt(fetcher, entry, plan, (written, delta) => {
           attemptBytes += delta;
           onChunk(written, delta);
@@ -154,13 +160,15 @@ export function createFsSink({ settings = {}, dirHandle, signal, total = 0, file
         onRetry: (info) => {
           if (typeof rollback === 'function') rollback(attemptBytes);
           attemptBytes = 0;
+          // onFileRetry 先发：此刻第 N 次已经失败、第 N+1 次还没开始（契约 §1 的 retry 时机）
+          if (typeof onFileRetry === 'function') onFileRetry(info);
           if (typeof onRetry === 'function') onRetry(info);
         }
       }
     );
   }
 
-  async function download(entries, fetcher, { onProgress } = {}) {
+  async function download(entries, fetcher, { onProgress, onFileEvent } = {}) {
     const list = Array.from(entries || []);
     const plans = planBatch(list, { preserveTree, files });
     const totalCount = total || list.length;
@@ -168,6 +176,10 @@ export function createFsSink({ settings = {}, dirHandle, signal, total = 0, file
     const failed = [];
     const report = createReporter({ onProgress });
     const progress = createProgressTracker(totalCount);
+    // 停机闸门无条件开启：会话过期是「停机」而不是「文件下载失败」，这个记录语义绝不能取决于
+    // 调用方有没有传 onFileEvent（createFileEmitter(undefined) 本身就是 noop）。
+    const emitFile = createFileEmitter(onFileEvent);
+    const control = createControl();
     let aborted = false;
 
     // entryId 显式传参：4 个并发文件共用一个 tracker，不能让 payload 取到别的文件的 id
@@ -185,11 +197,14 @@ export function createFsSink({ settings = {}, dirHandle, signal, total = 0, file
           aborted = true;
           return;
         }
+        // 会话过期停机之后不再启动新文件（在飞的那几个自然结束）
+        if (control.stopped) return;
         const label = relativePath(plan);
         const entryId = entry && entry.id != null ? String(entry.id) : '';
+        const fileName = plan.fileName;
         emit('file-start', label, entryId, true);
         try {
-          await writeEntry(
+          const written = await writeEntry(
             fetcher,
             entry,
             plan,
@@ -201,11 +216,23 @@ export function createFsSink({ settings = {}, dirHandle, signal, total = 0, file
               // 重试会把上一次 abort 掉的字节扣回去，bytesDone 才等于最终落盘量
               rollback: (n) => progress.rollbackBytes(n),
               // 只报状态，不改旧字段：'file-retry' 是新增字符串，UI 认识就显示、不认识就忽略
-              onRetry: () => emit('file-retry', label, entryId, true)
+              onRetry: () => emit('file-retry', label, entryId, true),
+              onAttempt: (attempt) => emitFile({ type: 'start', entryId, path: label, name: fileName, attempt }),
+              onFileRetry: (info) =>
+                emitFile({
+                  type: 'retry',
+                  entryId,
+                  path: label,
+                  name: fileName,
+                  attempt: info.attempt + 1,
+                  reason: retryReason(info.error)
+                })
             }
           );
           ok.push(entry);
           progress.endFile(false);
+          // 重试是把同一个文件重写一遍：written 是最后一次尝试的落盘字节，不是各次累加
+          emitFile({ type: 'done', entryId, path: label, name: fileName, bytes: written });
           emit('file-done', label, entryId, true);
         } catch (err) {
           if ((signal && signal.aborted) || isAbort(err)) {
@@ -214,17 +241,31 @@ export function createFsSink({ settings = {}, dirHandle, signal, total = 0, file
             emit('aborted', label, entryId, true);
             return;
           }
-          failed.push(toFailure(entry, plan, err));
+          if (isSessionExpiredError(err)) {
+            // 会话已失效：停机，这个文件既不算成功也不进失败清单，交给 pending 接管
+            control.stop('session-expired');
+            return;
+          }
+          const failure = toFailure(entry, plan, err);
+          failed.push(failure);
           progress.endFile(true);
+          emitFile({ type: 'failed', entryId, path: label, name: fileName, error: failure.error });
           emit('file-failed', label, entryId, true);
         }
       },
-      { signal }
+      { signal, control }
     );
 
     if (signal && signal.aborted) aborted = true;
+    // 用户取消优先：aborted 与 halted 互斥，取消时连 halt 事件也不发
+    const halted = control.stopped && !aborted ? control.reason || 'session-expired' : null;
+    const pending = halted ? listPending(list, ok, failed) : [];
+    if (halted) emitFile({ type: 'halt', entryId: '', path: '', name: '', reason: halted, pending: pending.length });
     emit('done', '', '', true);
-    return { ok, failed, aborted };
+    return withHalted(
+      { ok, failed, aborted },
+      halted ? { reason: halted, pending, pendingCount: pending.length } : null
+    );
   }
 
   return { kind: 'fs', download };

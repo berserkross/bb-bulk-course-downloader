@@ -539,14 +539,19 @@ test('download sink：单文件失败不产生空 URL 且继续其它文件', as
 
 // =========================== createSink 工厂 ===========================
 
-test('createSink：dirHandle 存在 → fs sink；否则 → download sink', () => {
+test('createSink：有 dirHandle → fs；没有且 fallbackSink 非 files → zip（缺省）；fallbackSink=files → download', () => {
   assert.equal(typeof pickDirectory, 'function');
   const withDir = createSink({ settings: {}, dirHandle: makeRoot(newLog()), total: 1 });
   assert.equal(withDir.kind, 'fs');
   assert.equal(typeof withDir.download, 'function');
+  // 缺省按 zip 兜底：settings 里根本没有 fallbackSink 这个键也要落到 zip（读取时兜底，不往 store 加默认值）
   const withoutDir = createSink({ settings: {}, dirHandle: null, total: 1 });
-  assert.equal(withoutDir.kind, 'download');
+  assert.equal(withoutDir.kind, 'zip');
   assert.equal(typeof withoutDir.download, 'function');
+  // 显式逃生口仍然回到逐文件 <a download>
+  const explicitFiles = createSink({ settings: { fallbackSink: 'files' }, dirHandle: null, total: 1 });
+  assert.equal(explicitFiles.kind, 'download');
+  assert.equal(typeof explicitFiles.download, 'function');
 });
 // =========================== 进度负载与失败契约 ===========================
 
@@ -1089,11 +1094,13 @@ test('fs sink：HttpError 404 不重试（只请求一次），会话失效也�
   assert.equal(result.failed[0].error.includes('?'), false, 'error 文案不得带 query');
   assert.equal(result.failed[0].error.includes('token='), false);
 
+  // v2.3.0 起会话过期是停机不是失败：该文件既不在 failed 里，也不在 ok 里，只落在 halted.pending 里
   const log2 = newLog();
   const sink2 = createFsSink({ settings: { downloadConcurrency: 1, fileRetries: 2 }, dirHandle: makeRoot(log2), files });
   let sessionCalls = 0;
+  const sessionEntry = entry({ name: 'b.mp4' });
   const result2 = await sink2.download(
-    [entry({ name: 'b.mp4' })],
+    [sessionEntry],
     {
       async fetchOk() {
         sessionCalls += 1;
@@ -1103,8 +1110,10 @@ test('fs sink：HttpError 404 不重试（只请求一次），会话失效也�
     {}
   );
   assert.equal(sessionCalls, 1, '会话失效重试也不会自己好');
-  assert.equal(result2.failed.length, 1);
-  assert.match(result2.failed[0].error, /会话已失效/);
+  assert.equal(result2.halted.reason, 'session-expired');
+  assert.deepEqual(result2.halted.pending, [sessionEntry], '触发停机的文件进 pending');
+  assert.equal(result2.failed.length, 0, '会话过期不是文件失败');
+  assert.equal(result2.failed.some((f) => f.entry === sessionEntry), false);
 });
 
 test('fs sink：HttpError 429 可重试，预算用尽后记 failed 并带上最后一次的错误', async () => {
@@ -1364,7 +1373,8 @@ test('createSink 接线：sizeOf 也必须透传到 download sink（大文件临
   globalThis.setTimeout = (fn, ms, ...rest) => (ms >= 60000 ? (fn(), 0) : realSetTimeout(fn, ms, ...rest));
   try {
     const sink = createSink({
-      settings: { downloadConcurrency: 2, serializeOverBytes: 1024, idleTimeoutMs: 5000 },
+      // 这条测的是 download sink 的接线：没有目录句柄时缺省已经改走 zip，必须显式点名回逐文件模式。
+      settings: { fallbackSink: 'files', downloadConcurrency: 2, serializeOverBytes: 1024, idleTimeoutMs: 5000 },
       total: 2,
       sizeOf: () => 4096
     });

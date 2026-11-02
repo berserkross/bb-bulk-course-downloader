@@ -1,24 +1,11 @@
 import { readFile, mkdir } from 'node:fs/promises';
 import { build, context } from 'esbuild';
-import { meta } from './src/meta.js';
+import { buildBanner, resolveRepo } from './src/meta.js';
 
 const pkg = JSON.parse(await readFile(new URL('./package.json', import.meta.url), 'utf8'));
 
-function banner() {
-  return [
-    '// ==UserScript==',
-    `// @name         ${meta.name}`,
-    `// @namespace    ${meta.namespace}`,
-    `// @version      ${pkg.version}`,
-    `// @description  ${meta.description}`,
-    ...meta.matches.map((m) => `// @match        ${m}`),
-    `// @grant        ${meta.grant}`,
-    `// @run-at       ${meta.runAt}`,
-    '// @license      MIT',
-    '// ==/UserScript==',
-    ''
-  ].join('\n');
-}
+// 仓库信息优先取环境变量 BB_REPO_URL，其次 package.json 的 repository；都没有就不写分发 URL。
+const repo = resolveRepo({ packageJson: pkg, envUrl: process.env.BB_REPO_URL });
 
 const options = {
   entryPoints: ['src/index.js'],
@@ -26,7 +13,7 @@ const options = {
   format: 'iife',
   target: ['chrome110', 'firefox115'],
   outfile: 'dist/bb-bulk-course-downloader.user.js',
-  banner: { js: banner() },
+  banner: { js: buildBanner({ version: pkg.version, repo }) },
   legalComments: 'none',
   logLevel: 'info'
 };
@@ -38,4 +25,13 @@ if (process.argv.includes('--watch')) {
   console.log('watching...');
 } else {
   await build(options);
+}
+
+if (repo) {
+  console.log(`自动更新已开启：${repo.owner}/${repo.repo}（@updateURL/@downloadURL 已写入）`);
+} else {
+  console.log(
+    '未检测到 GitHub 仓库信息，已跳过 @updateURL/@downloadURL（篡改猴不会自动更新）。' +
+      '要开启：在 package.json 加 "repository": "https://github.com/<owner>/<repo>.git"，或设置环境变量 BB_REPO_URL 后重新构建。'
+  );
 }

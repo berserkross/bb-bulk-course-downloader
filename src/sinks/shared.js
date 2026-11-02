@@ -151,3 +151,56 @@ export function toFailure(entry, plan, err) {
     error: redactUrls(toMessage(err)) || '下载失败（未提供原因）'
   };
 }
+
+/**
+ * retry 事件的 reason：一句人话，**按错误类别给固定文案**。
+ * 绝不回显 err.message（它常常内嵌完整 URL），这是契约 §1「不含 URL」最省事的落实方式。
+ */
+export function retryReason(err) {
+  if (!err) return '下载中断，重试一次';
+  const name = String(err.name || '');
+  if (name === 'StallError') return '连接停滞，太久没有收到新数据';
+  if (name === 'TruncatedError') return '文件没有下载完整';
+  if (name === 'TypeError') return '网络连接中断';
+  const status = Number(err.status);
+  if (Number.isFinite(status)) {
+    if (status === 429) return '请求被限流';
+    if (status >= 500) return '服务器暂时不可用';
+    return '请求失败（HTTP ' + status + '）';
+  }
+  return '下载中断，重试一次';
+}
+
+/** 停机时还没落地的文件：既不在 ok 里，也不在 failed 里（含触发停止的那一个）。 */
+export function listPending(list, ok, failed) {
+  const landed = new Set(ok || []);
+  const failedEntries = new Set((failed || []).map((item) => item && item.entry));
+  return Array.from(list || []).filter((entry) => !landed.has(entry) && !failedEntries.has(entry));
+}
+
+/** 逐文件事件出口：缺省（undefined）时是一个彻底的空操作，sink 行为与现状完全一致。 */
+export function createFileEmitter(onFileEvent) {
+  if (typeof onFileEvent !== 'function') return () => {};
+  return function emitFile(event) {
+    try {
+      onFileEvent(event);
+    } catch {
+      /* 上报失败不该打断下载 */
+    }
+  };
+}
+
+/**
+ * 批次返回值上的 halted（契约 §2）。
+ * 既有测试用 deepEqual 断言「ok / failed / aborted 三字段」，而 deepEqual 只比较可枚举的自身属性：
+ * 于是 halted 以**不可枚举**属性挂上去 —— result.halted 照常可读，旧契约的等值断言一字不改。
+ */
+export function withHalted(result, halted) {
+  Object.defineProperty(result, 'halted', {
+    value: halted == null ? null : halted,
+    enumerable: false,
+    writable: true,
+    configurable: true
+  });
+  return result;
+}

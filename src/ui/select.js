@@ -517,6 +517,8 @@ export function openSelectDialog(entries, options) {
       syncFolders();
       renderTotals();
       renderDirRow();
+      // 选到目录 / 失去权限都会改 pickedHandle，档位文案必须同一帧跟着换。
+      renderMode();
     }
 
     function setPickBusy(busy) {
@@ -789,11 +791,26 @@ export function openSelectDialog(entries, options) {
 
     const MODE_TEXT = {
       fs: '落盘方式：保存到文件夹（Chromium）——可以选一个目录，文件按原目录结构直接写进去。代价：每次下载都要重新选一次文件夹，且只有 Chromium 系浏览器支持。',
+      zip: '落盘方式：按文件夹打包成 .zip（存到浏览器默认下载目录）——没有目录写入权限时自动退到这种方式，解压后还原原目录结构。代价：按顶层文件夹分包，单包上限约 200 MB。',
       download: '落盘方式：逐文件下载（进浏览器默认下载目录）——当前浏览器无法让网页选目录，文件名用目录前缀保留层级。代价：所有文件都进默认下载目录，建不了子目录，文件多时会连续弹下载。'
     };
 
+    /**
+     * 档位必须跟真实 sink 一致（src/index.js 的 sinkKind 是同一口径）：选到目录 → fs；
+     * 没选到目录时按 settings.fallbackSink 走 zip（缺省）/ download。
+     * fsaAvailable 只说浏览器「能」选目录，不代表这次真写盘（用户可能取消、也可能拿不到权限），
+     * 所以它不再参与档位判定。
+     */
+    function modeKind() {
+      if (pickedHandle) return 'fs';
+      return settings && settings.fallbackSink === 'files' ? 'download' : 'zip';
+    }
+
     function renderMode() {
-      modeEl.textContent = MODE_TEXT[fsaAvailable ? 'fs' : 'download'] + (preserveTree ? '' : '（已关闭「保留原始目录结构」）');
+      // zip 的包内路径同样受「保留原始目录结构」影响（src/sinks/zip.js:120 读开关、:129 不保留时整批一包、
+      // :262 把开关透传给 planBatch 生成 segments），所以三档一律带这个后缀。
+      const text = MODE_TEXT[modeKind()];
+      modeEl.textContent = text + (preserveTree ? '' : '（已关闭「保留原始目录结构」）');
       modeEl.title = modeEl.textContent;
     }
 

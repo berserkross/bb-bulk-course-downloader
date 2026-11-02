@@ -126,6 +126,67 @@ export function retryLine(retry, existing) {
   return text + '：' + retry.path;
 }
 
+/** 文件列表行数上限：超出只画前 500 行，剩下的用一行收口，绝不让 DOM 被上千行拖死。 */
+export const MAX_FILE_ROWS = 500;
+
+/** 五种状态文案是唯一允许进 DOM 的状态词；其它状态键一律落回「等待」。 */
+const FILE_STATUS_TEXT = {
+  waiting: '等待',
+  running: '下载中',
+  done: '完成',
+  failed: '失败',
+  skipped: '跳过'
+};
+
+/** 砍掉 query 与 hash：`?content_id=...&token=...` 这类签名参数绝不许进 DOM。 */
+function stripQuery(value) {
+  const raw = String(value == null ? '' : value);
+  const cut = raw.search(/[?#]/);
+  return cut === -1 ? raw : raw.slice(0, cut);
+}
+
+/** 文件名只留可读部分：先砍 query/hash，再走一次 URL 脱敏。 */
+function safeNameText(value) {
+  return redactUrlText(stripQuery(value));
+}
+
+/** 路径只留相对路径：绝对 URL 砍掉协议与主机，再砍 query/hash。 */
+function safePathText(value) {
+  const raw = String(value == null ? '' : value).replace(/^\s*[a-z][a-z0-9+.-]*:\/\/[^/?#]*/i, '');
+  return redactUrlText(stripQuery(raw));
+}
+
+function finiteNumber(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+/** 行身份只看 id / entryId：两者都没有的条目没法按 entryId 更新，直接不种行。 */
+function entryIdOf(entry) {
+  const raw = entry && entry.id != null ? entry.id : entry && entry.entryId;
+  if (raw == null || raw === '') return '';
+  return String(raw);
+}
+
+/** 种子行的初始状态：只认五种状态键，其余一律「等待」。 */
+function seedFileStatus(entry) {
+  const raw = entry && typeof entry.status === 'string' ? entry.status : '';
+  return Object.prototype.hasOwnProperty.call(FILE_STATUS_TEXT, raw) ? raw : 'waiting';
+}
+
+/** 相对路径：目录段 + 文件名；绝对 URL 只留 pathname。 */
+function entryPathText(entry) {
+  const e = entry || {};
+  const segments = Array.isArray(e.folderPath) ? e.folderPath : [];
+  if (segments.length) {
+    return segments
+      .map(function (part) {
+        return safePathText(part);
+      })
+      .join(' / ');
+  }
+  return safePathText(e.path || '');
+}
+
 function node(tag, className, text) {
   const el = document.createElement(tag);
   if (className) el.className = className;
@@ -232,6 +293,10 @@ function reusePanel(root, opts) {
     setMode: noop,
     setNotice: noop,
     setResume: noop,
+    setFiles: noop,
+    applyFileEvent: noop,
+    setHalted: noop,
+    clearHalted: noop,
     showSummary: noop,
     rebind: noop,
     fail(message) {
@@ -254,6 +319,8 @@ export function mountPanel(options) {
   let onSettingsChange = typeof opts.onSettingsChange === 'function' ? opts.onSettingsChange : null;
   let onRetryFailed = typeof opts.onRetryFailed === 'function' ? opts.onRetryFailed : null;
   let onResume = typeof opts.onResume === 'function' ? opts.onResume : null;
+  /** 停机横幅上海一个按钮的回调；缺省时不渲染那个按钮。 */
+  let onResumePending = typeof opts.onResumePending === 'function' ? opts.onResumePending : null;
 
   injectStyles();
 
@@ -268,6 +335,13 @@ export function mountPanel(options) {
   let retryState = { path: '', count: 0 };
   /** 失败清单的唯一真相源：重试只改它，再整块重绘。 */
   let summaryState = { ok: 0, failed: [], aborted: false };
+  /** 文件列表：fileOrder 决定行序，fileMap 存逐 entryId 的状态（重试计数也在这里，绝不跨行串台）。 */
+  let fileOrder = [];
+  let fileMap = new Map();
+  /** 停机横幅的当前文案；空串 = 没有停机。 */
+  let haltText = '';
+  /** 停机时没下载到的文件数（0 = 没停机）：顶部状态行与摘要头都靠它让位给「已暂停」。 */
+  let haltPendingCount = 0;
 
   const root = node('div', 'bbdl-panel');
   root.dataset.state = 'idle';
@@ -307,6 +381,22 @@ export function mountPanel(options) {
   const noticeEl = node('p', 'bbdl-notice');
   noticeEl.hidden = true;
 
+  // 停机横幅：文案固定，数字是未下载文件数；按钮只在调用方给了 onResumePending 时才存在。
+  const haltEl = node('div', 'bbdl-halt');
+  haltEl.setAttribute('role', 'alert');
+  haltEl.hidden = true;
+
+  // 可折叠「文件列表」：默认折叠（<details> 不带 open），行数上限 MAX_FILE_ROWS。
+  const filesEl = node('details', 'bbdl-files');
+  filesEl.hidden = true;
+  const filesSummaryEl = node('summary', 'bbdl-files__summary', '文件列表');
+  const filesBodyEl = node('div', 'bbdl-files__body');
+  const filesMoreEl = node('p', 'bbdl-files__more');
+  filesMoreEl.hidden = true;
+  filesEl.appendChild(filesSummaryEl);
+  filesEl.appendChild(filesBodyEl);
+  filesEl.appendChild(filesMoreEl);
+
   // 上次的目录是「继续上次」的唯一入口：只有 hydrate 拿到句柄才会显示。
   const resumeEl = node('div', 'bbdl-resume');
   resumeEl.hidden = true;
@@ -344,9 +434,11 @@ export function mountPanel(options) {
 
   body.appendChild(statusEl);
   body.appendChild(noticeEl);
+  body.appendChild(haltEl);
   body.appendChild(progressEl);
   body.appendChild(resumeEl);
   body.appendChild(actionsEl);
+  body.appendChild(filesEl);
   body.appendChild(settingsEl);
   body.appendChild(modeEl);
   body.appendChild(summaryEl);
@@ -394,6 +486,10 @@ export function mountPanel(options) {
 
     root.dataset.state = next;
     const view = viewFor(next, context);
+    // 停机收尾时 viewFor 给的是「已完成」，与正上方的停机横幅打脸：这里把状态行换成暂停口径。
+    if (next === 'done' && haltPendingCount > 0) {
+      view.status = '已暂停，未下载 ' + haltPendingCount + ' 个文件。重新登录后再点「刷新后继续」。';
+    }
 
     applyButton(scanBtn, view.scan);
     applyButton(downloadBtn, view.download);
@@ -478,6 +574,10 @@ export function mountPanel(options) {
         // 铁律：这一层不许 await —— 处理器必须同步把 ensureDirectoryPermission 发出去。
         if (onResume) onResume();
         break;
+      case 'resume-pending':
+        // 唯一调用点：一次点击只进一次这里，绝不另挂第二个监听器（否则会调两次）。
+        if (onResumePending) onResumePending();
+        break;
       case 'cancel':
         requestCancel();
         break;
@@ -488,6 +588,8 @@ export function mountPanel(options) {
 
   function setState(state, extra) {
     clearWatchdog();
+    // 新一轮开始（扫描 / 下载）：上一批的停机数字不许泄漏进来。
+    if (state === 'scanning' || state === 'downloading') haltPendingCount = 0;
     const nextContext = {};
     if (extra && typeof extra.count === 'number') nextContext.entryCount = extra.count;
     else if (extra && typeof extra.entryCount === 'number') nextContext.entryCount = extra.entryCount;
@@ -561,6 +663,7 @@ export function mountPanel(options) {
 
   const MODE_TEXT = {
     fs: '落盘方式：保存到文件夹（Chromium）——直接写入你选的目录，保留原目录结构。代价：每次下载都要重新选一次文件夹，且只有 Chromium 系浏览器支持。',
+    zip: '落盘方式：按文件夹打包成 .zip（存到浏览器默认下载目录）——没有目录写入权限时自动退到这种方式，解压后即可还原原目录结构。代价：按顶层文件夹分包，单包上限约 200 MB，且任何一次失败都要重下该包里的文件。',
     download:
       '落盘方式：逐文件下载（进浏览器默认下载目录）——网页拿不到目录写权限，文件名用 folder__ 前缀代替子目录。代价：所有文件都落在默认下载目录里，无法建子目录，文件多时会连续弹出多个下载。另外这里只能按下载清单跳过已下过的文件，无法核实磁盘文件。'
   };
@@ -642,24 +745,24 @@ export function mountPanel(options) {
     timers.push(timer);
   }
 
+  /**
+   * 摘要头这一行的唯一出口。停机时 pending 不是失败：不出现「失败」二字，
+   * 只有真的 failed 非空才追加「，失败 Y 个」；没停机就逐字走原来的句式。
+   */
+  function summaryHeadText(staged) {
+    const prefix = staged.aborted ? '已取消（部分完成）：' : '下载完成：';
+    if (haltPendingCount <= 0) return prefix + '成功 ' + staged.ok + ' 个，失败 ' + staged.failed.length + ' 个';
+    const head = (staged.aborted ? '已取消（部分完成）：' : '已暂停：') + '成功 ' + staged.ok + ' 个，未下载 ' + haltPendingCount + ' 个';
+    return staged.failed.length ? head + '，失败 ' + staged.failed.length + ' 个' : head;
+  }
+
   function renderSummary() {
     if (destroyed) return;
     summaryEl.textContent = '';
     summaryEl.hidden = false;
 
     const staged = summaryState;
-    summaryEl.appendChild(
-      node(
-        'p',
-        'bbdl-summary__head',
-        (staged.aborted ? '已取消（部分完成）：' : '下载完成：') +
-          '成功 ' +
-          staged.ok +
-          ' 个，失败 ' +
-          staged.failed.length +
-          ' 个'
-      )
-    );
+    summaryEl.appendChild(node('p', 'bbdl-summary__head', summaryHeadText(staged)));
 
     // 全部成功时清单整体消失，只剩这一行结论。
     if (!staged.failed.length) return;
@@ -764,6 +867,179 @@ export function mountPanel(options) {
     render('error', { message: message == null ? '未知错误' : String(message) });
   }
 
+  /** 画一行：名称 / 状态 / 字节 / 重试次数，路径单独一行灰字。 */
+  function makeFileRow(record) {
+    const row = node('div', 'bbdl-files__row');
+    row.dataset.entryId = safeNameText(record.id);
+    const els = {
+      row: row,
+      name: node('span', 'bbdl-files__name'),
+      status: node('span', 'bbdl-files__status'),
+      bytes: node('span', 'bbdl-files__bytes'),
+      retry: node('span', 'bbdl-files__retry'),
+      path: node('span', 'bbdl-files__path')
+    };
+    row.appendChild(els.name);
+    row.appendChild(els.status);
+    row.appendChild(els.bytes);
+    row.appendChild(els.retry);
+    row.appendChild(els.path);
+    return els;
+  }
+
+  /** 行内容只从 record 读：事件字段不直接进 DOM，URL query 因此没有入口。 */
+  function paintFileRow(record) {
+    const els = record.els;
+    if (!els) return;
+    const key = FILE_STATUS_TEXT[record.status] ? record.status : 'waiting';
+    els.name.textContent = record.name || '(未命名文件)';
+    els.name.title = record.name || '';
+    els.status.textContent = FILE_STATUS_TEXT[key];
+    els.status.className = 'bbdl-files__status bbdl-files__status--' + key;
+    els.bytes.textContent = record.bytes == null ? '—' : formatBytes(record.bytes);
+    // 重试次数 = 事件给的「第几次尝试」；只有真重试过（≥ 第 2 次）才显示数字。
+    els.retry.textContent = record.attempt >= 2 ? record.attempt + ' 次' : '—';
+    els.retry.title = record.attempt >= 2 ? '第 ' + record.attempt + ' 次尝试' : '未重试';
+    els.path.textContent = record.path || '';
+    els.path.title = record.path || '';
+    els.path.hidden = !record.path;
+    els.row.dataset.status = record.status;
+  }
+
+  /** 整块重画文件列表：只在 setFiles 时走这条路，事件走 paintFileRow 的原地更新。 */
+  function renderFiles() {
+    if (destroyed) return;
+    filesBodyEl.textContent = '';
+    const shown = Math.min(fileOrder.length, MAX_FILE_ROWS);
+    const frag = document.createDocumentFragment();
+    for (let i = 0; i < shown; i += 1) {
+      const record = fileMap.get(fileOrder[i]);
+      if (!record) continue;
+      record.els = makeFileRow(record);
+      paintFileRow(record);
+      frag.appendChild(record.els.row);
+    }
+    filesBodyEl.appendChild(frag);
+    // 超出行数上限的条目一个节点都不建，els 置空后事件只改状态、不碰 DOM。
+    for (let i = shown; i < fileOrder.length; i += 1) {
+      const extra = fileMap.get(fileOrder[i]);
+      if (extra) extra.els = null;
+    }
+    const rest = fileOrder.length - shown;
+    filesMoreEl.hidden = rest <= 0;
+    filesMoreEl.textContent = rest > 0 ? '其余 ' + rest + ' 个文件未展开' : '';
+    filesEl.hidden = fileOrder.length === 0;
+    filesSummaryEl.textContent = '文件列表（' + fileOrder.length + '）';
+  }
+
+  /** 种子行：只种数据不猜状态；同名 entryId 只留第一行。 */
+  function setFiles(entries) {
+    if (destroyed) return;
+    // 新一批种子行 = 新账本：上一批的停机数字作废。
+    haltPendingCount = 0;
+    const list = Array.isArray(entries) ? entries : [];
+    const nextOrder = [];
+    const nextMap = new Map();
+    for (const entry of list) {
+      const id = entryIdOf(entry);
+      if (!id || nextMap.has(id)) continue;
+      const size = finiteNumber(entry && entry.size);
+      nextMap.set(id, {
+        id: id,
+        name: safeNameText(entry && entry.name),
+        path: entryPathText(entry),
+        status: seedFileStatus(entry),
+        bytes: size != null && size >= 0 ? size : null,
+        attempt: 0,
+        els: null
+      });
+      nextOrder.push(id);
+    }
+    fileOrder = nextOrder;
+    fileMap = nextMap;
+    renderFiles();
+  }
+
+  function countPendingRows() {
+    let pending = 0;
+    for (const record of fileMap.values()) {
+      if (record.status === 'waiting' || record.status === 'running') pending += 1;
+    }
+    return pending;
+  }
+
+  function paintHalt() {
+    haltEl.textContent = '';
+    if (!haltText) {
+      haltEl.hidden = true;
+      return;
+    }
+    const textEl = node('span', 'bbdl-halt__text', haltText);
+    textEl.title = haltText;
+    haltEl.appendChild(textEl);
+    // 没有 onResumePending 就一个按钮都不渲染（不是禁用，是不存在）。
+    if (onResumePending) haltEl.appendChild(button('bbdl-btn bbdl-btn--small', 'resume-pending', '刷新后继续'));
+    haltEl.hidden = false;
+  }
+
+  /** 停机横幅：文案固定，只有「N 个未下载」随 pendingCount 变。 */
+  function setHalted(info) {
+    if (destroyed) return;
+    const i = info || {};
+    const given = finiteNumber(i.pendingCount);
+    const pending = given != null && given >= 0 ? Math.floor(given) : countPendingRows();
+    haltPendingCount = pending;
+    haltText = '登录已过期，已暂停。刷新页面重新登录后再继续（' + pending + ' 个未下载）。';
+    paintHalt();
+  }
+
+  function clearHalted() {
+    if (destroyed) return;
+    haltPendingCount = 0;
+    haltText = '';
+    haltEl.textContent = '';
+    haltEl.hidden = true;
+  }
+
+  /** 逐文件事件：只按 entryId 更新自己那一行，重试计数天然互不污染。 */
+  function applyFileEvent(event) {
+    if (destroyed) return;
+    const e = event || {};
+    const type = typeof e.type === 'string' ? e.type : '';
+    if (type === 'halt') {
+      // 停机后在飞的文件不会再继续：状态退回「等待」，横幅数字用事件给的 pending。
+      for (const record of fileMap.values()) {
+        if (record.status === 'running') {
+          record.status = 'waiting';
+          paintFileRow(record);
+        }
+      }
+      setHalted({ reason: e.reason, pendingCount: e.pending });
+      return;
+    }
+    if (type !== 'start' && type !== 'retry' && type !== 'done' && type !== 'failed') return;
+    const record = fileMap.get(e.entryId == null ? '' : String(e.entryId));
+    // setFiles 没种下这一行就忽略：绝不为陌生 entryId 凭空造行。
+    if (!record) return;
+    const attempt = finiteNumber(e.attempt);
+    if (type === 'retry') {
+      record.status = 'running';
+      record.attempt = attempt != null && attempt >= 1 ? Math.floor(attempt) : record.attempt + 1;
+    } else if (type === 'start') {
+      record.status = 'running';
+      if (attempt === 1) record.attempt = 1;
+      else if (attempt != null && attempt > 1) record.attempt = Math.floor(attempt);
+    } else if (type === 'done') {
+      record.status = 'done';
+      const bytes = finiteNumber(e.bytes);
+      if (bytes != null && bytes >= 0) record.bytes = bytes;
+    } else {
+      record.status = 'failed';
+    }
+    paintFileRow(record);
+  }
+
+
   /** 二次注入时把最新闭包接进同一份 DOM：面板继续工作，回调指向最新的调用方。 */
   function rebind(next) {
     const o = next || {};
@@ -778,6 +1054,8 @@ export function mountPanel(options) {
     if (typeof o.onSettingsChange === 'function') onSettingsChange = o.onSettingsChange;
     if (typeof o.onRetryFailed === 'function') onRetryFailed = o.onRetryFailed;
     if (typeof o.onResume === 'function') onResume = o.onResume;
+    if (typeof o.onResumePending === 'function') onResumePending = o.onResumePending;
+    if (haltText) paintHalt();
     if (!summaryEl.hidden) renderSummary();
   }
 
@@ -798,6 +1076,10 @@ export function mountPanel(options) {
     setMode: setMode,
     setNotice: setNotice,
     setResume: setResume,
+    setFiles: setFiles,
+    applyFileEvent: applyFileEvent,
+    setHalted: setHalted,
+    clearHalted: clearHalted,
     showSummary: showSummary,
     rebind: rebind,
     fail: fail,

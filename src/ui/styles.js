@@ -683,6 +683,118 @@ export const CSS = `
   color: #9aa4b2;
 }
 
+/* ---------- 停机横幅 ---------- */
+.bbdl-halt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid #6d3330;
+  border-radius: 8px;
+  background: #4a2523;
+  color: #ffb3ad;
+  font-size: 12px;
+}
+
+.bbdl-halt__text {
+  flex: 1 1 auto;
+  min-width: 0;
+  word-break: break-word;
+}
+
+/* ---------- 逐文件列表（可折叠） ---------- */
+.bbdl-files {
+  border-top: 1px solid var(--bbdl-line);
+  padding-top: 6px;
+  font-size: 12px;
+}
+
+.bbdl-files > .bbdl-files__summary {
+  cursor: pointer;
+  user-select: none;
+  color: var(--bbdl-muted);
+}
+
+/* 行高由内容决定：只限高度不裁行，滚动交给这一层。 */
+.bbdl-files__body {
+  margin-top: 4px;
+  max-height: 220px;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.bbdl-files__row {
+  display: grid;
+  /* 名称吃掉剩余宽度，状态/字节/重试靠右定宽 —— 长文件名永远走省略号，不挤走数字列。 */
+  grid-template-columns: minmax(0, 1fr) 46px 56px 40px;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 4px;
+  border-top: 1px solid rgba(255, 255, 255, 0.04);
+  line-height: 1.45;
+}
+
+.bbdl-files__row:first-child {
+  border-top: 0;
+}
+
+.bbdl-files__name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  line-height: 1.45;
+}
+
+.bbdl-files__status {
+  font-size: 11.5px;
+  white-space: nowrap;
+  color: var(--bbdl-muted);
+  text-align: right;
+}
+
+.bbdl-files__status--running {
+  color: var(--bbdl-accent);
+}
+
+.bbdl-files__status--done {
+  color: var(--bbdl-ok);
+}
+
+.bbdl-files__status--failed {
+  color: var(--bbdl-danger);
+}
+
+.bbdl-files__status--skipped {
+  color: #7d868f;
+}
+
+.bbdl-files__bytes,
+.bbdl-files__retry {
+  color: var(--bbdl-muted);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  text-align: right;
+}
+
+/* 路径另起一行、灰字：绝不换行撑高，超长靠省略号 + title 兜底。 */
+.bbdl-files__path {
+  grid-column: 1 / -1;
+  color: #7d868f;
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.bbdl-files__more {
+  margin: 2px 0 0;
+  color: var(--bbdl-muted);
+  font-size: 11.5px;
+}
+
 @media (prefers-color-scheme: light) {
   .bbdl-panel,
   .bbdl-overlay {
