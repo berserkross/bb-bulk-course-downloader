@@ -4,22 +4,29 @@ import assert from 'node:assert/strict';
 import { planSkips } from '../../src/store/manifest-plan.js';
 import { updateRecords, recordFromPlan } from '../../src/store/manifest.js';
 
-/** 造一个 planBatch 形状的计划：落盘相对路径 = segments.concat(fileName).join('/')。 */
-function plan(id, segments, fileName, size) {
+/**
+ * 造一个 planBatch 形状的计划：落盘相对路径 = segments.concat(fileName).join('/')。
+ * href 缺省不写字段 —— 用来模拟「本次扫描拿不到版本指纹」的条目。
+ */
+function plan(id, segments, fileName, size, href) {
   const entry = { id, name: fileName, folderPath: segments };
   if (size !== undefined) entry.size = size;
+  if (href !== undefined) entry.href = href;
   return { entry, segments, fileName };
 }
 
-function record(id, path, size, status) {
-  return { id, path, name: path.split('/').pop(), size, status, updatedAt: 1 };
+/** href 缺省不写字段 —— 用来模拟 v1 旧记录（契约 §5：没有 href → 不得当作「未变」）。 */
+function record(id, path, size, status, href) {
+  const rec = { id, path, name: path.split('/').pop(), size, status, updatedAt: 1 };
+  if (href !== undefined) rec.href = href;
+  return rec;
 }
 
 function snapshot(value) {
   return JSON.stringify(value);
 }
 
-const EMPTY_DIFF = { added: 0, changed: 0, unchanged: 0, stale: 0, total: 0 };
+const EMPTY_DIFF = { added: 0, changed: 0, moved: 0, unchanged: 0, stale: 0, unknown: 0, total: 0 };
 
 // ---------------------------------------------------------------- 跳过判定 1) ~ 5)
 
@@ -53,14 +60,29 @@ test('3) 磁盘有该路径但大小不等 → 进 todo（防：上游更新过�
   assert.equal(result.todo[0], plans[0]);
 });
 
-test('4) 磁盘上没有、但清单同路径且 status=done → skip/manifest（防：不支持 FSA 的浏览器上跳过功能整体失效）', () => {
-  const plans = [plan('a', ['Week 3'], 'slides.pdf')];
-  const manifest = { courseId: 'c', version: 1, updatedAt: 1, files: { a: record('a', 'Week 3/slides.pdf', 100, 'done') } };
+test('4) 磁盘上没有、但清单同路径且 status=done 且 href 相等 → skip/manifest-unchanged（防：不支持 FSA 的浏览器上跳过功能整体失效）', () => {
+  const plans = [plan('a', ['Week 3'], 'slides.pdf', 100, '/rid/1/xid-1')];
+  const manifest = {
+    courseId: 'c',
+    version: 2,
+    updatedAt: 1,
+    files: { a: record('a', 'Week 3/slides.pdf', 100, 'done', '/rid/1/xid-1') }
+  };
   const result = planSkips({ plans, manifest, existingPaths: new Map() });
   assert.equal(result.todo.length, 0);
   assert.equal(result.skip.length, 1);
-  assert.equal(result.skip[0].reason, 'manifest');
+  assert.equal(result.skip[0].reason, 'manifest-unchanged');
   assert.equal(result.skip[0].size, 100);
+});
+
+test('4b) 无 FSA 浏览器上的 v1 记录（没有 href 可比）不再弱证据跳过，而是重下一次自愈（防：上游改过但字节数没变的课件被永久静默跳过）', () => {
+  const plans = [plan('a', ['Week 3'], 'slides.pdf', 100, '/rid/1/xid-1')];
+  const manifest = { courseId: 'c', version: 1, updatedAt: 1, files: { a: record('a', 'Week 3/slides.pdf', 100, 'done') } };
+  const result = planSkips({ plans, manifest, existingPaths: new Map() });
+  assert.equal(result.skip.length, 0, 'v1 记录不许再产生 manifest 弱证据跳过');
+  assert.equal(result.todo.length, 1);
+  assert.equal(result.diff.unknown, 1);
+  assert.equal(result.diff.unchanged, 0);
 });
 
 test('5) 清单里没有、磁盘上也没有 → 进 todo（防：新文件被误跳过，最后什么都没下）', () => {
@@ -165,24 +187,25 @@ test('stale 只报告「清单里有、本次扫描没有」的条目，且带 i
 test('diff 计数：added/changed/unchanged/stale/total 各自口径（防：摘要说「全部完成」，其实少下了文件）', () => {
   const plans = [
     plan('fresh', [], 'new.pdf'), // 清单里没有 → added
-    plan('same', [], 'same.pdf', 100), // done 且大小一致 → unchanged
-    plan('moved', [], 'moved.pdf', 300) // done 但大小变了 → changed
+    plan('same', [], 'same.pdf', 100, '/rid/2/xid-2'), // done、href 与 path 都相等 → unchanged
+    plan('moved', [], 'moved.pdf', 300, '/rid/3/xid-3') // 版本指纹变了 → changed
   ];
   const manifest = {
     courseId: 'c',
-    version: 1,
+    version: 2,
     updatedAt: 1,
     files: {
-      same: record('same', 'same.pdf', 100, 'done'),
-      moved: record('moved', 'moved.pdf', 200, 'done'),
-      gone: record('gone', 'gone.pdf', 10, 'done')
+      same: record('same', 'same.pdf', 100, 'done', '/rid/2/xid-2'),
+      moved: record('moved', 'moved.pdf', 200, 'done', '/rid/3/xid-1'),
+      gone: record('gone', 'gone.pdf', 10, 'done', '/rid/9/xid-9')
     }
   };
   const result = planSkips({ plans, manifest, existingPaths: new Map() });
-  assert.deepEqual(result.diff, { added: 1, changed: 1, unchanged: 1, stale: 1, total: 3 });
+  assert.deepEqual(result.diff, { added: 1, changed: 1, moved: 0, unchanged: 1, stale: 1, unknown: 0, total: 3 });
 });
 
 test('diff 三个桶必须是本次计划的完整划分：added + changed + unchanged === total（防：某个文件两头不算，N 个数对不上）', () => {
+  // 契约 §7 之后口径扩成五桶（moved / unknown），这条用例的意图不变：不允许有文件两头都不算。
   const plans = [plan('a', [], 'a.pdf'), plan('b', [], 'b.pdf', 5), plan('c', ['X'], 'c.pdf', 6)];
   const manifest = {
     courseId: 'c',
@@ -191,7 +214,7 @@ test('diff 三个桶必须是本次计划的完整划分：added + changed + unc
     files: { b: record('b', 'b.pdf', 5, 'done'), c: record('c', 'X/c.pdf', 9, 'partial') }
   };
   const { diff } = planSkips({ plans, manifest, existingPaths: new Map([['b.pdf', 5]]) });
-  assert.equal(diff.added + diff.changed + diff.unchanged, diff.total);
+  assert.equal(diff.added + diff.changed + diff.moved + diff.unchanged + diff.unknown, diff.total);
   assert.equal(diff.total, 3);
 });
 
@@ -239,7 +262,8 @@ test('updateRecords 按 id 合并并补上 plan 的 path/name（防：进度回�
   assert.equal(next.files.a.status, 'done');
   assert.equal(next.files.a.updatedAt, 900);
   assert.equal(next.updatedAt, 900);
-  assert.equal(next.version, 1);
+  // 契约 §5：写回统一 version 2（读到 v1 也升级），v1 记录本体保留。
+  assert.equal(next.version, 2);
 });
 
 test('大小未知时写 null，绝不写 0（防：用 0 表达未知，「同名同大小」判定会把空文件当成所有文件）', () => {

@@ -8,13 +8,52 @@ import {
   toFailure,
   isAbort
 } from './shared.js';
+import { createIdleReader, withFileRetry, TruncatedError, DEFAULT_IDLE_MS } from './guard.js';
+
+/** settings 由接线层注入；读不到就落回契约默认值（fileRetries=1 表示首次失败后额外重试 1 次）。 */
+function pickIdleMs(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : DEFAULT_IDLE_MS;
+}
+
+function pickFileRetries(value) {
+  if (value == null) return 1;
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 1;
+}
+
+/** sizeOf 的返回值只有「有限正数」才算已知体积；undefined / 0 / NaN 一律当未知，绝不用 0 去比。 */
+function makeSizeLookup(sizeOf) {
+  if (typeof sizeOf !== 'function') return () => undefined;
+  return (entry) => {
+    try {
+      const value = Number(sizeOf(entry));
+      return Number.isFinite(value) && value > 0 ? value : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+}
+
+/**
+ * 只有 content-encoding 为空或 identity 时才允许做「字节数是否等于体积」的校验。
+ * 原因：gzip/br 响应里的 Content-Length（以及 Range 探测到的体积）是压缩后的长度，
+ * 而传输层已经解压过，我们 write 进磁盘的是解压后的字节 —— 两者天然不等。
+ * 拿压缩后的长度去比解压后的字节，会把每一份正常文件都误判成截断，所以必须跳过。
+ */
+function isIdentityEncoding(response) {
+  const headers = response && response.headers;
+  const raw = headers && typeof headers.get === 'function' ? headers.get('content-encoding') : '';
+  const encoding = String(raw == null ? '' : raw).trim().toLowerCase();
+  return encoding === '' || encoding === 'identity';
+}
 
 /**
  * FSA 落盘 sink —— 本项目的性能命门。
  * 铁律：Response 的主体流式读取，读完一块立刻 write 一块。
  * 绝不出现 await response.blob() / arrayBuffer()，否则 300MB 的录屏课件会先整个进内存。
  */
-export function createFsSink({ settings = {}, dirHandle, signal, total = 0, files } = {}) {
+export function createFsSink({ settings = {}, dirHandle, signal, total = 0, files, sizeOf } = {}) {
   if (!dirHandle) throw new Error('createFsSink 需要 dirHandle');
   if (!files || typeof files.buildEntryPath !== 'function' || typeof files.sanitizeSegment !== 'function') {
     throw new Error('createFsSink 需要 files 依赖（buildEntryPath / sanitizeSegment）');
@@ -22,6 +61,9 @@ export function createFsSink({ settings = {}, dirHandle, signal, total = 0, file
 
   const concurrency = Math.max(1, Math.floor(settings.downloadConcurrency) || 1);
   const preserveTree = settings.preserveTree !== false;
+  const idleMs = pickIdleMs(settings.idleTimeoutMs);
+  const fileRetries = pickFileRetries(settings.fileRetries);
+  const lookupSize = makeSizeLookup(sizeOf);
   const dirCache = new Map();
 
   function dirFor(segments) {
@@ -40,7 +82,11 @@ export function createFsSink({ settings = {}, dirHandle, signal, total = 0, file
     return dir;
   }
 
-  async function writeEntry(fetcher, entry, plan, onChunk) {
+  /**
+   * 一次完整的落盘尝试：建 writable → 读流 → 完整性校验 → close。
+   * 任何一步失败都会 cancel reader + abort writable，半截文件绝不留在磁盘上被当成成功。
+   */
+  async function writeAttempt(fetcher, entry, plan, onChunk) {
     const response = await fetcher.fetchOk(entry.url, { signal });
     const body = response && response.body;
     if (!body || typeof body.getReader !== 'function') {
@@ -49,19 +95,27 @@ export function createFsSink({ settings = {}, dirHandle, signal, total = 0, file
 
     const dir = await dirFor(plan.segments);
     const fileHandle = await dir.getFileHandle(plan.fileName, { create: true });
+    // 重试必须重新 createWritable：不能接着上一次的半截文件往下写
     const writable = await fileHandle.createWritable();
-    const reader = body.getReader();
+    const reader = createIdleReader(body.getReader(), { idleMs });
     let written = 0;
 
     try {
       for (;;) {
-        const { done, value } = await reader.read();
+        const { done, value } = await reader.read(); // 停滞超过 idleMs 会 reject StallError
         if (done) break;
         if (!value || !value.byteLength) continue;
         await writable.write(value); // 边下边写：内存里只有这一个 chunk
         written += value.byteLength;
         onChunk(written, value.byteLength);
       }
+
+      // 连接被掐断时浏览器常常「干净地」结束流 —— 只有拿期望体积比一次才看得出是半截文件
+      const expected = lookupSize(entry);
+      if (expected !== undefined && isIdentityEncoding(response) && written !== expected) {
+        throw new TruncatedError(expected, written);
+      }
+
       await writable.close();
     } catch (err) {
       try {
@@ -78,6 +132,32 @@ export function createFsSink({ settings = {}, dirHandle, signal, total = 0, file
     }
 
     return written;
+  }
+
+  /**
+   * 整份文件级的重试：停滞/截断/网络层错误各给一次机会，重试前重新建 writable。
+   * attemptBytes 是「本次尝试已经计入 tracker 的字节数」：被 abort 的那一份没有落地，
+   * 重试前必须按它回退，否则 bytesDone 会大于真实落盘量（一个文件重试成功却显示 32/28）。
+   */
+  function writeEntry(fetcher, entry, plan, onChunk, { onRetry, rollback } = {}) {
+    let attemptBytes = 0;
+    return withFileRetry(
+      () => {
+        attemptBytes = 0;
+        return writeAttempt(fetcher, entry, plan, (written, delta) => {
+          attemptBytes += delta;
+          onChunk(written, delta);
+        });
+      },
+      {
+        attempts: 1 + fileRetries,
+        onRetry: (info) => {
+          if (typeof rollback === 'function') rollback(attemptBytes);
+          attemptBytes = 0;
+          if (typeof onRetry === 'function') onRetry(info);
+        }
+      }
+    );
   }
 
   async function download(entries, fetcher, { onProgress } = {}) {
@@ -109,10 +189,21 @@ export function createFsSink({ settings = {}, dirHandle, signal, total = 0, file
         const entryId = entry && entry.id != null ? String(entry.id) : '';
         emit('file-start', label, entryId, true);
         try {
-          await writeEntry(fetcher, entry, plan, (_written, delta) => {
-            progress.addBytes(delta); // 写完这一块才有资格计入 bytesDone
-            emit('progress', label, entryId, false);
-          });
+          await writeEntry(
+            fetcher,
+            entry,
+            plan,
+            (_written, delta) => {
+              progress.addBytes(delta); // 写完这一块才有资格计入 bytesDone
+              emit('progress', label, entryId, false);
+            },
+            {
+              // 重试会把上一次 abort 掉的字节扣回去，bytesDone 才等于最终落盘量
+              rollback: (n) => progress.rollbackBytes(n),
+              // 只报状态，不改旧字段：'file-retry' 是新增字符串，UI 认识就显示、不认识就忽略
+              onRetry: () => emit('file-retry', label, entryId, true)
+            }
+          );
           ok.push(entry);
           progress.endFile(false);
           emit('file-done', label, entryId, true);

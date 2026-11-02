@@ -275,6 +275,11 @@ export const CSS = `
   word-break: break-word;
 }
 
+.bbdl-failed__hint {
+  color: var(--bbdl-accent);
+  font-size: 11.5px;
+}
+
 .bbdl-copybox {
   width: 100%;
   resize: vertical;

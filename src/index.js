@@ -21,6 +21,12 @@ const FILE_FAILED = 'file-failed';
 /** 清单落库节流：500ms 内的多条记录合并成一次写库，避免每个文件一次事务。 */
 const MANIFEST_FLUSH_MS = 500;
 
+/** 无 FSA 的体积闸值：超过就提醒「只能逐个交给浏览器」。只按「全部已知」判断，绝不拿未知凑合计。 */
+const NO_FSA_HINT_BYTES = 500 * 1024 * 1024;
+
+/** 落盘层参数只补默认值（不新增 UI 控件）：用户在面板里能看到的两项不在此列。 */
+const SINK_DEFAULTS = { idleTimeoutMs: 30000, fileRetries: 1, serializeOverBytes: 48 * 1024 * 1024 };
+
 const PERMISSION_TEXT = {
   prompt: '浏览器还需要你再确认一次目录权限',
   denied: '浏览器拒绝了目录权限',
@@ -63,6 +69,15 @@ function emptySummary() {
   };
 }
 
+/** 只补缺失/非有限数字的键：用户既有设置（含面板可改的）一个都不覆盖。 */
+function applySinkDefaults(target) {
+  for (const key of Object.keys(SINK_DEFAULTS)) {
+    const value = target[key];
+    if (typeof value !== 'number' || !Number.isFinite(value)) target[key] = SINK_DEFAULTS[key];
+  }
+  return target;
+}
+
 /**
  * 全部依赖从参数进来，模块默认值由文件末尾的默认接线提供。
  *
@@ -75,7 +90,7 @@ export function createController(config) {
   const loc = cfg.location || (typeof location === 'undefined' ? null : location);
   const doc = cfg.document || (typeof document === 'undefined' ? null : document);
   const store = cfg.store || null;
-  const settings = cfg.settings || {};
+  const settings = applySinkDefaults(cfg.settings || {});
   const deps = cfg.deps || {};
 
   const createFetcher = typeof deps.createFetcher === 'function' ? deps.createFetcher : defaultCreateFetcher;
@@ -108,9 +123,22 @@ export function createController(config) {
     skipResult: null,
     skipSummary: null,
     skipDirHandle: null,
+    /** 摘要算的时候用的是哪种目录结构：它一变，summary 就不能再用。 */
+    skipPreserveTree: null,
     diskChecked: false,
     diskTruncated: false,
+    /** 目录枚举缓存：同一个句柄只扫一次盘，摘要与最终交给 sink 的判断共用这一份。 */
+    existingPaths: null,
+    existingHandle: null,
+    existingHas: false,
+    existingChecked: false,
+    existingTruncated: false,
+    /** 对话框里选定的目录；关掉对话框后由 startDownload 清掉。 */
+    pickHandle: null,
+    pickAbort: null,
     pendingRecords: [],
+    /** 「获取体积」的结果：对话框只拿它刷行，落盘层的体积索引必须自己留一份。 */
+    probedSizes: new Map(),
     flushTimer: 0,
     batchPlans: []
   };
@@ -160,6 +188,24 @@ export function createController(config) {
   }
 
   /**
+   * 记住这次选定的目录：面板立刻变成「可续接」，句柄异步落 IndexedDB。
+   * - 只吞掉写失败：记不住最多下次重选，绝不能拦住下载（fire-and-forget，不占同步栈）。
+   * - 权限没拿到（denied / prompt / unsupported）时既不清也不写：Chrome 的授权是会话级的，
+   *   句柄本身仍然有效，下一次「继续上次」正是重新授权的入口，clear 掉才是真的把路堵死。
+   */
+  function rememberHandle(handle) {
+    if (!handle) return;
+    state.savedHandle = handle;
+    try {
+      panel.setResume({ dirName: handle.name || '上次的目录', granted: true });
+    } catch (err) {
+      /* 面板不在也不影响「这次选过哪个目录」这件事 */
+    }
+    if (!store || typeof store.saveHandle !== 'function') return;
+    void safeCall(() => store.saveHandle(courseId, handle));
+  }
+
+  /**
    * 分母由 UI 提供：sink 报 bytesTotal === 0（总量未知）时，只有当对话框里
    * 每个已选文件体积都探测过，才拿它们的和补上，其余情况一概保持未知。
    */
@@ -193,21 +239,43 @@ export function createController(config) {
 
   /* ---------------- 跳过集合 ---------------- */
 
-  async function readExistingPaths(dirHandle, signal) {
+  /**
+   * 目录枚举带缓存：同一个句柄只扫一次盘（对话框里判一次、下载前判一次是同一份结果）。
+   * 取消中的结果一律不写回 —— 把「没比对成」记成「磁盘上一个都没有」会让用户白下整批。
+   */
+  async function existingSnapshot(dirHandle, signal, force) {
     const empty = { paths: new Map(), checked: false, truncated: false };
-    if (!dirHandle || typeof listExistingFiles !== 'function') return empty;
-    const status = await ensurePermissionStatus(dirHandle, false);
-    if (status !== 'granted') return empty;
+    const handle = dirHandle || null;
+    if (!force && state.existingHas && state.existingHandle === handle) {
+      return { paths: state.existingPaths, checked: state.existingChecked, truncated: state.existingTruncated };
+    }
+    const remember = function (paths, checked, truncated) {
+      state.existingPaths = paths;
+      state.existingHandle = handle;
+      state.existingHas = true;
+      state.existingChecked = checked;
+      state.existingTruncated = truncated;
+    };
+
+    if (!handle || typeof listExistingFiles !== 'function') {
+      if (!(signal && signal.aborted)) remember(empty.paths, false, false);
+      return empty;
+    }
+    const status = await ensurePermissionStatus(handle, false);
+    if (status !== 'granted' || (signal && signal.aborted)) return empty;
     try {
-      const found = await listExistingFiles(dirHandle, { signal: signal });
-      if (!(found instanceof Map)) return empty;
-      return { paths: found, checked: true, truncated: !!found.truncated };
+      const found = await listExistingFiles(handle, { signal: signal });
+      if (!(found instanceof Map) || (signal && signal.aborted)) return empty;
+      const truncated = !!found.truncated;
+      remember(found, true, truncated);
+      return { paths: found, checked: true, truncated: truncated };
     } catch (err) {
       return empty;
     }
   }
 
-  async function computeSkips(dirHandle, signal) {
+  async function computeSkips(dirHandle, signal, options) {
+    const opts = options || {};
     const plans = buildPlans(state.entries);
     state.plans = plans;
 
@@ -217,12 +285,15 @@ export function createController(config) {
       if (manifest) state.manifest = manifest;
     }
 
-    const existing = await readExistingPaths(dirHandle, signal);
+    const existing = await existingSnapshot(dirHandle, signal, opts.force === true);
+    // 取消 / 换目录之后的比对：一个字段都不写。调用方拿到 null 就知道「这份摘要不成立」。
+    if (signal && signal.aborted) return null;
     state.diskChecked = existing.checked;
     state.diskTruncated = existing.truncated;
     state.skipDirHandle = dirHandle || null;
 
     const preserveTree = settings.preserveTree !== false;
+    state.skipPreserveTree = preserveTree;
     const result = planSkips
       ? planSkips({ plans: plans, manifest: manifest || null, existingPaths: existing.paths, preserveTree: preserveTree })
       : { todo: plans, skip: [], stale: [], diff: { added: plans.length, changed: 0, unchanged: 0, stale: 0, total: plans.length } };
@@ -275,10 +346,14 @@ export function createController(config) {
 
     const dirHandle = choice.dirHandle || null;
     let result = state.skipResult;
-    // 扫描时用的是「上次的目录」；用户在对话框里换了目录就必须按新目录重算，否则会多下或漏下。
-    if (!result || state.skipDirHandle !== (dirHandle || null)) {
+    // 扫描时用的是「上次的目录」；用户在对话框里换了目录（或改了目录结构）就必须重算，
+    // 否则会多下或漏下。句柄没变时 computeSkips 命中快照缓存，不会重复扫盘。
+    const preserveTree = settings.preserveTree !== false;
+    if (!result || state.skipDirHandle !== (dirHandle || null) || state.skipPreserveTree !== preserveTree) {
       result = await computeSkips(dirHandle, signal);
     }
+    // 比对被取消：按用户选中放行，且绝不假装「一个都不存在」。
+    if (!result) return chosen;
 
     const todoIds = new Set();
     const todo = Array.isArray(result.todo) ? result.todo : [];
@@ -286,6 +361,91 @@ export function createController(config) {
       if (plan && plan.entry && plan.entry.id) todoIds.add(plan.entry.id);
     }
     return chosen.filter((entry) => todoIds.has(entry.id));
+  }
+
+  /* ---------------- 对话框里选目录 ---------------- */
+
+  function abortPick() {
+    const controller = state.pickAbort;
+    state.pickAbort = null;
+    if (!controller) return;
+    try {
+      controller.abort();
+    } catch (err) {
+      // 取消只是「别再扫了」，失败没有后果
+    }
+  }
+
+  async function afterPick(handle, permission, signal, report) {
+    const name = (handle && handle.name) || '所选目录';
+    report.setHint('正在比对磁盘…');
+
+    let status = 'unsupported';
+    if (permission) status = (await permission) || 'unsupported';
+    else status = await ensurePermissionStatus(handle, false);
+    if (signal.aborted) return { cancelled: true };
+
+    if (status !== 'granted') {
+      // 拿不到写入权限：先退回「只按清单跳过」的口径，让摘要与最终交给 sink 的判断一致。
+      state.pickHandle = null;
+      const fallback = await computeSkips(null, signal, { force: true });
+      if (signal.aborted || !fallback) return { cancelled: true };
+      return { status: status, dirHandle: null, name: name, skipInfo: state.skipSummary };
+    }
+
+    state.pickHandle = handle;
+    const result = await computeSkips(handle, signal, { force: true });
+    if (signal.aborted || !result) return { cancelled: true };
+    // 授权拿到手才算「这个目录真的能用」：到这里才记住它，「继续上次」下次才有入口。
+    rememberHandle(handle);
+    return { status: 'granted', dirHandle: handle, name: name, skipInfo: state.skipSummary };
+  }
+
+  /**
+   * 对话框「选择保存位置…」的全部流程。
+   * 铁律：pickDirectory 与 ensureDirectoryPermission({ request: true }) 都必须留在用户点击的
+   * 同一个同步栈里 —— 函数体在第一个 await 之前就把这两件事发出去了。
+   */
+  function pickDirectoryForDialog(api) {
+    const report = api && typeof api.setHint === 'function' ? api : { setHint: function () {} };
+    abortPick();
+    const controller = new AbortController();
+    state.pickAbort = controller;
+    const signal = controller.signal;
+
+    let picked;
+    try {
+      // 这一行直接跑在 click 事件处理里，前面不许有 await
+      picked = pickDirectory({ signal: signal });
+    } catch (err) {
+      state.pickAbort = null;
+      return Promise.resolve({ failed: describe(err) });
+    }
+
+    // 续接上次目录时给的是现成句柄（不是 Promise）：权限请求同样留在这一栈里发出去。
+    if (picked && typeof picked.then !== 'function') {
+      return afterPick(picked, ensurePermissionStatus(picked, true), signal, report);
+    }
+
+    return Promise.resolve(picked).then(
+      function (handle) {
+        if (!handle) return { cancelled: true };
+        return afterPick(handle, null, signal, report);
+      },
+      function (err) {
+        // 用户在系统选择器里按了取消、或浏览器拒绝：都不算失败。
+        if (err && (err.name === 'AbortError' || err.name === 'NotAllowedError')) return { cancelled: true };
+        return { failed: describe(err) };
+      }
+    );
+  }
+
+  /** 对话框里改了「保留原始目录结构」：路径全变，摘要要重算；同一句柄走快照缓存，不重扫盘。 */
+  async function refreshDialogSkips() {
+    const handle = state.pickHandle || state.dirHandle || state.resumeHandle || null;
+    const signal = state.pickAbort ? state.pickAbort.signal : null;
+    const result = await computeSkips(handle, signal, { force: false });
+    return result ? state.skipSummary : null;
   }
 
   /* ---------------- 扫描 ---------------- */
@@ -337,7 +497,13 @@ export function createController(config) {
         const entry = queue.shift();
         if (!entry) return;
         const size = await fetcher.probeSize(entry.url);
-        if (typeof size === 'number') api.setRowSize(entry.id, size);
+        if (typeof size === 'number') {
+          // 探测结果先落进控制器自己的索引：对话框关闭后它才是落盘层的体积来源。
+          if (isKnownSize(size) && entry.id !== null && entry.id !== undefined && entry.id !== '') {
+            state.probedSizes.set(String(entry.id), size);
+          }
+          api.setRowSize(entry.id, size);
+        }
       }
     }
 
@@ -349,6 +515,9 @@ export function createController(config) {
 
   async function startDownload() {
     if (state.busy || !state.entries.length) return null;
+    // 上一轮对话框里选过的目录不能带进来：这次以用户新选的为准。
+    state.pickHandle = null;
+    abortPick();
 
     let summary = state.skipSummary;
     if (!summary) summary = await refreshSkips(null, null);
@@ -362,6 +531,10 @@ export function createController(config) {
         pickDirectory: state.resumeHandle ? function () { return state.resumeHandle; } : pickDirectory,
         skipInfo: summary,
         onProbeSizes: probeSizes,
+        // 选目录走回调：对话框只负责把点击原样转过来，用户手势不能跨 await。
+        onPickDirectory: pickDirectoryForDialog,
+        onRefreshSkips: refreshDialogSkips,
+        onClose: abortPick,
         onSettingsChange(patch) {
           Object.assign(settings, saveSettings(patch));
         }
@@ -377,6 +550,16 @@ export function createController(config) {
     state.expectedBytes = typeof choice.expectedBytes === 'number' ? choice.expectedBytes : 0;
     panel.setMode(dirHandle ? 'fs' : 'download');
     panel.setNotice('');
+    // 没有目录句柄时浏览器给每个文件单独弹一次下载：体积大就先把话说清楚，别让用户以为是卡住了。
+    // 体积未知（含有一个未知）一律不提示 —— 猜出来的合计比不说更糟。
+    if (!dirHandle) {
+      const pickedBytes = selectedBytes(choice.entries);
+      if (typeof pickedBytes === 'number' && pickedBytes > NO_FSA_HINT_BYTES) {
+        panel.setNotice(
+          '这批文件合计超过 500 MB：没有文件夹写入权限时会逐个交给浏览器下载（会连续弹窗），建议改用 Chrome/Edge 获得流式落盘。'
+        );
+      }
+    }
 
     const signal = begin();
     try {
@@ -401,7 +584,7 @@ export function createController(config) {
   }
 
   async function runDownload(entries, dirHandle, signal) {
-    const sink = await createSink({ settings, dirHandle, signal, total: entries.length });
+    const sink = await createSink({ settings, dirHandle, signal, total: entries.length, sizeOf: sizeOf });
     const fetcher = createFetcher({ signal });
     return sink.download(entries, fetcher, { onProgress });
   }
@@ -423,9 +606,47 @@ export function createController(config) {
     }
   }
 
+  /* ---------------- 体积索引 ---------------- */
+
+  /** 体积只认「有限正数」：0 与负数都不算已知（0 会被下游当成「空文件」）。 */
+  function isKnownSize(value) {
+    return typeof value === 'number' && Number.isFinite(value) && value > 0;
+  }
+
+  /**
+   * 落盘层要的体积：先看对话框「获取体积」（Range: bytes=0-0）的结果，再看清单里
+   * 上一次写回的 record.size。entry.id 可能缺失（无清单时），此时无法索引 → undefined。
+   */
+  function sizeOf(entry) {
+    const id = entry && entry.id !== null && entry.id !== undefined ? String(entry.id) : '';
+    if (!id) return undefined;
+
+    const probed = state.probedSizes.get(id);
+    if (isKnownSize(probed)) return probed;
+
+    const files = state.manifest && typeof state.manifest.files === 'object' ? state.manifest.files : null;
+    const record = files && Object.prototype.hasOwnProperty.call(files, id) ? files[id] : null;
+    const size = record ? record.size : null;
+    return isKnownSize(size) ? size : undefined;
+  }
+
+  /** 选中项体积合计：只要有一个未知就整批返回 null，绝不拿已知部分冒充「总计」。 */
+  function selectedBytes(entries) {
+    const list = Array.isArray(entries) ? entries : [];
+    if (!list.length) return null;
+    let sum = 0;
+    for (const entry of list) {
+      const size = sizeOf(entry);
+      if (typeof size !== 'number') return null;
+      sum += size;
+    }
+    return sum;
+  }
+
   /* ---------------- 清单写回 ---------------- */
 
-  function sizeOf(id) {
+  /** 清单写回用的体积：来自本条扫描结果里的 entry.size（旧口径，保持不变）。 */
+  function recordSizeOf(id) {
     const entry = state.entryById.get(id);
     const size = entry && typeof entry.size === 'number' && Number.isFinite(entry.size) && entry.size >= 0 ? entry.size : null;
     // 契约：体积未知写 null，绝不写 0（0 会让 planSkips 误判成「磁盘上是空文件」）。
@@ -435,7 +656,7 @@ export function createController(config) {
   function noteRecord(p) {
     const id = p.entryId ? String(p.entryId) : '';
     if (!id) return;
-    state.pendingRecords.push({ id: id, status: p.state === FILE_DONE ? 'done' : 'failed', size: sizeOf(id) });
+    state.pendingRecords.push({ id: id, status: p.state === FILE_DONE ? 'done' : 'failed', size: recordSizeOf(id) });
     scheduleFlush();
   }
 
@@ -523,6 +744,8 @@ export function createController(config) {
   async function resumeWith(handle) {
     state.dirHandle = handle;
     state.resumeHandle = handle;
+    // 续接成功再写一次：updatedAt 保持新鲜，浏览器清掉句柄时也能被更早发现。
+    rememberHandle(handle);
     if (!state.entries.length) await startScan();
     if (!state.entries.length) return null;
     return startDownload();

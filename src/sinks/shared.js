@@ -78,7 +78,8 @@ export function redactUrls(message) {
  * 进度负载：两个 sink 的全部上报都由这两个函数产出，字段含义只在这里写一次。
  * - filesDone / filesTotal：已结束的文件数（成功 + 失败）/ 本批文件数
  * - bytesDone：已经真正写进磁盘（fs）或已经交给浏览器（download）的字节数，
- *   不是待下载总量；写失败被 abort 掉的那部分也计入，因为计数器只增不减（单调不减）。
+ *   不是待下载总量。文件级重试前会把上一次 abort 掉的那部分回退掉（rollbackBytes），
+ *   所以它恒等于最终落盘的字节数：单个文件重试时可能短暂回退，跨文件仍然只增不减。
  * - bytesTotal：已知总字节数；未知时恒为 0（响应没给长度就是未知，绝不出 NaN）
  * - currentPath：当前文件的相对路径；批次级事件为空串
  * - entryId：当前文件在清单里的 id（plan.entry.id）；批次级事件为空串
@@ -98,6 +99,16 @@ export function createProgressTracker(filesTotal = 0) {
   tracker.addBytes = (delta) => {
     const n = Number(delta);
     if (Number.isFinite(n) && n > 0) tracker.bytesDone += n;
+  };
+  /**
+   * 回退口子：只给「文件级重试」用 —— 上一次尝试写了一半被 abort，那部分字节
+   * 并没有留在磁盘上，留在计数器里会让 bytesDone 大于真实落盘量。
+   * 减到 0 就停，绝不让计数器变负。
+   */
+  tracker.rollbackBytes = (delta) => {
+    const n = Number(delta);
+    if (!Number.isFinite(n) || n <= 0) return;
+    tracker.bytesDone = Math.max(0, tracker.bytesDone - n);
   };
   tracker.endFile = (isFailed) => {
     tracker.filesDone += 1;

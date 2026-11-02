@@ -31,6 +31,16 @@ export function redactUrlText(value) {
   return text.replace(ABSOLUTE_URL, '$1').replace(RELATIVE_WITH_QUERY, '$1');
 }
 
+/**
+ * 「重试后仍失败」类的错误：给一句下一步建议，其余失败项一个字都不加。
+ * 只认这三类文案（停滞 / 文件不完整 / 重试），别的错误照原样展示。
+ */
+const RETRY_CLASS_ERROR = /停滞|文件不完整|重试/;
+
+export function retryHintText(reason) {
+  return RETRY_CLASS_ERROR.test(reason == null ? '' : String(reason)) ? '可稍后点「只重试失败的」再试一次' : '';
+}
+
 /** 按优先顺序取第一个可用的数字字段：新契约在前，旧字段兜底。 */
 function pickNumber(source, keys, fallback) {
   for (const key of keys) {
@@ -80,6 +90,40 @@ export function progressLine(payload, sample) {
 
   if (current) text += ' · 当前：' + redactUrlText(current);
   return text;
+}
+
+/** 文件边界事件：收到这些就说明换文件了，重试计数必须归零。 */
+const RETRY_RESET_STATES = new Set(['start', 'file-start', 'file-done', 'file-failed', 'aborted', 'done']);
+
+/** 重试文案只带相对路径：万一带了 query 也砍掉，绝不让签名参数进 DOM。 */
+function retryFileName(value) {
+  const raw = String(value == null ? '' : value);
+  const cut = raw.search(/[?#]/);
+  return redactUrlText(cut === -1 ? raw : raw.slice(0, cut));
+}
+
+/**
+ * 文件级重试计数：sink 的 'file-retry' 只报路径、没有 attempt 字段，次数只能 UI 自己数。
+ * 同一个 path 连续重试才累加；换文件（file-start / file-done / file-failed）一律归零。
+ */
+export function trackRetry(prev, payload) {
+  const p = payload || {};
+  const state = typeof p.state === 'string' ? p.state : '';
+  const current = prev && prev.count > 0 ? prev : { path: '', count: 0 };
+  if (state === 'file-retry') {
+    const path = retryFileName(p.currentPath || p.path || '');
+    return { path: path, count: current.path === path ? current.count + 1 : 1 };
+  }
+  if (RETRY_RESET_STATES.has(state)) return { path: '', count: 0 };
+  return current;
+}
+
+/** 状态行尾部的重试说明；文件名已经出现在进度行里就不再重复贴一遍。 */
+export function retryLine(retry, existing) {
+  if (!retry || !(retry.count > 0)) return '';
+  const text = ' · 重试中（第 ' + retry.count + ' 次）';
+  if (!retry.path || (existing && existing.indexOf(retry.path) !== -1)) return text;
+  return text + '：' + retry.path;
 }
 
 function node(tag, className, text) {
@@ -220,6 +264,8 @@ export function mountPanel(options) {
   let destroyed = false;
   /** 进度样本：只用来估剩余时间，不参与节流（节流在数据层）。 */
   let sample = null;
+  /** 文件级重试计数（同一文件连续 retry 累加，换文件归零）：setDownloadProgress 维护。 */
+  let retryState = { path: '', count: 0 };
   /** 失败清单的唯一真相源：重试只改它，再整块重绘。 */
   let summaryState = { ok: 0, failed: [], aborted: false };
 
@@ -479,6 +525,8 @@ export function mountPanel(options) {
     setBar(ratio * 100);
 
     let text = progressLine(p, sample);
+    retryState = trackRetry(retryState, p);
+    text += retryLine(retryState, text);
     if (failedCount) text += ' · 失败 ' + failedCount;
     progressTextEl.textContent = text;
     progressTextEl.title = text;
@@ -630,6 +678,13 @@ export function mountPanel(options) {
       li.appendChild(nameEl);
       li.appendChild(pathEl);
       li.appendChild(reasonEl);
+      // 建议是固定文案，不掺任何来自网络的内容：失败项的 URL 只活在 item.url 里，永远不进 DOM。
+      const hint = retryHintText(item && item.error);
+      if (hint) {
+        const hintEl = node('span', 'bbdl-failed__hint', hint);
+        hintEl.title = hint;
+        li.appendChild(hintEl);
+      }
       list.appendChild(li);
     });
     summaryEl.appendChild(list);
