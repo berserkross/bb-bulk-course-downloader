@@ -1,7 +1,6 @@
 import {
   createFetcher as defaultCreateFetcher,
   createHeartbeat,
-  probeAlive as defaultProbeAlive,
   SessionExpiredError
 } from './bb/http.js';
 import { createScanner as defaultCreateScanner } from './bb/scan.js';
@@ -62,11 +61,20 @@ function describe(err) {
   return (err && err.message) || String(err);
 }
 
-/** 停机自检通过后，第 used+1 次重试前等多久（毫秒）：越界取最后一项。 */
+/**
+ * 第 used+1 次自动续跑前等多久（毫秒）：越界取最后一项。
+ * 注意：只要有进展就把预算归零、连续两轮零进展就熔断，所以 8000 之后的档位在自动续跑里基本
+ * 不可达；第三档 20 秒只在放宽零进展熔断时才生效。真正兜住「反复静默恢复」的是
+ * AUTO_RESUME_MAX_TOTAL（整批累计 20 次）。
+ */
 const AUTO_RESUME_DELAYS = [3000, 8000, 20000];
 /** settings 里缺 keepAliveMs / autoResumeMax 时的兜底：与 store.js 的 DEFAULTS 同值。 */
 const DEFAULT_KEEP_ALIVE_MS = 90 * 1000;
 const DEFAULT_AUTO_RESUME_MAX = 3;
+/** 零进展熔断与整批续跑熔断共用的提示文案：绝不拼 URL / 文件名 / 秒数。 */
+const AUTO_RESUME_STOP_NOTICE = '自动重试已停止：连续两次没有任何进展。请刷新页面重新登录后点「刷新后继续」。';
+/** 整批允许累计自动续跑多少次就熔断：防「每几秒恢复一次」的无限乒乓。 */
+const AUTO_RESUME_MAX_TOTAL = 20;
 
 /**
  * 该不该自动续跑：只认「会话过期」这一种停机，用户取消之后一次都不许再自己转。
@@ -217,8 +225,8 @@ export function createController(config) {
   const exportManifestPack = typeof deps.exportManifestPack === 'function' ? deps.exportManifestPack : null;
   const importManifestPack = typeof deps.importManifestPack === 'function' ? deps.importManifestPack : null;
   const mergeManifests = typeof deps.mergeManifests === 'function' ? deps.mergeManifests : null;
-  /** 会话自检可注入：不注入就走真实 fetch（它绝不抛）。 */
-  const probeAlive = typeof deps.probeAlive === 'function' ? deps.probeAlive : defaultProbeAlive;
+  /** 续跑等待可注入：单测注入瞬时实现，生产默认仍是可取消的 waitAbortable。 */
+  const wait = typeof deps.wait === 'function' ? deps.wait : waitAbortable;
   /** 下载边界可注入：测试里换成收集器，真实运行时才碰 a[download]。 */
   const writeDownload = typeof cfg.downloadTextFile === 'function' ? cfg.downloadTextFile : null;
 
@@ -962,8 +970,10 @@ export function createController(config) {
   }
 
   /**
-   * 「一次 HTML 响应 = 整批停机」的解药：先自检真死假死，假死自动续跑（有上限），真死才收尾竖横幅。
-   * 用户取消（signal.aborted）立刻跳出：不再等、不再探、不再跑。
+   * 「一次 HTML 响应 = 整批停机」的解药：不再先探活（旧探活把 text/html 一律判死，
+   * 用户遇到的「第 4 个文件停机、点一下就能接着下」正被它误杀），改成直接续跑 + 有界熔断：
+   * 本轮有进展就重置预算，连续两轮零进展、或整批累计续跑撞满 20 次才停手交回用户。
+   * 用户取消（signal.aborted）立刻跳出：不再等、不再跑、不再提示。
    * @param {any[]} entries
    * @param {any} dirHandle
    * @param {AbortSignal} signal
@@ -974,38 +984,57 @@ export function createController(config) {
     const finish = typeof opts.finish === 'function' ? opts.finish : finishDownload;
     let batch = entries;
     let seedFiles = opts.seedFiles !== false;
+    /** 本批次累计续跑次数：只在本次调用里计数，不写进 state。 */
+    let resumes = 0;
+    /** 连续零进展轮数：本轮下成过文件就归零。 */
+    let zeroProgress = 0;
+    /** 提示只走既有 notice 行：面板没有方法就安静跳过。 */
+    function notify(text) {
+      if (typeof panel.setNotice === 'function') panel.setNotice(text);
+    }
     for (;;) {
       const result = await runDownload(batch, dirHandle, signal, { seedFiles: seedFiles });
       const halted = result ? result.halted : null;
       const aborted = Boolean((signal && signal.aborted) || (result && result.aborted));
       const pending = halted && Array.isArray(halted.pending) ? halted.pending : [];
       const target = pending.length ? pendingUrl(pending[0]) : '';
-      // 没有 pending、拿不到地址、或不该续跑：走原来的收尾，一个字都不改。
+      // 没有 pending、拿不到地址、或不该续跑（用户取消 / 非会话过期 / 次数用尽）：走原来的收尾。
       if (!target || !shouldAutoResume({ halted: halted, aborted: aborted, used: state.autoResumeUsed, max: state.autoResumeMax })) {
         return await finish(result);
       }
       if (signal && signal.aborted) return await finish(result);
-      // 先落库再探：自检要发网络请求，待写记录不跨这一段。
-      await flushRecords();
-      const probe = await probeAlive({ url: target, signal: signal });
-      const line = { alive: Boolean(probe && probe.alive) };
-      if (probe && Number.isFinite(probe.status)) line.status = probe.status;
-      if (probe && typeof probe.contentType === 'string' && probe.contentType) line.contentType = probe.contentType;
-      if (probe && typeof probe.htmlKind === 'string' && probe.htmlKind) line.htmlKind = probe.htmlKind;
-      line.used = state.autoResumeUsed;
-      console.info('[bbdl] 停机自检', line);
-      // 探完再确认一次：等这一下的时间里用户可能已经点了取消。
-      if (signal && signal.aborted) return await finish(result);
-      if (!probe || !probe.alive) return await finish(result);
-      state.autoResumeUsed += 1;
-      if (typeof panel.setNotice === 'function') {
-        panel.setNotice('会话看起来还活着，已自动重试（第 ' + state.autoResumeUsed + ' 次）…');
+      const ok = result && Array.isArray(result.ok) ? result.ok : [];
+      if (ok.length > 0) {
+        // 有进展就重置预算：历史次数不该连坐这一次能下的文件。
+        state.autoResumeUsed = 0;
+        zeroProgress = 0;
+      } else {
+        zeroProgress += 1;
+        if (zeroProgress >= 2) {
+          // 连着两轮一个文件都没下成：这是真死，别再自动重试。
+          notify(AUTO_RESUME_STOP_NOTICE);
+          console.info('[bbdl] 自动重试熔断', { zeroProgress: zeroProgress, pending: pending.length });
+          return await finish(result);
+        }
       }
+      if (resumes >= AUTO_RESUME_MAX_TOTAL) {
+        // 有进展但每隔几秒就停一次：整批续跑预算已撞满。
+        notify(AUTO_RESUME_STOP_NOTICE);
+        console.info('[bbdl] 自动重试熔断', { resumes: resumes });
+        return await finish(result);
+      }
+      // 先落库再续跑：待写记录不跨这一轮。
+      await flushRecords();
+      state.autoResumeUsed += 1;
+      resumes += 1;
+      const delay = autoResumeDelay(state.autoResumeUsed - 1);
+      // 文案里只出现数字：绝不出现文件名或 URL。
+      notify('疑似登录过期，' + Math.round(delay / 1000) + ' 秒后自动重试（第 ' + resumes + ' 次）…');
       // 撤横幅与切回 downloading 必须在等待之前：这段等待最长 20 秒，横幅不许和新 notice 同时挂着。
       state.haltedPending = [];
       clearHaltedBanner();
       panel.setState('downloading');
-      await waitAbortable(autoResumeDelay(state.autoResumeUsed - 1), signal);
+      await wait(delay, signal);
       if (signal && signal.aborted) return await finish(result);
       // 下一轮就是刚才 pending 的那几条：不重种行、不重扫。
       batch = pending;

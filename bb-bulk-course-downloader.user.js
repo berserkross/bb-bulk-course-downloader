@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BB 课件批量下载
 // @namespace    bb-bulk-course-downloader
-// @version      2.7.0
+// @version      2.7.1
 // @description  扫描 Blackboard 课程内容，勾选后按原始目录结构批量下载课件
 // @updateURL    https://raw.githubusercontent.com/berserkross/bb-bulk-course-downloader/main/bb-bulk-course-downloader.user.js
 // @downloadURL  https://raw.githubusercontent.com/berserkross/bb-bulk-course-downloader/main/bb-bulk-course-downloader.user.js
@@ -1123,44 +1123,6 @@
   var PROBE_HTML_LIMIT = 64 * 1024;
   var HTML_LOGIN_RE = /sign in|login|password|统一身份|登录/i;
   var HTML_BLOCKED_RE = /blocked|denied|forbidden|rate limit|too many requests|拦截|访问受限/i;
-  async function probeAlive(options) {
-    const opts = options || {};
-    const url = String(opts.url || "");
-    if (!url) return { alive: false };
-    let response;
-    try {
-      response = await fetch(url, {
-        method: "GET",
-        headers: { Range: "bytes=0-0" },
-        credentials: "include",
-        cache: "no-store",
-        signal: opts.signal
-      });
-    } catch {
-      return { alive: false };
-    }
-    const status = Number(response && response.status) || 0;
-    const type = String(response && response.headers && response.headers.get("content-type") || "").toLowerCase();
-    const usable = status >= 200 && status < 300 || status === 206;
-    const result = { alive: false, status };
-    if (type) result.contentType = type;
-    if (type.indexOf("text/html") === -1) {
-      discardBody(response);
-      result.alive = usable;
-      return result;
-    }
-    let text = "";
-    try {
-      text = await response.text();
-    } catch {
-      text = "";
-    }
-    text = String(text == null ? "" : text);
-    if (text.length > PROBE_HTML_LIMIT) text = text.slice(0, PROBE_HTML_LIMIT);
-    result.bytes = text.length;
-    result.htmlKind = htmlKindOf(text);
-    return result;
-  }
   function createHeartbeat(options) {
     const opts = options || {};
     const fetcher = opts.fetcher || null;
@@ -3062,7 +3024,7 @@
     zipChunkBytes: 200 * 1024 * 1024,
     // 保活心跳间隔：门户会话闲置太久必死，下载期间定期回敲一次最省事的续命手段
     keepAliveMs: 90 * 1e3,
-    // 停机自检判「假过期」时自动续跑的上限（次）：撞满就交回用户，不再自己转圈
+    // 自动续跑的连续零进展熔断阈值（次）：有进展即归零，撞满就交回用户，不再自己转圈
     autoResumeMax: 3
   };
   function loadSettings() {
@@ -6067,6 +6029,8 @@
   var AUTO_RESUME_DELAYS = [3e3, 8e3, 2e4];
   var DEFAULT_KEEP_ALIVE_MS = 90 * 1e3;
   var DEFAULT_AUTO_RESUME_MAX = 3;
+  var AUTO_RESUME_STOP_NOTICE = "\u81EA\u52A8\u91CD\u8BD5\u5DF2\u505C\u6B62\uFF1A\u8FDE\u7EED\u4E24\u6B21\u6CA1\u6709\u4EFB\u4F55\u8FDB\u5C55\u3002\u8BF7\u5237\u65B0\u9875\u9762\u91CD\u65B0\u767B\u5F55\u540E\u70B9\u300C\u5237\u65B0\u540E\u7EE7\u7EED\u300D\u3002";
+  var AUTO_RESUME_MAX_TOTAL = 20;
   function shouldAutoResume(input) {
     const opts = input || {};
     const halted = opts.halted || null;
@@ -6172,7 +6136,7 @@
     const exportManifestPack2 = typeof deps.exportManifestPack === "function" ? deps.exportManifestPack : null;
     const importManifestPack2 = typeof deps.importManifestPack === "function" ? deps.importManifestPack : null;
     const mergeManifests2 = typeof deps.mergeManifests === "function" ? deps.mergeManifests : null;
-    const probeAlive2 = typeof deps.probeAlive === "function" ? deps.probeAlive : probeAlive;
+    const wait = typeof deps.wait === "function" ? deps.wait : waitAbortable;
     const writeDownload = typeof cfg.downloadTextFile === "function" ? cfg.downloadTextFile : null;
     const listExistingFiles2 = typeof cfg.listExistingFiles === "function" ? cfg.listExistingFiles : listExistingFiles;
     const pickDirectory2 = typeof cfg.pickDirectory === "function" ? cfg.pickDirectory : pickDirectory;
@@ -6764,6 +6728,11 @@
       const finish = typeof opts.finish === "function" ? opts.finish : finishDownload;
       let batch = entries;
       let seedFiles = opts.seedFiles !== false;
+      let resumes = 0;
+      let zeroProgress = 0;
+      function notify2(text) {
+        if (typeof panel.setNotice === "function") panel.setNotice(text);
+      }
       for (; ; ) {
         const result = await runDownload(batch, dirHandle, signal, { seedFiles });
         const halted = result ? result.halted : null;
@@ -6774,24 +6743,32 @@
           return await finish(result);
         }
         if (signal && signal.aborted) return await finish(result);
-        await flushRecords();
-        const probe = await probeAlive2({ url: target, signal });
-        const line = { alive: Boolean(probe && probe.alive) };
-        if (probe && Number.isFinite(probe.status)) line.status = probe.status;
-        if (probe && typeof probe.contentType === "string" && probe.contentType) line.contentType = probe.contentType;
-        if (probe && typeof probe.htmlKind === "string" && probe.htmlKind) line.htmlKind = probe.htmlKind;
-        line.used = state.autoResumeUsed;
-        console.info("[bbdl] \u505C\u673A\u81EA\u68C0", line);
-        if (signal && signal.aborted) return await finish(result);
-        if (!probe || !probe.alive) return await finish(result);
-        state.autoResumeUsed += 1;
-        if (typeof panel.setNotice === "function") {
-          panel.setNotice("\u4F1A\u8BDD\u770B\u8D77\u6765\u8FD8\u6D3B\u7740\uFF0C\u5DF2\u81EA\u52A8\u91CD\u8BD5\uFF08\u7B2C " + state.autoResumeUsed + " \u6B21\uFF09\u2026");
+        const ok = result && Array.isArray(result.ok) ? result.ok : [];
+        if (ok.length > 0) {
+          state.autoResumeUsed = 0;
+          zeroProgress = 0;
+        } else {
+          zeroProgress += 1;
+          if (zeroProgress >= 2) {
+            notify2(AUTO_RESUME_STOP_NOTICE);
+            console.info("[bbdl] \u81EA\u52A8\u91CD\u8BD5\u7194\u65AD", { zeroProgress, pending: pending.length });
+            return await finish(result);
+          }
         }
+        if (resumes >= AUTO_RESUME_MAX_TOTAL) {
+          notify2(AUTO_RESUME_STOP_NOTICE);
+          console.info("[bbdl] \u81EA\u52A8\u91CD\u8BD5\u7194\u65AD", { resumes });
+          return await finish(result);
+        }
+        await flushRecords();
+        state.autoResumeUsed += 1;
+        resumes += 1;
+        const delay = autoResumeDelay(state.autoResumeUsed - 1);
+        notify2("\u7591\u4F3C\u767B\u5F55\u8FC7\u671F\uFF0C" + Math.round(delay / 1e3) + " \u79D2\u540E\u81EA\u52A8\u91CD\u8BD5\uFF08\u7B2C " + resumes + " \u6B21\uFF09\u2026");
         state.haltedPending = [];
         clearHaltedBanner();
         panel.setState("downloading");
-        await waitAbortable(autoResumeDelay(state.autoResumeUsed - 1), signal);
+        await wait(delay, signal);
         if (signal && signal.aborted) return await finish(result);
         batch = pending;
         seedFiles = false;

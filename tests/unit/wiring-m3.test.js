@@ -81,7 +81,9 @@ function harness(over) {
       panel.opts = options;
       return panel;
     },
-    settings: extra.settings || { preserveTree: true, downloadConcurrency: 2 },
+    // 这个文件只验接线：默认把自动续跑闸门关掉（autoResumeMax 是既有设置项），
+    // 需要验续跑的用例自己把 autoResumeMax 打开。
+    settings: extra.settings || { preserveTree: true, downloadConcurrency: 2, autoResumeMax: 0 },
     location: { href: HREF },
     document: null,
     deps: {
@@ -104,9 +106,9 @@ function harness(over) {
       createFetcher: function () {
         return { async probeSize() { return undefined; } };
       },
-      // 会话自检注入：这个文件里的 halted 用例会走自动续跑，真自检要发一次 fetch（DNS 失败约 300ms）
-      probeAlive: function () {
-        return Promise.resolve({ alive: false });
+      // 续跑等待注入：真等要 3/8 秒，这里瞬时返回（delay 数字仍由生产实现算出）。
+      wait: function () {
+        return Promise.resolve();
       }
     }
   });
@@ -154,27 +156,44 @@ test('AC2/B：setFiles 在 download 之前恰好种一次，onFileEvent 的事�
   assert.equal(Object.isFrozen(applied[0].args[0]), true, '原样转发连不可写都保持不变');
 });
 
-test('AC3/C：halted 时 setHalted 恰好一次、pendingCount 正确，摘要的失败清单不含停机 pending', async () => {
+test('AC3/C：v2.7.1 起不再靠探活判断，连续两次零进展才停 —— halted 时 setHalted 恰好一次、pendingCount 正确，摘要的失败清单不含停机 pending', async () => {
+  // 探活（probeAlive）已经从续跑路径上彻底删掉：这里让第 1 轮有进展、之后连续两轮「仍然停机且零 ok」，
+  // 停手只能由「连续零进展」触发 —— 探活既没有被注入，也没有被调用过。
+  let round = 0;
   let real = null;
   const h = harness({
-    behave: async function (entries, api) {
-      // 复刻 download sink：pending 里的 e2 既不在 ok 也不在 failed，e3 却被塞进了 failed
-      // （真实场景里前置 fetch 已判失败），接线层必须自己把 pending 摘掉。
+    settings: { preserveTree: true, downloadConcurrency: 2, autoResumeMax: 3 },
+    behave: async function (entries) {
+      round += 1;
+      if (round === 1) {
+        // 复刻 download sink：pending 里的 e2 既不在 ok 也不在 failed，e3 却被塞进了 failed
+        // （真实场景里前置 fetch 已判失败），接线层必须自己把 pending 摘掉。
+        real = withHiddenHalted({
+          ok: [entries[0]],
+          failed: [
+            { entry: entries[1], name: 'b.pdf', path: 'b.pdf', url: entries[1].url, error: '登录已过期' },
+            { entry: entries[2], name: 'c.pdf', path: 'c.pdf', url: entries[2].url, error: '404' }
+          ],
+          aborted: false
+        }, { reason: 'session-expired', pending: [entries[1]], pendingCount: 1 });
+        // {...result} 看不见 halted —— 接线层只有直接读 result.halted 才可能发现停了机
+        assert.equal(Object.keys(real).includes('halted'), false);
+        return real;
+      }
+      // 第 2、3 轮：这一轮一个文件都没下成，而且仍然停机 —— 熔断必须在这里收口。
       real = withHiddenHalted({
-        ok: [entries[0]],
+        ok: [],
         failed: [
-          { entry: entries[1], name: 'b.pdf', path: 'b.pdf', url: entries[1].url, error: '登录已过期' },
-          { entry: entries[2], name: 'c.pdf', path: 'c.pdf', url: entries[2].url, error: '404' }
+          { entry: entries[0], name: 'b.pdf', path: 'b.pdf', url: entries[0].url, error: '登录已过期' }
         ],
         aborted: false
-      }, { reason: 'session-expired', pending: [entries[1]], pendingCount: 1 });
-      // {...result} 看不见 halted —— 接线层只有直接读 result.halted 才可能发现停了机
-      assert.equal(Object.keys(real).includes('halted'), false);
+      }, { reason: 'session-expired', pending: [entries[0]], pendingCount: 1 });
       return real;
     }
   });
   await runFirstBatch(h);
 
+  assert.equal(round, 3, '第 1 轮有进展（预算归零）→ 之后连续两轮零进展即停手，不许无限续跑');
   const halted = h.panel.callsOf('setHalted');
   assert.equal(halted.length, 1, '停机横幅只竖一次');
   assert.deepEqual(halted[0].args[0], { reason: 'session-expired', pendingCount: 1 });
@@ -182,12 +201,27 @@ test('AC3/C：halted 时 setHalted 恰好一次、pendingCount 正确，摘要�
   const summary = h.panel.callsOf('showSummary');
   assert.equal(summary.length, 1);
   const shown = summary[0].args[0];
-  assert.deepEqual(shown.failed.map(function (item) { return item.entry.id; }), ['e3'], 'pending 的 e2 不许出现在失败清单');
-  assert.equal(shown.ok.length, 1);
+  assert.deepEqual(shown.failed.map(function (item) { return item.entry.id; }), [], 'pending 的 e2 不许出现在失败清单');
+  assert.equal(shown.ok.length, 0, '熔断那一轮一个都没下成');
 
   // 面板拿到的只是副本：调用方手里的真实结果一个字都没改
-  assert.equal(real.failed.length, 2);
+  assert.equal(real.failed.length, 1);
   assert.deepEqual(h.controller.getState().haltedPending.map(function (entry) { return entry.id; }), ['e2']);
+
+  const notices = h.panel.texts('setNotice');
+  const stopNotices = notices.filter(function (text) { return text.includes('自动重试已停止'); });
+  assert.equal(stopNotices.length, 1, '熔断提示只出现一次');
+  assert.equal(
+    stopNotices[0],
+    '自动重试已停止：连续两次没有任何进展。请刷新页面重新登录后点「刷新后继续」。',
+    '熔断文案逐字照抄'
+  );
+  assert.equal(/http|\?|\//.test(stopNotices[0]), false, '熔断文案里不许出现 URL / 查询串 / 路径');
+  assert.equal(
+    notices.filter(function (text) { return text.includes('秒后自动重试'); }).length,
+    2,
+    '有进展那一轮与之后零进展的第一轮各给一次续跑提示'
+  );
 });
 
 test('AC3/C：halted 缺 pendingCount（zip sink 的形状）时按 pending 长度兜底，不把 undefined 递给面板', async () => {
