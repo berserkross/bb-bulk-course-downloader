@@ -133,7 +133,7 @@ test('不变量 3 stale 只出现在返回值里：不进 todo / skip，不改�
   assert.equal(result.diff.stale, 1);
   const touchedIds = result.todo.concat(result.skip.map((s) => s.plan)).map((p) => p.entry.id);
   assert.ok(!touchedIds.includes('doc-gone'), 'stale 条目不许混进 todo / skip');
-  assert.deepEqual(Object.keys(result).sort(), ['diff', 'skip', 'stale', 'todo'], '返回值不得带任何删除/清理入口');
+  assert.deepEqual(Object.keys(result).sort(), ['changedPaths', 'diff', 'skip', 'stale', 'todo'], '返回值不得带任何删除/清理入口');
   assert.deepEqual(result.stale.map((s) => Object.keys(s).sort()), [['id', 'path']]);
   assert.deepEqual([snapshot(plans), snapshot(manifest), snapshot(Array.from(disk.entries()))], before, 'stale 不许写回入参');
 });
@@ -420,4 +420,15 @@ test('updateRecords 保留未被本次结果触及的 v1 记录（没有 href �
   assert.deepEqual(next.files['doc-old'], untouched, 'v1 记录必须原样保留');
   assert.equal(next.files['doc-new'].href, HREF_A);
   assert.equal(next.version, 2);
+});
+
+test('历史变更只列出版本变化或磁盘大小不符的条目', () => {
+  const plans = ['version','size','new','old'].map(id => plan(id, [], id, 100, HREF_A));
+  const result = planSkips({ plans, manifest: manifestOf({
+    version: record('version','version',100,'done',HREF_B),
+    size: record('size','size',100,'done',HREF_A),
+    old: record('old','old',100,'failed',HREF_A)
+  }), existingPaths: diskMap([['size', 12]]) });
+  assert.deepEqual(result.changedPaths, [{ id: 'version', path: 'version' }, { id: 'size', path: 'size' }]);
+  assert.equal(result.diff.changed, result.changedPaths.length);
 });

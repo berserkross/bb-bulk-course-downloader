@@ -436,3 +436,19 @@ test('index.js：degraded 为 null 时这条提示一个字都不出现', async 
   const hits = panel.texts('setNotice').filter((text) => text.indexOf('限流') !== -1);
   assert.deepEqual(hits, []);
 });
+
+test('200 个请求全被拦截时，三种落盘方式都在固定请求预算内暂停', async t => {
+  const realTimer = globalThis.setTimeout;
+  t.mock.method(globalThis, 'setTimeout', (fn, ms, ...args) =>
+    realTimer(fn, ms === 1500 || ms === 4000 ? 0 : ms, ...args));
+  const entries = Array.from({length: 200}, (_, i) => entry({ id: String(i), name: i + '.pdf' }));
+  for (const makeSink of [createFsSink, createDownloadSink, createZipSink]) {
+    const sink = makeSink({ files, settings: { downloadConcurrency: 4 }, dirHandle: makeRoot(newLog()), doc: fakeDoc(), urlApi: fakeUrlApi() });
+    let requests = 0;
+    const result = await sink.download(entries, { async fetchOk() { requests++; throw suspect(); } });
+    assert.equal(result.halted?.reason, 'server-blocked');
+    assert.equal(result.halted.pending.length, 200);
+    assert.equal(result.failed.length, 0);
+    assert.ok(requests <= 7, String(requests));
+  }
+});

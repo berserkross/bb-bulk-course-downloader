@@ -104,7 +104,7 @@ export function createScanner(options) {
   }
 
   async function run() {
-    const files = [];
+    const pages = new Map();
     const visited = new Set();
     const seenFileUrls = new Set();
     failures = [];
@@ -120,7 +120,7 @@ export function createScanner(options) {
     function report() {
       if (typeof onProgress !== 'function') return;
       try {
-        onProgress({ foldersDone, foldersQueued: pending, filesFound: files.length });
+        onProgress({ foldersDone, foldersQueued: pending, filesFound: seenFileUrls.size });
       } catch {
         /* 进度回调用自己的异常不能影响扫描 */
       }
@@ -136,11 +136,8 @@ export function createScanner(options) {
     }
 
     function accept(job, parsed) {
-      for (const file of parsed.files) {
-        if (seenFileUrls.has(file.url)) continue;
-        seenFileUrls.add(file.url);
-        files.push(Object.assign({}, file, { folderPath: job.folderPath.slice() }));
-      }
+      pages.set(job.id, parsed);
+      for (const file of parsed.files) seenFileUrls.add(file.url);
       for (const folder of parsed.folders) {
         if (!folder.id || visited.has(folder.id)) continue;
         visited.add(folder.id);
@@ -196,6 +193,27 @@ export function createScanner(options) {
 
     if (pending > 0) await done;
     if (fatal) throw fatal;
+    // 网络完成顺序只影响进度。按课程页的链接顺序逐层选路径，重复引用优先用最浅的一处。
+    const files = [];
+    const queue = [rootJob];
+    visited.clear();
+    visited.add(rootJob.id);
+    seenFileUrls.clear();
+    for (let i = 0; i < queue.length; i++) {
+      const { id, folderPath } = queue[i];
+      const page = pages.get(id);
+      if (!page) continue;
+      for (const file of page.files) {
+        if (seenFileUrls.has(file.url)) continue;
+        seenFileUrls.add(file.url);
+        files.push({ ...file, folderPath: folderPath.slice() });
+      }
+      for (const folder of page.folders) {
+        if (!folder.id || visited.has(folder.id)) continue;
+        visited.add(folder.id);
+        queue.push({ id: folder.id, folderPath: folderPath.concat(String(folder.name || folder.id)) });
+      }
+    }
     return files;
   }
 

@@ -73,6 +73,7 @@ function verdictOf({ record, statusDone, pathEqual, uncertain, prevHref, href })
  *     size: number | null
  *   }>,
  *   stale: Array<{ id: string, path: string }>,
+ *   changedPaths: Array<{ id: string, path: string }>,
  *   diff: {
  *     added: number, changed: number, moved: number, unchanged: number,
  *     stale: number, unknown: number, total: number
@@ -90,6 +91,7 @@ export function planSkips({ plans, manifest, existingPaths, preserveTree = true,
   const uncertain = disk.truncated === true || scanFailed === true;
 
   const todo = [];
+  const changedPaths = [];
   const skip = [];
   const matched = new Set();
   // 五个桶必须是本次计划的完整划分：added + changed + moved + unchanged + unknown === total。
@@ -119,16 +121,22 @@ export function planSkips({ plans, manifest, existingPaths, preserveTree = true,
     // ---- ② 权威证据优先于物理证据 ----
     if (hrefOverwritten) {
       todo.push(plan);
+      changedPaths.push({ id, path });
       diff.changed += 1;
       continue;
     }
 
     // ---- ③ 磁盘分支（后置：只在 href 没给出「上游改过」结论时参与） ----
+    if (record && !statusDone) {
+      todo.push(plan);
+      diff.unknown += 1;
+      continue;
+    }
     if (disk.has(path)) {
       const diskSize = knownSize(disk.get(path));
       if (diskSize !== null && expected !== null) {
         if (diskSize === expected) {
-          // 正向物理核实：同名同大小 → 跳过（partial / failed 也照跳，这是既有正向行为）。
+          // 正向物理核实：同名同大小，且没有未完成记录。
           skip.push({ plan, reason: 'disk', size: diskSize });
           if (record) diff.unchanged += 1;
           else diff.added += 1;
@@ -137,16 +145,10 @@ export function planSkips({ plans, manifest, existingPaths, preserveTree = true,
         // 大小不等：本地那份和期望不是同一个东西，必须重下。
         // 清单说没完成的，这不是「上游变更」，是上一轮没下完 → 计 unknown。
         todo.push(plan);
-        if (statusDone) diff.changed += 1;
-        else diff.unknown += 1;
-        continue;
-      }
-      // 无法核实的两个分支共享这条守卫：清单已经不认为这份文件完成时，
-      // 「磁盘上有个同名文件」不足以证明它就是完成品——否则上一轮下到一半的半截文件
-      // 会被当成已完成永久跳过（数据红线：partial / failed 一律重下）。
-      if (record && record.status !== 'done') {
-        todo.push(plan);
-        diff.unknown += 1; // 不是上游变更，是上一轮没下完
+        if (statusDone) {
+          changedPaths.push({ id, path });
+          diff.changed += 1;
+        } else diff.unknown += 1;
         continue;
       }
       if (uncertain) {
@@ -166,11 +168,6 @@ export function planSkips({ plans, manifest, existingPaths, preserveTree = true,
     if (verdict === 'added') {
       todo.push(plan);
       diff.added += 1;
-      continue;
-    }
-    if (verdict === 'changed') {
-      todo.push(plan);
-      diff.changed += 1;
       continue;
     }
     if (verdict === 'moved') {
@@ -198,5 +195,5 @@ export function planSkips({ plans, manifest, existingPaths, preserveTree = true,
   }
   diff.stale = stale.length;
 
-  return { todo, skip, stale, diff };
+  return { todo, skip, stale, diff, changedPaths };
 }

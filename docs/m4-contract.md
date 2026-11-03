@@ -103,3 +103,5 @@ Boundary：src/index.js、src/ui/panel.js、src/ui/select.js、src/ui/styles.js�
 4. 导出->导入往返：files 数量与 status 不变；scans 不因导入而丢。
 5. 同一课程在两个文件夹间来回切，勾选状态各自保留、不串台。
 6. 全部新用例与既有 310 条用例一起跑通（由调度者执行全量）。
+
+ZIP 的 done 文件事件仍表示条目已完整进入包内，供列表使用。用于写入清单的 file-done 进度在包交给浏览器下载后发出。创建或交付包失败时，包内文件不会被提前记成已保存。

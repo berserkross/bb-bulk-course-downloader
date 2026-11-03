@@ -425,7 +425,7 @@ export function mountPanel(options) {
   /** 进度样本：只用来估剩余时间，不参与节流（节流在数据层）。 */
   let sample = null;
   /** 文件级重试计数（同一文件连续 retry 累加，换文件归零）：setDownloadProgress 维护。 */
-  let retryState = { path: '', count: 0 };
+  const retries = new Map();
   /** 失败清单的唯一真相源：重试只改它，再整块重绘。 */
   let summaryState = { ok: 0, failed: [], aborted: false };
   /** 文件列表：fileOrder 决定行序，fileMap 存逐 entryId 的状态（重试计数也在这里，绝不跨行串台）。 */
@@ -837,7 +837,11 @@ export function mountPanel(options) {
     setBar(ratio * 100);
 
     let text = progressLine(p, sample);
-    retryState = trackRetry(retryState, p);
+    if (p.state === 'start') retries.clear();
+    const key = p.entryId || p.currentPath || p.path || '';
+    const retryState = trackRetry(retries.get(key), p);
+    if (retryState.count) retries.set(key, retryState);
+    else retries.delete(key);
     text += retryLine(retryState, text);
     if (failedCount) text += ' · 失败 ' + failedCount;
     progressTextEl.textContent = text;
@@ -916,7 +920,7 @@ export function mountPanel(options) {
 
   const MODE_TEXT = {
     fs: '落盘方式：保存到文件夹（Chromium）——直接写入你选的目录，保留原目录结构。代价：每次下载都要重新选一次文件夹，且只有 Chromium 系浏览器支持。',
-    zip: '落盘方式：按文件夹打包成 .zip（存到浏览器默认下载目录）——没有目录写入权限时自动退到这种方式，解压后即可还原原目录结构。代价：按顶层文件夹分包，单包上限约 200 MB，且任何一次失败都要重下该包里的文件。',
+    zip: '落盘方式：按文件夹打包成 .zip（存到浏览器默认下载目录）——没有目录写入权限时自动退到这种方式，解压后即可还原原目录结构。ZIP 并发为 1，逐个读取并封包。包内部分文件失败时，可以单独重试缺少的文件。',
     download:
       '落盘方式：逐文件下载（进浏览器默认下载目录）——网页拿不到目录写权限，文件名用 folder__ 前缀代替子目录。代价：所有文件都落在默认下载目录里，无法建子目录，文件多时会连续弹出多个下载。另外这里只能按下载清单跳过已下过的文件，无法核实磁盘文件。'
   };
@@ -1096,7 +1100,7 @@ export function mountPanel(options) {
         }
         const okList = Array.isArray(result.ok) ? result.ok : [];
         const failed = Array.isArray(result.failed) ? result.failed : [];
-        summaryState = { ok: summaryState.ok + okList.length, failed: failed, aborted: !!result.aborted };
+        summaryState = { ok: result.batchOkCount ?? (summaryState.ok + okList.length), failed: failed, aborted: !!result.aborted };
         renderSummary();
         render(failed.length ? 'error' : 'done', failed.length ? { message: '重试后仍有 ' + failed.length + ' 个文件失败。' } : {});
       },

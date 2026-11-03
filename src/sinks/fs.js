@@ -15,7 +15,7 @@ import {
   withDegraded,
   listPending
 } from './shared.js';
-import { createIdleReader, withFileRetry, TruncatedError, DEFAULT_IDLE_MS, isSessionExpiredError } from './guard.js';
+import { createIdleReader, withFileRetry, createSuspectBudget, ServerBlockedError, TruncatedError, DEFAULT_IDLE_MS, isSessionExpiredError } from './guard.js';
 
 /** settings 由接线层注入；读不到就落回契约默认值（fileRetries=1 表示首次失败后额外重试 1 次）。 */
 function pickIdleMs(value) {
@@ -149,7 +149,7 @@ export function createFsSink({ settings = {}, dirHandle, signal, total = 0, file
    * attemptBytes 是「本次尝试已经计入 tracker 的字节数」：被 abort 的那一份没有落地，
    * 重试前必须按它回退，否则 bytesDone 会大于真实落盘量（一个文件重试成功却显示 32/28）。
    */
-  function writeEntry(fetcher, entry, plan, onChunk, { onRetry, onAttempt, onFileRetry, rollback, onName } = {}) {
+  function writeEntry(fetcher, entry, plan, onChunk, { budget, onRetry, onAttempt, onFileRetry, rollback, onName } = {}) {
     let attemptBytes = 0;
     return withFileRetry(
       // withFileRetry 把「本次是第几次」交回来：attempt 计数天然按文件各一份，并发下互不污染
@@ -168,6 +168,7 @@ export function createFsSink({ settings = {}, dirHandle, signal, total = 0, file
         );
       },
       {
+        budget,
         attempts: 1 + fileRetries,
         onRetry: (info) => {
           if (typeof rollback === 'function') rollback(attemptBytes);
@@ -202,6 +203,7 @@ export function createFsSink({ settings = {}, dirHandle, signal, total = 0, file
     let aborted = false;
     // 疑似限流引发的降速记录（契约 §3.3）：{ from, to } | null，最终挂成不可枚举属性
     let degraded = null;
+    const budget = createSuspectBudget();
     // 诊断计数：worker 到底有没有被调用。入口计数是「计划存在但池子没跑」与「池子跑了却什么都没记」的唯一分界。
     let workerStarted = 0;
 
@@ -244,6 +246,7 @@ export function createFsSink({ settings = {}, dirHandle, signal, total = 0, file
               emit('progress', label, entryId, false);
             },
             {
+              budget,
               onName,
               // 重试会把上一次 abort 掉的字节扣回去，bytesDone 才等于最终落盘量
               rollback: (n) => progress.rollbackBytes(n),
@@ -275,6 +278,10 @@ export function createFsSink({ settings = {}, dirHandle, signal, total = 0, file
             // 半截文件写不出去，既不算成功也不进 failed
             aborted = true;
             emit('aborted', label, entryId, true);
+            return;
+          }
+          if (err instanceof ServerBlockedError) {
+            control.stop('server-blocked');
             return;
           }
           if (isSessionExpiredError(err)) {

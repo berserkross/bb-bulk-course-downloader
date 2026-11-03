@@ -80,3 +80,5 @@ skip[].reason 新增取值：'manifest-unchanged' | 'manifest-unknown'
 ## 10. 未决（不阻塞实现）
 
 `dt-content-rid` / xid 尾段在「改名」与「覆盖」时各自的稳定性未做真实课程对照实验。它只影响我们能否把 `changed` 进一步细分（改内容 vs 改版本号），不影响本契约的判定正确性。
+
+planSkips 额外返回 changedPaths，每项含 id 和 path。扫描历史从此列表截取展示，新增、改名、未知和疑似删除不混入。partial 和 failed 即使磁盘大小相等也重新下载。相同文件 URL 出现在多个目录时，扫描选择层级最浅且在课程页链接顺序中靠前的位置，以免并发请求的完成顺序改变落盘路径。

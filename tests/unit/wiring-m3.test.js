@@ -202,8 +202,8 @@ test('AC3/C：v2.7.1 起不再靠探活判断，连续两次零进展才停 —�
   const summary = h.panel.callsOf('showSummary');
   assert.equal(summary.length, 1);
   const shown = summary[0].args[0];
-  assert.deepEqual(shown.failed.map(function (item) { return item.entry.id; }), [], 'pending 的 e2 不许出现在失败清单');
-  assert.equal(shown.ok.length, 0, '熔断那一轮一个都没下成');
+  assert.deepEqual(shown.failed.map(function (item) { return item.entry.id; }), ['e3'], '跨轮保留真实失败，排除待续跑的 e2');
+  assert.equal(shown.ok.length, 1, '摘要保留第一轮成功的 e1');
 
   // 面板拿到的只是副本：调用方手里的真实结果一个字都没改
   assert.equal(real.failed.length, 1);
@@ -311,4 +311,29 @@ test('F：停机那批文件绝不会被写成 done / failed（halt 进度项与
 
   const records = h.store.writes.flatMap(function (write) { return write.records; });
   assert.deepEqual(records.map(function (record) { return record.id + ':' + record.status; }), ['e1:done'], '只有真下完的 e1 落库，停机 pending 一条都不写');
+});
+
+test('批次未结束时每八条完成记录即落库，收尾等待在途写入', async () => {
+  let release, reached, finishSink;
+  const holdSink = new Promise(resolve => { finishSink = resolve; });
+  const gate = new Promise(resolve => { release = resolve; });
+  const reported = new Promise(resolve => { reached = resolve; });
+  const entries = Array.from({length: 8}, (_, i) => ({ ...ENTRIES[0], id: 'f' + i }));
+  const h = harness({entries, async behave(batch, api) {
+    for (const entry of batch) api.onProgress({ state: 'file-done', entryId: entry.id, currentPath: entry.name });
+    reached();
+    await holdSink;
+    return { ok: batch, failed: [], aborted: false };
+  }});
+  const writes = [];
+  h.store.mergeFiles = async (course, records) => { writes.push(records); await gate; };
+  const running = runFirstBatch(h);
+  await reported;
+  await new Promise(resolve => setImmediate(resolve));
+  try {
+    assert.equal(writes[0]?.length, 8);
+    finishSink();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.panel.countOf('showSummary'), 0);
+  } finally { finishSink(); release(); await running; }
 });

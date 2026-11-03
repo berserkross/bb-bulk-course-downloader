@@ -9,7 +9,7 @@ import {
   listExistingFiles as defaultListExistingFiles,
   pickDirectory as defaultPickDirectory
 } from './sinks/index.js';
-import { planBatch, redactUrls, relativePath } from './sinks/shared.js';
+import { planBatch, redactUrls } from './sinks/shared.js';
 import { buildEntryPath, dedupePaths, sanitizeSegment } from './bb/files.js';
 import { loadSettings, saveSettings } from './store.js';
 import { mountPanel as defaultMountPanel } from './ui/panel.js';
@@ -135,9 +135,11 @@ function sessionIntentStore() {
     write(value) {
       try {
         const store = bucket();
-        if (store) store.setItem(INTENT_KEY, JSON.stringify(value));
+        if (!store) return false;
+        store.setItem(INTENT_KEY, JSON.stringify(value));
+        return true;
       } catch (err) {
-        /* 写不进就是这一次没有意图：不重载也绝不抛 */
+        return false;
       }
     },
     clear() {
@@ -331,6 +333,9 @@ export function createController(config) {
     probedSizes: new Map(),
     flushTimer: 0,
     batchPlans: [],
+    batchOk: new Map(),
+    batchFailed: new Map(),
+    selectedIds: [],
     /** 上一轮停机时没能下载的 entry 快照：只给「刷新后继续」用，不清清单、不重扫。 */
     haltedPending: [],
     /** 自动续跑已经用掉几次：用户新发起一批归零，续跑 / 重试继承当前计数。 */
@@ -779,7 +784,7 @@ export function createController(config) {
           report.ok += 1;
           // 探测结果先落进控制器自己的索引：对话框关闭后它才是落盘层的体积来源。
           if (isKnownSize(size) && entry.id !== null && entry.id !== undefined && entry.id !== '') {
-            state.probedSizes.set(String(entry.id), size);
+            state.probedSizes.set(String(entry.id), { href: entry.href, size });
           }
           api.setRowSize(entry.id, size);
         } else {
@@ -813,13 +818,14 @@ export function createController(config) {
     if (!summary) summary = await refreshSkips(null, null);
 
     let choice;
-    if (silentResume) {
-      // 重载后续跑（§3.3）：这次没有人能点选择框，等价于「对话框里全选、目录已选」。
+    const restoration = silentResume;
+    if (restoration) {
+      const selected = Array.isArray(restoration.selectedIds) ? new Set(restoration.selectedIds) : null;
       silentResume = false;
       // 重载之后没有人能勾选，按清单 + 磁盘比对取待办：盘上已有、清单说 done 的一律不重下。
       // （skipExisting:false 会把整批重下一遍，同名文件还会被 dedupePaths 加上 (2) 后缀。）
       choice = {
-        entries: state.entries,
+        entries: selected ? state.entries.filter(entry => selected.has(entryIdOf(entry))) : state.entries,
         dirHandle: state.resumeHandle || null,
         expectedBytes: 0,
         skipExisting: true
@@ -849,7 +855,14 @@ export function createController(config) {
         return null;
       }
     }
-    if (!choice || !Array.isArray(choice.entries) || !choice.entries.length) return null;
+    if (!choice || !Array.isArray(choice.entries)) return null;
+    if (!choice.entries.length) {
+      clearIntent();
+      return null;
+    }
+    state.batchOk.clear();
+    state.batchFailed.clear();
+    state.selectedIds = choice.entries.map(entryIdOf).filter(Boolean);
 
     const dirHandle = choice.dirHandle || null;
     state.dirHandle = dirHandle;
@@ -876,14 +889,26 @@ export function createController(config) {
     const signal = begin();
     try {
       const batch = await resolveBatch(choice, signal);
+      const previousDone = new Set(restoration?.completedIds || []);
+      const todo = new Set(batch);
+      const rows = [];
+      for (const entry of choice.entries) {
+        if (todo.has(entry)) rows.push(entry);
+        else if (previousDone.has(entryIdOf(entry))) {
+          state.batchOk.set(entryIdOf(entry), entry);
+          rows.push({ ...entry, status: 'done' });
+        }
+      }
+      callPanel('setFiles', rows);
       if (!batch.length) {
+        clearIntent();
         panel.setNotice('选中的 ' + choice.entries.length + ' 个文件都已存在，本次没有需要下载的内容。');
-        panel.showSummary({ ok: [], failed: [], aborted: false });
+        panel.showSummary(resultForPanel({ aborted: false }));
         return { ok: [], failed: [], aborted: false };
       }
       state.batchPlans = buildPlans(batch);
       panel.setState('downloading');
-      return await runBatchWithAutoResume(batch, dirHandle, signal, { seedFiles: true });
+      return await runBatchWithAutoResume(batch, dirHandle, signal);
     } catch (err) {
       panel.fail(signal.aborted ? '已取消' : describe(err));
       return null;
@@ -895,13 +920,9 @@ export function createController(config) {
   /** 本批次的零工作量证据：runDownload 写、finishDownload 读一次就清。 */
   let zeroWork = null;
 
-  async function runDownload(entries, dirHandle, signal, options) {
-    const opts = options || {};
+  async function runDownload(entries, dirHandle, signal) {
     const sink = await createSink({ settings, dirHandle, signal, total: entries.length, sizeOf: sizeOf });
     const fetcher = createFetcher({ signal });
-    // 种子行必须在 sink.download 之前、且只种这一次：panel 不为陌生 entryId 造行，
-    // 漏了这一步逐文件事件会全部落空。续跑（resumePending）传 seedFiles:false —— 列表原样保留。
-    if (opts.seedFiles !== false && typeof panel.setFiles === 'function') panel.setFiles(entries);
     // 每批次各一条：只打结构化对象，绝不打 URL（用户靠控制台 [bbdl] 前缀自查）。
     console.info('[bbdl] 开始下载', { sink: sink.kind, entries: entries.length });
     // 诊断（v2.5.3）：信号在批次开头就已经 aborted 的话，池子会一个 worker 都不启动
@@ -979,7 +1000,7 @@ export function createController(config) {
           '，成功 0、失败 0。请把控制台里 [bbdl] 开头的日志发给开发者。'
       );
     } else {
-      panel.showSummary(resultForPanel(result, state.haltedPending));
+      panel.showSummary(resultForPanel(result));
     }
     noticePartialPackages(result);
     // 降速提示放在最后：它是「本批次正在发生」的状态，盖住前一条静态提示也不会丢信息
@@ -1085,9 +1106,9 @@ export function createController(config) {
 
   function writeIntent(value) {
     try {
-      if (typeof intentStore.write === 'function') intentStore.write(value);
+      return typeof intentStore.write === 'function' && intentStore.write(value) !== false;
     } catch (err) {
-      /* 写不进就是这一次没有意图：不重载也绝不抛 */
+      return false;
     }
   }
 
@@ -1120,13 +1141,12 @@ export function createController(config) {
    * @param {any[]} entries
    * @param {any} dirHandle
    * @param {AbortSignal} signal
-   * @param {{ seedFiles?: boolean, finish?: Function }} [options]
+   * @param {{ finish?: Function }} [options]
    */
   async function runBatchWithAutoResume(entries, dirHandle, signal, options) {
     const opts = options || {};
     const finish = typeof opts.finish === 'function' ? opts.finish : finishDownload;
     let batch = entries;
-    let seedFiles = opts.seedFiles !== false;
     /** 本批次累计续跑次数：只在本次调用里计数，不写进 state。 */
     let resumes = 0;
     /** 连续零进展轮数：本轮下成过文件就归零。 */
@@ -1167,14 +1187,21 @@ export function createController(config) {
       // 先落库再写意图：重载会把内存里的待写记录整个丢掉。
       await flushRecords();
       const attempt = reloads + 1;
-      writeIntent({
+      const stored = writeIntent({
         courseId: courseId,
         contentId: contentId,
+        selectedIds: state.selectedIds,
+        completedIds: [...state.batchOk.keys()],
         pendingIds: pendingList.map(entryIdOf).filter(function (id) { return Boolean(id); }),
         dirName: dirHandle && dirHandle.name ? String(dirHandle.name) : '',
         createdAt: now(),
         reloads: attempt
       });
+      if (!stored) {
+        clearIntent();
+        notify(pausedNotice(pendingList.length));
+        return await settle(result);
+      }
       console.info('[bbdl] 自动重载续跑', { reloads: attempt });
       callPanel('setRecovering', { attempt: attempt });
       reload();
@@ -1182,12 +1209,28 @@ export function createController(config) {
       return new Promise(function () {});
     }
     for (;;) {
-      const result = await runDownload(batch, dirHandle, signal, { seedFiles: seedFiles });
+      const result = await runDownload(batch, dirHandle, signal);
       const halted = result ? result.halted : null;
+      const pendingIds = new Set((halted?.pending || []).map(entryIdOf));
+      for (const id of pendingIds) state.batchFailed.delete(id);
+      for (const failure of result?.failed || []) {
+        const key = entryIdOf(failure.entry || failure) || failure;
+        if (!pendingIds.has(key)) state.batchFailed.set(key, failure);
+      }
+      for (const entry of result?.ok || []) {
+        const key = entryIdOf(entry) || entry;
+        state.batchOk.set(key, entry);
+        state.batchFailed.delete(key);
+      }
       const aborted = Boolean((signal && signal.aborted) || (result && result.aborted));
       const pending = halted && Array.isArray(halted.pending) ? halted.pending : [];
       const target = pending.length ? pendingUrl(pending[0]) : '';
       // 停机那一刻只留一行诊断：面板文案里绝不出现「登录」（§1 文案红线）。
+      if (halted?.reason === 'server-blocked') {
+        clearIntent();
+        notify('服务器连续返回异常响应，已暂停，请稍后继续。');
+        return await settle(result);
+      }
       if (halted) console.info('[bbdl] 停机', { reason: halted.reason, pending: pending.length });
       // 没有 pending、拿不到地址、或不该续跑（用户取消 / 非会话过期 / 次数用尽）：走原来的收尾。
       if (!target || !shouldAutoResume({ halted: halted, aborted: aborted, used: state.autoResumeUsed, max: state.autoResumeMax })) {
@@ -1233,7 +1276,6 @@ export function createController(config) {
       }
       // 下一轮就是刚才 pending 的那几条：不重种行、不重扫。
       batch = pending;
-      seedFiles = false;
     }
   }
 
@@ -1269,7 +1311,7 @@ export function createController(config) {
     const from = Math.floor(Number(degraded.from));
     const to = Math.floor(Number(degraded.to));
     if (!Number.isFinite(from) || !Number.isFinite(to)) return;
-    if (to >= from) return; // 没真的降就别说话
+    if (result.halted || to >= from) return; // 没真的降就别说话
     panel.setNotice('服务器似乎在限流，已把并发从 ' + from + ' 降到 ' + to + ' 继续下载。');
   }
 
@@ -1289,16 +1331,8 @@ export function createController(config) {
     return pending;
   }
 
-  /** 停机时面板早退的那几条已经退回 waiting：它们既不是成功也不是失败，不能进失败清单。 */
-  function resultForPanel(result, pendingList) {
-    const res = result || { ok: [], failed: [], aborted: false };
-    const failed = Array.isArray(res.failed) ? res.failed : [];
-    if (!pendingList || !pendingList.length) return res;
-    const pendingIds = new Set(pendingList.map(entryIdOf));
-    const kept = failed.filter((item) => !pendingIds.has(entryIdOf(item && item.entry ? item.entry : item)));
-    if (kept.length === failed.length) return res;
-    // 只给面板一份摘过的副本：调用方拿到的仍是落盘层的原样结果。
-    return Object.assign({}, res, { failed: kept });
+  function resultForPanel(result) {
+    return { ...result, ok: [...state.batchOk.values()], failed: [...state.batchFailed.values()] };
   }
 
   function clearHaltedBanner() {
@@ -1325,7 +1359,7 @@ export function createController(config) {
     panel.setState('downloading');
     return (async function () {
       try {
-        return await runBatchWithAutoResume(pending, state.dirHandle, signal, { seedFiles: false });
+        return await runBatchWithAutoResume(pending, state.dirHandle, signal);
       } catch (err) {
         panel.fail(signal.aborted ? '已取消' : describe(err));
         return null;
@@ -1347,11 +1381,10 @@ export function createController(config) {
     try {
       // 重试批次一样可能撞上会话过期：自检 / 自动续跑 / 横幅 / 快照 / 摘要摘除都走同一条链。
       return await runBatchWithAutoResume(entries, state.dirHandle, state.abort.signal, {
-        seedFiles: true,
         finish(result) {
           const halted = result ? result.halted : null;
           state.haltedPending = rememberHalted(halted);
-          return resultForPanel(result, state.haltedPending);
+          return { ...resultForPanel(result), batchOkCount: state.batchOk.size };
         }
       });
     } finally {
@@ -1376,10 +1409,11 @@ export function createController(config) {
     if (!id) return undefined;
 
     const probed = state.probedSizes.get(id);
-    if (isKnownSize(probed)) return probed;
+    if (probed && probed.href === entry.href) return probed.size;
 
     const files = state.manifest && typeof state.manifest.files === 'object' ? state.manifest.files : null;
     const record = files && Object.prototype.hasOwnProperty.call(files, id) ? files[id] : null;
+    if (record?.href && entry.href && record.href !== entry.href) return undefined;
     const size = record ? record.size : null;
     return isKnownSize(size) ? size : undefined;
   }
@@ -1413,7 +1447,16 @@ export function createController(config) {
     scheduleFlush();
   }
 
+  let writing = Promise.resolve();
+  doc?.defaultView?.addEventListener('pagehide', flushRecords);
+  doc?.addEventListener?.('visibilitychange', () => {
+    if (doc.visibilityState === 'hidden') void flushRecords();
+  });
   function scheduleFlush() {
+    if (state.pendingRecords.length >= 8) {
+      void flushRecords();
+      return;
+    }
     if (state.flushTimer) return;
     state.flushTimer = setTimeout(function () {
       state.flushTimer = 0;
@@ -1427,26 +1470,32 @@ export function createController(config) {
       state.flushTimer = 0;
     }
     const records = state.pendingRecords;
-    if (!records.length) return state.manifest;
+    if (!records.length) {
+      await writing;
+      return state.manifest;
+    }
     state.pendingRecords = [];
 
     const now = Date.now();
+    let updated;
     try {
       if (updateRecords) {
         // 纯函数合并只更新内存：下一次算跳过立刻能用到最新状态。
-        state.manifest = updateRecords(state.manifest, state.batchPlans, records, now) || state.manifest;
+        updated = updateRecords(state.manifest, state.batchPlans, records, now);
+        if (updated) state.manifest = updated;
       }
     } catch (err) {
       /* 合并失败也要继续落库：清单持久化走 store.mergeFiles，下一次照样能据此跳过。 */
     }
 
     if (!store) return state.manifest;
-    try {
-      if (typeof store.mergeFiles === 'function') await store.mergeFiles(courseId, records);
-      else if (typeof store.saveManifest === 'function') await store.saveManifest(courseId, state.manifest);
-    } catch (err) {
-      /* 清单落库失败不影响下载结果：最多下次多下一次。 */
-    }
+    const snapshot = state.manifest;
+    const completed = records.map(record => updated?.files?.[record.id] || record);
+    writing = writing.then(() => safeCall(() => {
+      if (typeof store.mergeFiles === 'function') return store.mergeFiles(courseId, completed);
+      return store.saveManifest?.(courseId, snapshot);
+    }));
+    await writing;
     return state.manifest;
   }
 
@@ -1480,31 +1529,8 @@ export function createController(config) {
       unchanged: nonNegCount(summary.unchanged),
       unknown: nonNegCount(summary.unknown),
       stale: nonNegCount(summary.stale),
-      changedPaths: changedPathList(MAX_CHANGED_PATHS)
+      changedPaths: (state.skipResult?.changedPaths || []).slice(0, MAX_CHANGED_PATHS)
     };
-  }
-
-  /**
-   * 变更路径：planSkips 的 diff 只给计数、不给分类后的路径，所以这里取「这次要下发的计划」，
-   * 一条 path 出错的计划只跳过它自己。上限由调用方给，服务层不再截断。
-   */
-  function changedPathList(limit) {
-    const todo = state.skipResult && Array.isArray(state.skipResult.todo) ? state.skipResult.todo : [];
-    const out = [];
-    for (const plan of todo) {
-      if (out.length >= limit) break;
-      if (!plan || !plan.entry || plan.entry.id === null || plan.entry.id === undefined) continue;
-      const id = String(plan.entry.id);
-      if (!id) continue;
-      let path = '';
-      try {
-        path = relativePath(plan);
-      } catch (err) {
-        continue;
-      }
-      out.push({ id: id, path: path });
-    }
-    return out;
   }
 
   /**
@@ -1722,7 +1748,7 @@ export function createController(config) {
       const pendingIds = Array.isArray(intent.pendingIds) ? intent.pendingIds : [];
       const recorded = intent.courseId === null || intent.courseId === undefined ? '' : String(intent.courseId);
       // 过期或不是这门课：清掉不做（用户可能把这个标签页换成了另一门课）。
-      if (stale || recorded !== String(courseId)) {
+      if (stale || recorded !== String(courseId) || String(intent.contentId) !== String(contentId)) {
         clearIntent();
         return null;
       }
@@ -1741,7 +1767,7 @@ export function createController(config) {
       state.resumeHandle = handle;
       if (!state.entries.length) await startScan();
       if (!state.entries.length) return null;
-      silentResume = true;
+      silentResume = intent;
       try {
         return await startDownload();
       } finally {

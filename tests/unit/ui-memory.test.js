@@ -323,3 +323,13 @@ test('面板档位跟着真实 sink 走：缺省 zip，fallbackSink=files 才 do
   assert.deepEqual(fsa.panel.texts('setMode'), ['fs'], '有目录句柄不变');
   assert.deepEqual(fsa.panel.texts('setNotice').filter(Boolean), []);
 });
+
+test('文件换版后不使用旧版本的字节数做截断校验', async () => {
+  const entry = { ...ENTRIES[0], href: '/version2' };
+  const manifest = { files: { e1: { ...MANIFEST.files.e1, href: '/version1' } } };
+  const h = harness({ entries: [entry], manifest });
+  await h.controller.ready;
+  await h.controller.startScan();
+  await h.controller.startDownload();
+  assert.equal(h.rec.sinkOpts.sizeOf(entry), undefined);
+});

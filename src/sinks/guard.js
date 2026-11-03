@@ -13,6 +13,19 @@ export const DEFAULT_IDLE_MS = 30000;
  * 它和调用方传入的 attempts（普通预算）互不占用 —— 限流不该吃掉「文件坏了再来一次」的额度。
  */
 export const SUSPECT_ATTEMPTS = 3;
+
+export class ServerBlockedError extends Error {}
+
+/** 一轮下载共享预算。成功的文件解除连续异常；触发暂停后只允许在途请求收尾。 */
+export function createSuspectBudget() {
+  let consecutive = 0;
+  let blocked = false;
+  return {
+    check() { if (blocked) throw new ServerBlockedError(); },
+    suspect() { if (++consecutive >= 3) blocked = true; },
+    success() { consecutive = 0; }
+  };
+}
 /** 可疑重试的退避（毫秒）：不做随机抖动，限流下要的是慢下来，不是被打散。 */
 export const SUSPECT_DELAYS = [1500, 4000, 8000];
 /** 可疑重试的固定文案：面板据此显示「重试中（第 N 次）」，绝不带 URL。 */
@@ -195,7 +208,7 @@ function notify(onRetry, info) {
  * - 任何一本账耗尽就结束，并把最后一次错误原样抛出。
  * AbortError 立即透传（用户取消不该被重试掩盖）；每次重试前先回调 onRetry。
  */
-export async function withFileRetry(fn, { attempts = 2, isRetriable = isRetriableError, onRetry, sleep = waitMs } = {}) {
+export async function withFileRetry(fn, { attempts = 2, isRetriable = isRetriableError, onRetry, budget, sleep = waitMs } = {}) {
   const total = countOf(attempts, 1);
   const suspectTotal = SUSPECT_ATTEMPTS;
   let attempt = 0;
@@ -204,10 +217,15 @@ export async function withFileRetry(fn, { attempts = 2, isRetriable = isRetriabl
   for (;;) {
     attempt += 1;
     try {
-      return await fn(attempt);
+      budget?.check();
+      const result = await fn(attempt);
+      budget?.success();
+      return result;
     } catch (err) {
-      if (isAbortLike(err)) throw err;
+      if (isAbortLike(err) || err instanceof ServerBlockedError) throw err;
       if (isSuspectResponse(err)) {
+        budget?.suspect();
+        budget?.check();
         if (!isRetriable(err)) throw err;
         suspect += 1;
         if (suspect >= suspectTotal) throw err;

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BB 课件批量下载
 // @namespace    bb-bulk-course-downloader
-// @version      2.8.0
+// @version      2.8.1
 // @description  扫描 Blackboard 课程内容，勾选后按原始目录结构批量下载课件
 // @updateURL    https://raw.githubusercontent.com/berserkross/bb-bulk-course-downloader/main/bb-bulk-course-downloader.user.js
 // @downloadURL  https://raw.githubusercontent.com/berserkross/bb-bulk-course-downloader/main/bb-bulk-course-downloader.user.js
@@ -560,6 +560,7 @@
     const files3 = manifest && manifest.files && typeof manifest.files === "object" ? manifest.files : {};
     const uncertain = disk.truncated === true || scanFailed === true;
     const todo = [];
+    const changedPaths = [];
     const skip = [];
     const matched = /* @__PURE__ */ new Set();
     const diff = { added: 0, changed: 0, moved: 0, unchanged: 0, stale: 0, unknown: 0, total: list.length };
@@ -579,7 +580,13 @@
       const hrefOverwritten = statusDone && prevHref !== "" && href !== "" && prevHref !== href;
       if (hrefOverwritten) {
         todo.push(plan);
+        changedPaths.push({ id, path });
         diff.changed += 1;
+        continue;
+      }
+      if (record && !statusDone) {
+        todo.push(plan);
+        diff.unknown += 1;
         continue;
       }
       if (disk.has(path)) {
@@ -592,13 +599,10 @@
             continue;
           }
           todo.push(plan);
-          if (statusDone) diff.changed += 1;
-          else diff.unknown += 1;
-          continue;
-        }
-        if (record && record.status !== "done") {
-          todo.push(plan);
-          diff.unknown += 1;
+          if (statusDone) {
+            changedPaths.push({ id, path });
+            diff.changed += 1;
+          } else diff.unknown += 1;
           continue;
         }
         if (uncertain) {
@@ -613,11 +617,6 @@
       if (verdict === "added") {
         todo.push(plan);
         diff.added += 1;
-        continue;
-      }
-      if (verdict === "changed") {
-        todo.push(plan);
-        diff.changed += 1;
         continue;
       }
       if (verdict === "moved") {
@@ -639,7 +638,7 @@
       stale.push({ id, path: recordPath(files3[id]) });
     }
     diff.stale = stale.length;
-    return { todo, skip, stale, diff };
+    return { todo, skip, stale, diff, changedPaths };
   }
   var init_manifest_plan = __esm({
     "src/store/manifest-plan.js"() {
@@ -731,6 +730,7 @@
       courseId: source && source.courseId ? String(source.courseId) : "",
       version: MANIFEST_VERSION,
       updatedAt: stamp(now),
+      ...Array.isArray(source?.scans) ? { scans: source.scans } : {},
       files: files3
     };
   }
@@ -1595,7 +1595,7 @@
       return parseContentList(parseHtml(html), response.url || job.url);
     }
     async function run() {
-      const files3 = [];
+      const pages = /* @__PURE__ */ new Map();
       const visited = /* @__PURE__ */ new Set();
       const seenFileUrls = /* @__PURE__ */ new Set();
       failures = [];
@@ -1610,7 +1610,7 @@
       function report() {
         if (typeof onProgress !== "function") return;
         try {
-          onProgress({ foldersDone, foldersQueued: pending, filesFound: files3.length });
+          onProgress({ foldersDone, foldersQueued: pending, filesFound: seenFileUrls.size });
         } catch {
         }
       }
@@ -1623,11 +1623,8 @@
         }
       }
       function accept(job, parsed) {
-        for (const file of parsed.files) {
-          if (seenFileUrls.has(file.url)) continue;
-          seenFileUrls.add(file.url);
-          files3.push(Object.assign({}, file, { folderPath: job.folderPath.slice() }));
-        }
+        pages.set(job.id, parsed);
+        for (const file of parsed.files) seenFileUrls.add(file.url);
         for (const folder of parsed.folders) {
           if (!folder.id || visited.has(folder.id)) continue;
           visited.add(folder.id);
@@ -1680,6 +1677,26 @@
       }
       if (pending > 0) await done;
       if (fatal) throw fatal;
+      const files3 = [];
+      const queue = [rootJob];
+      visited.clear();
+      visited.add(rootJob.id);
+      seenFileUrls.clear();
+      for (let i = 0; i < queue.length; i++) {
+        const { id, folderPath } = queue[i];
+        const page = pages.get(id);
+        if (!page) continue;
+        for (const file of page.files) {
+          if (seenFileUrls.has(file.url)) continue;
+          seenFileUrls.add(file.url);
+          files3.push({ ...file, folderPath: folderPath.slice() });
+        }
+        for (const folder of page.folders) {
+          if (!folder.id || visited.has(folder.id)) continue;
+          visited.add(folder.id);
+          queue.push({ id: folder.id, folderPath: folderPath.concat(String(folder.name || folder.id)) });
+        }
+      }
       return files3;
     }
     return {
@@ -1803,6 +1820,23 @@
   // src/sinks/guard.js
   var DEFAULT_IDLE_MS = 3e4;
   var SUSPECT_ATTEMPTS = 3;
+  var ServerBlockedError = class extends Error {
+  };
+  function createSuspectBudget() {
+    let consecutive = 0;
+    let blocked = false;
+    return {
+      check() {
+        if (blocked) throw new ServerBlockedError();
+      },
+      suspect() {
+        if (++consecutive >= 3) blocked = true;
+      },
+      success() {
+        consecutive = 0;
+      }
+    };
+  }
   var SUSPECT_DELAYS = [1500, 4e3, 8e3];
   var RETRY_SUSPECT_TEXT = "\u670D\u52A1\u5668\u8FD4\u56DE\u5F02\u5E38\u9875\u9762\uFF0C\u7A0D\u540E\u91CD\u8BD5";
   var RETRIABLE_STATUS = /* @__PURE__ */ new Set([429, 500, 502, 503, 504]);
@@ -1922,7 +1956,7 @@
     } catch {
     }
   }
-  async function withFileRetry(fn, { attempts = 2, isRetriable = isRetriableError, onRetry, sleep: sleep2 = waitMs } = {}) {
+  async function withFileRetry(fn, { attempts = 2, isRetriable = isRetriableError, onRetry, budget, sleep: sleep2 = waitMs } = {}) {
     const total = countOf(attempts, 1);
     const suspectTotal = SUSPECT_ATTEMPTS;
     let attempt = 0;
@@ -1931,10 +1965,15 @@
     for (; ; ) {
       attempt += 1;
       try {
-        return await fn(attempt);
+        budget?.check();
+        const result = await fn(attempt);
+        budget?.success();
+        return result;
       } catch (err) {
-        if (isAbortLike(err)) throw err;
+        if (isAbortLike(err) || err instanceof ServerBlockedError) throw err;
         if (isSuspectResponse(err)) {
+          budget?.suspect();
+          budget?.check();
           if (!isRetriable(err)) throw err;
           suspect += 1;
           if (suspect >= suspectTotal) throw err;
@@ -2042,7 +2081,7 @@
       }
       return written;
     }
-    function writeEntry(fetcher, entry, plan, onChunk, { onRetry, onAttempt, onFileRetry, rollback, onName } = {}) {
+    function writeEntry(fetcher, entry, plan, onChunk, { budget, onRetry, onAttempt, onFileRetry, rollback, onName } = {}) {
       let attemptBytes = 0;
       return withFileRetry(
         // withFileRetry 把「本次是第几次」交回来：attempt 计数天然按文件各一份，并发下互不污染
@@ -2061,6 +2100,7 @@
           );
         },
         {
+          budget,
           attempts: 1 + fileRetries,
           onRetry: (info) => {
             if (typeof rollback === "function") rollback(attemptBytes);
@@ -2088,6 +2128,7 @@
       const control = createControl();
       let aborted = false;
       let degraded = null;
+      const budget = createSuspectBudget();
       let workerStarted = 0;
       const emit = (state, path, entryId = "", force = false) => report(progressPayload(progress, state, path, entryId), force);
       emit("start", "", "", true);
@@ -2122,6 +2163,7 @@
                 emit("progress", label, entryId, false);
               },
               {
+                budget,
                 onName,
                 // 重试会把上一次 abort 掉的字节扣回去，bytesDone 才等于最终落盘量
                 rollback: (n) => progress.rollbackBytes(n),
@@ -2150,6 +2192,10 @@
             if (signal && signal.aborted || isAbort2(err)) {
               aborted = true;
               emit("aborted", label, entryId, true);
+              return;
+            }
+            if (err instanceof ServerBlockedError) {
+              control.stop("server-blocked");
               return;
             }
             if (isSessionExpiredError(err)) {
@@ -2303,6 +2349,7 @@
       const control = createControl();
       let aborted = false;
       let degraded = null;
+      const budget = createSuspectBudget();
       const emit = (state, path, entryId = "", force = false) => report(progressPayload(progress, state, path, entryId), force);
       emit("start", "", "", true);
       async function attemptOnce(entry, deliver) {
@@ -2367,6 +2414,7 @@
                 return attemptOnce(entry, deliver);
               },
               {
+                budget,
                 attempts: 1 + fileRetries,
                 // 只报状态，不改旧字段：'file-retry' 是新增字符串，UI 认识就显示、不认识就忽略
                 onRetry: (info) => {
@@ -2397,6 +2445,10 @@
             if (signal && signal.aborted || isAbort2(err)) {
               aborted = true;
               emit("aborted", label, entryId, true);
+              return;
+            }
+            if (err instanceof ServerBlockedError) {
+              control.stop("server-blocked");
               return;
             }
             if (isSessionExpiredError(err)) {
@@ -2764,8 +2816,20 @@
       let aborted = false;
       let halted = null;
       let degraded = null;
+      const budget = createSuspectBudget();
       let cursor = 0;
       const emit = (state, path, entryId = "", force = false) => report(progressPayload(progress, state, path, entryId), force);
+      const buffered = [];
+      async function deliver(pkg) {
+        const delivered = await flushPackage(pkg);
+        for (const { entry, label, entryId } of buffered) {
+          ok.push(entry);
+          progress.endFile(false);
+          emit("file-done", label, entryId, true);
+        }
+        buffered.length = 0;
+        return delivered;
+      }
       const stopNow = () => aborted || halted !== null;
       emit("start", "", "", true);
       for (const group of groups) {
@@ -2793,7 +2857,7 @@
             continue;
           }
           if (shouldCut(pkg, plannedNameLength, known)) {
-            await flushPackage(pkg);
+            await deliver(pkg);
             pkg = newPackage(group.name);
             missing = 0;
           }
@@ -2825,6 +2889,7 @@
                 );
               },
               {
+                budget,
                 attempts: 1 + fileRetries,
                 // 会话过期永不重试：isRetriableError 对它返回 false（§2），这里显式传一遍让契约可见
                 isRetriable: isRetriableError,
@@ -2858,18 +2923,16 @@
             pkg.bytes += DESCRIPTOR_SIZE;
             pkg.cdBytes += CENTRAL_HEADER_SIZE + nameLength;
             pkg.entries.push({ name, crc, size, offset, time: stamp2.time, date: stamp2.date });
-            ok.push(entry);
-            progress.endFile(false);
+            buffered.push({ entry, label, entryId });
             emitFile({ type: "done", entryId, path: label, name, bytes: size });
-            emit("file-done", label, entryId, true);
           } catch (err) {
             if (signal && signal.aborted || isAbort2(err)) {
               aborted = true;
               emit("aborted", label, entryId, true);
               break;
             }
-            if (err && err.name === "SessionExpiredError") {
-              halted = { reason: "session-expired", pending: ordered.slice(cursor).map((item) => item.entry) };
+            if (err instanceof ServerBlockedError || err?.name === "SessionExpiredError") {
+              halted = { reason: err instanceof ServerBlockedError ? "server-blocked" : "session-expired", pending: ordered.slice(cursor).map((item) => item.entry) };
               emit("halt", label, entryId, true);
               break;
             }
@@ -2884,7 +2947,7 @@
           cursor += 1;
         }
         const savedCount = pkg.entries.length;
-        const delivered = await flushPackage(pkg);
+        const delivered = await deliver(pkg);
         if (delivered && savedCount > 0 && missing > 0) {
           partialPackages.push({ name: delivered.name, saved: savedCount, missing });
         }
@@ -4254,7 +4317,7 @@
     let watchdog = 0;
     let destroyed = false;
     let sample = null;
-    let retryState = { path: "", count: 0 };
+    const retries = /* @__PURE__ */ new Map();
     let summaryState = { ok: 0, failed: [], aborted: false };
     let fileOrder = [];
     let fileMap = /* @__PURE__ */ new Map();
@@ -4591,7 +4654,11 @@
       const ratio = bytesTotal > 0 ? bytesDone / bytesTotal : filesTotal > 0 ? filesDone / filesTotal : 0;
       setBar(ratio * 100);
       let text = progressLine(p, sample);
-      retryState = trackRetry(retryState, p);
+      if (p.state === "start") retries.clear();
+      const key = p.entryId || p.currentPath || p.path || "";
+      const retryState = trackRetry(retries.get(key), p);
+      if (retryState.count) retries.set(key, retryState);
+      else retries.delete(key);
       text += retryLine(retryState, text);
       if (failedCount) text += " \xB7 \u5931\u8D25 " + failedCount;
       progressTextEl.textContent = text;
@@ -4659,7 +4726,7 @@
     }
     const MODE_TEXT = {
       fs: "\u843D\u76D8\u65B9\u5F0F\uFF1A\u4FDD\u5B58\u5230\u6587\u4EF6\u5939\uFF08Chromium\uFF09\u2014\u2014\u76F4\u63A5\u5199\u5165\u4F60\u9009\u7684\u76EE\u5F55\uFF0C\u4FDD\u7559\u539F\u76EE\u5F55\u7ED3\u6784\u3002\u4EE3\u4EF7\uFF1A\u6BCF\u6B21\u4E0B\u8F7D\u90FD\u8981\u91CD\u65B0\u9009\u4E00\u6B21\u6587\u4EF6\u5939\uFF0C\u4E14\u53EA\u6709 Chromium \u7CFB\u6D4F\u89C8\u5668\u652F\u6301\u3002",
-      zip: "\u843D\u76D8\u65B9\u5F0F\uFF1A\u6309\u6587\u4EF6\u5939\u6253\u5305\u6210 .zip\uFF08\u5B58\u5230\u6D4F\u89C8\u5668\u9ED8\u8BA4\u4E0B\u8F7D\u76EE\u5F55\uFF09\u2014\u2014\u6CA1\u6709\u76EE\u5F55\u5199\u5165\u6743\u9650\u65F6\u81EA\u52A8\u9000\u5230\u8FD9\u79CD\u65B9\u5F0F\uFF0C\u89E3\u538B\u540E\u5373\u53EF\u8FD8\u539F\u539F\u76EE\u5F55\u7ED3\u6784\u3002\u4EE3\u4EF7\uFF1A\u6309\u9876\u5C42\u6587\u4EF6\u5939\u5206\u5305\uFF0C\u5355\u5305\u4E0A\u9650\u7EA6 200 MB\uFF0C\u4E14\u4EFB\u4F55\u4E00\u6B21\u5931\u8D25\u90FD\u8981\u91CD\u4E0B\u8BE5\u5305\u91CC\u7684\u6587\u4EF6\u3002",
+      zip: "\u843D\u76D8\u65B9\u5F0F\uFF1A\u6309\u6587\u4EF6\u5939\u6253\u5305\u6210 .zip\uFF08\u5B58\u5230\u6D4F\u89C8\u5668\u9ED8\u8BA4\u4E0B\u8F7D\u76EE\u5F55\uFF09\u2014\u2014\u6CA1\u6709\u76EE\u5F55\u5199\u5165\u6743\u9650\u65F6\u81EA\u52A8\u9000\u5230\u8FD9\u79CD\u65B9\u5F0F\uFF0C\u89E3\u538B\u540E\u5373\u53EF\u8FD8\u539F\u539F\u76EE\u5F55\u7ED3\u6784\u3002ZIP \u5E76\u53D1\u4E3A 1\uFF0C\u9010\u4E2A\u8BFB\u53D6\u5E76\u5C01\u5305\u3002\u5305\u5185\u90E8\u5206\u6587\u4EF6\u5931\u8D25\u65F6\uFF0C\u53EF\u4EE5\u5355\u72EC\u91CD\u8BD5\u7F3A\u5C11\u7684\u6587\u4EF6\u3002",
       download: "\u843D\u76D8\u65B9\u5F0F\uFF1A\u9010\u6587\u4EF6\u4E0B\u8F7D\uFF08\u8FDB\u6D4F\u89C8\u5668\u9ED8\u8BA4\u4E0B\u8F7D\u76EE\u5F55\uFF09\u2014\u2014\u7F51\u9875\u62FF\u4E0D\u5230\u76EE\u5F55\u5199\u6743\u9650\uFF0C\u6587\u4EF6\u540D\u7528 folder__ \u524D\u7F00\u4EE3\u66FF\u5B50\u76EE\u5F55\u3002\u4EE3\u4EF7\uFF1A\u6240\u6709\u6587\u4EF6\u90FD\u843D\u5728\u9ED8\u8BA4\u4E0B\u8F7D\u76EE\u5F55\u91CC\uFF0C\u65E0\u6CD5\u5EFA\u5B50\u76EE\u5F55\uFF0C\u6587\u4EF6\u591A\u65F6\u4F1A\u8FDE\u7EED\u5F39\u51FA\u591A\u4E2A\u4E0B\u8F7D\u3002\u53E6\u5916\u8FD9\u91CC\u53EA\u80FD\u6309\u4E0B\u8F7D\u6E05\u5355\u8DF3\u8FC7\u5DF2\u4E0B\u8FC7\u7684\u6587\u4EF6\uFF0C\u65E0\u6CD5\u6838\u5B9E\u78C1\u76D8\u6587\u4EF6\u3002"
     };
     function setMode(kind) {
@@ -4806,7 +4873,7 @@
           }
           const okList = Array.isArray(result.ok) ? result.ok : [];
           const failed = Array.isArray(result.failed) ? result.failed : [];
-          summaryState = { ok: summaryState.ok + okList.length, failed, aborted: !!result.aborted };
+          summaryState = { ok: result.batchOkCount ?? summaryState.ok + okList.length, failed, aborted: !!result.aborted };
           renderSummary();
           render(failed.length ? "error" : "done", failed.length ? { message: "\u91CD\u8BD5\u540E\u4ECD\u6709 " + failed.length + " \u4E2A\u6587\u4EF6\u5931\u8D25\u3002" } : {});
         },
@@ -6130,8 +6197,11 @@
       write(value) {
         try {
           const store = bucket();
-          if (store) store.setItem(INTENT_KEY, JSON.stringify(value));
+          if (!store) return false;
+          store.setItem(INTENT_KEY, JSON.stringify(value));
+          return true;
         } catch (err) {
+          return false;
         }
       },
       clear() {
@@ -6281,6 +6351,9 @@
       probedSizes: /* @__PURE__ */ new Map(),
       flushTimer: 0,
       batchPlans: [],
+      batchOk: /* @__PURE__ */ new Map(),
+      batchFailed: /* @__PURE__ */ new Map(),
+      selectedIds: [],
       /** 上一轮停机时没能下载的 entry 快照：只给「刷新后继续」用，不清清单、不重扫。 */
       haltedPending: [],
       /** 自动续跑已经用掉几次：用户新发起一批归零，续跑 / 重试继承当前计数。 */
@@ -6626,7 +6699,7 @@
           if (typeof size === "number") {
             report.ok += 1;
             if (isKnownSize(size) && entry.id !== null && entry.id !== void 0 && entry.id !== "") {
-              state.probedSizes.set(String(entry.id), size);
+              state.probedSizes.set(String(entry.id), { href: entry.href, size });
             }
             api.setRowSize(entry.id, size);
           } else {
@@ -6649,10 +6722,12 @@
       let summary = state.skipSummary;
       if (!summary) summary = await refreshSkips(null, null);
       let choice;
-      if (silentResume) {
+      const restoration = silentResume;
+      if (restoration) {
+        const selected = Array.isArray(restoration.selectedIds) ? new Set(restoration.selectedIds) : null;
         silentResume = false;
         choice = {
-          entries: state.entries,
+          entries: selected ? state.entries.filter((entry) => selected.has(entryIdOf2(entry))) : state.entries,
           dirHandle: state.resumeHandle || null,
           expectedBytes: 0,
           skipExisting: true
@@ -6684,7 +6759,14 @@
           return null;
         }
       }
-      if (!choice || !Array.isArray(choice.entries) || !choice.entries.length) return null;
+      if (!choice || !Array.isArray(choice.entries)) return null;
+      if (!choice.entries.length) {
+        clearIntent();
+        return null;
+      }
+      state.batchOk.clear();
+      state.batchFailed.clear();
+      state.selectedIds = choice.entries.map(entryIdOf2).filter(Boolean);
       const dirHandle = choice.dirHandle || null;
       state.dirHandle = dirHandle;
       state.expectedBytes = typeof choice.expectedBytes === "number" ? choice.expectedBytes : 0;
@@ -6701,14 +6783,26 @@
       const signal = begin();
       try {
         const batch = await resolveBatch(choice, signal);
+        const previousDone = new Set(restoration?.completedIds || []);
+        const todo = new Set(batch);
+        const rows = [];
+        for (const entry of choice.entries) {
+          if (todo.has(entry)) rows.push(entry);
+          else if (previousDone.has(entryIdOf2(entry))) {
+            state.batchOk.set(entryIdOf2(entry), entry);
+            rows.push({ ...entry, status: "done" });
+          }
+        }
+        callPanel("setFiles", rows);
         if (!batch.length) {
+          clearIntent();
           panel.setNotice("\u9009\u4E2D\u7684 " + choice.entries.length + " \u4E2A\u6587\u4EF6\u90FD\u5DF2\u5B58\u5728\uFF0C\u672C\u6B21\u6CA1\u6709\u9700\u8981\u4E0B\u8F7D\u7684\u5185\u5BB9\u3002");
-          panel.showSummary({ ok: [], failed: [], aborted: false });
+          panel.showSummary(resultForPanel({ aborted: false }));
           return { ok: [], failed: [], aborted: false };
         }
         state.batchPlans = buildPlans(batch);
         panel.setState("downloading");
-        return await runBatchWithAutoResume(batch, dirHandle, signal, { seedFiles: true });
+        return await runBatchWithAutoResume(batch, dirHandle, signal);
       } catch (err) {
         panel.fail(signal.aborted ? "\u5DF2\u53D6\u6D88" : describe(err));
         return null;
@@ -6717,11 +6811,9 @@
       }
     }
     let zeroWork = null;
-    async function runDownload(entries, dirHandle, signal, options) {
-      const opts = options || {};
+    async function runDownload(entries, dirHandle, signal) {
       const sink = await createSink2({ settings, dirHandle, signal, total: entries.length, sizeOf });
       const fetcher = createFetcher2({ signal });
-      if (opts.seedFiles !== false && typeof panel.setFiles === "function") panel.setFiles(entries);
       console.info("[bbdl] \u5F00\u59CB\u4E0B\u8F7D", { sink: sink.kind, entries: entries.length });
       console.info("[bbdl] \u6279\u6B21\u5F00\u59CB", {
         sink: sink.kind,
@@ -6780,7 +6872,7 @@
           "\u6CA1\u6709\u5F00\u59CB\u4EFB\u4F55\u6587\u4EF6\uFF1A\u63D0\u4EA4 " + zero.entries + " \u4E2A\u6587\u4EF6\uFF0C\u843D\u76D8\u65B9\u5F0F\uFF1A" + sinkLabel(zero.sink) + "\uFF0C\u6210\u529F 0\u3001\u5931\u8D25 0\u3002\u8BF7\u628A\u63A7\u5236\u53F0\u91CC [bbdl] \u5F00\u5934\u7684\u65E5\u5FD7\u53D1\u7ED9\u5F00\u53D1\u8005\u3002"
         );
       } else {
-        panel.showSummary(resultForPanel(result, state.haltedPending));
+        panel.showSummary(resultForPanel(result));
       }
       noticePartialPackages(result);
       noticeDegraded(result);
@@ -6863,8 +6955,9 @@
     }
     function writeIntent(value) {
       try {
-        if (typeof intentStore.write === "function") intentStore.write(value);
+        return typeof intentStore.write === "function" && intentStore.write(value) !== false;
       } catch (err) {
+        return false;
       }
     }
     function clearIntent() {
@@ -6882,7 +6975,6 @@
       const opts = options || {};
       const finish = typeof opts.finish === "function" ? opts.finish : finishDownload;
       let batch = entries;
-      let seedFiles = opts.seedFiles !== false;
       let resumes = 0;
       let zeroProgress = 0;
       function notify2(text) {
@@ -6912,9 +7004,11 @@
         }
         await flushRecords();
         const attempt = reloads + 1;
-        writeIntent({
+        const stored = writeIntent({
           courseId,
           contentId,
+          selectedIds: state.selectedIds,
+          completedIds: [...state.batchOk.keys()],
           pendingIds: pendingList.map(entryIdOf2).filter(function(id) {
             return Boolean(id);
           }),
@@ -6922,6 +7016,11 @@
           createdAt: now(),
           reloads: attempt
         });
+        if (!stored) {
+          clearIntent();
+          notify2(pausedNotice(pendingList.length));
+          return await settle2(result);
+        }
         console.info("[bbdl] \u81EA\u52A8\u91CD\u8F7D\u7EED\u8DD1", { reloads: attempt });
         callPanel("setRecovering", { attempt });
         reload();
@@ -6929,11 +7028,27 @@
         });
       }
       for (; ; ) {
-        const result = await runDownload(batch, dirHandle, signal, { seedFiles });
+        const result = await runDownload(batch, dirHandle, signal);
         const halted = result ? result.halted : null;
+        const pendingIds = new Set((halted?.pending || []).map(entryIdOf2));
+        for (const id of pendingIds) state.batchFailed.delete(id);
+        for (const failure of result?.failed || []) {
+          const key = entryIdOf2(failure.entry || failure) || failure;
+          if (!pendingIds.has(key)) state.batchFailed.set(key, failure);
+        }
+        for (const entry of result?.ok || []) {
+          const key = entryIdOf2(entry) || entry;
+          state.batchOk.set(key, entry);
+          state.batchFailed.delete(key);
+        }
         const aborted = Boolean(signal && signal.aborted || result && result.aborted);
         const pending = halted && Array.isArray(halted.pending) ? halted.pending : [];
         const target = pending.length ? pendingUrl(pending[0]) : "";
+        if (halted?.reason === "server-blocked") {
+          clearIntent();
+          notify2("\u670D\u52A1\u5668\u8FDE\u7EED\u8FD4\u56DE\u5F02\u5E38\u54CD\u5E94\uFF0C\u5DF2\u6682\u505C\uFF0C\u8BF7\u7A0D\u540E\u7EE7\u7EED\u3002");
+          return await settle2(result);
+        }
         if (halted) console.info("[bbdl] \u505C\u673A", { reason: halted.reason, pending: pending.length });
         if (!target || !shouldAutoResume({ halted, aborted, used: state.autoResumeUsed, max: state.autoResumeMax })) {
           if (aborted || !halted) clearIntent();
@@ -6969,7 +7084,6 @@
           return await settle2(result);
         }
         batch = pending;
-        seedFiles = false;
       }
     }
     function noticePartialPackages(result) {
@@ -6992,7 +7106,7 @@
       const from = Math.floor(Number(degraded.from));
       const to = Math.floor(Number(degraded.to));
       if (!Number.isFinite(from) || !Number.isFinite(to)) return;
-      if (to >= from) return;
+      if (result.halted || to >= from) return;
       panel.setNotice("\u670D\u52A1\u5668\u4F3C\u4E4E\u5728\u9650\u6D41\uFF0C\u5DF2\u628A\u5E76\u53D1\u4ECE " + from + " \u964D\u5230 " + to + " \u7EE7\u7EED\u4E0B\u8F7D\u3002");
     }
     function rememberHalted(halted) {
@@ -7005,14 +7119,8 @@
       if (typeof panel.setHalted === "function") panel.setHalted({ reason: halted.reason, pendingCount });
       return pending;
     }
-    function resultForPanel(result, pendingList) {
-      const res = result || { ok: [], failed: [], aborted: false };
-      const failed = Array.isArray(res.failed) ? res.failed : [];
-      if (!pendingList || !pendingList.length) return res;
-      const pendingIds = new Set(pendingList.map(entryIdOf2));
-      const kept = failed.filter((item) => !pendingIds.has(entryIdOf2(item && item.entry ? item.entry : item)));
-      if (kept.length === failed.length) return res;
-      return Object.assign({}, res, { failed: kept });
+    function resultForPanel(result) {
+      return { ...result, ok: [...state.batchOk.values()], failed: [...state.batchFailed.values()] };
     }
     function clearHaltedBanner() {
       if (typeof panel.clearHalted === "function") panel.clearHalted();
@@ -7031,7 +7139,7 @@
       panel.setState("downloading");
       return async function() {
         try {
-          return await runBatchWithAutoResume(pending, state.dirHandle, signal, { seedFiles: false });
+          return await runBatchWithAutoResume(pending, state.dirHandle, signal);
         } catch (err) {
           panel.fail(signal.aborted ? "\u5DF2\u53D6\u6D88" : describe(err));
           return null;
@@ -7049,11 +7157,10 @@
       panel.setState("downloading");
       try {
         return await runBatchWithAutoResume(entries, state.dirHandle, state.abort.signal, {
-          seedFiles: true,
           finish(result) {
             const halted = result ? result.halted : null;
             state.haltedPending = rememberHalted(halted);
-            return resultForPanel(result, state.haltedPending);
+            return { ...resultForPanel(result), batchOkCount: state.batchOk.size };
           }
         });
       } finally {
@@ -7068,9 +7175,10 @@
       const id = entry && entry.id !== null && entry.id !== void 0 ? String(entry.id) : "";
       if (!id) return void 0;
       const probed = state.probedSizes.get(id);
-      if (isKnownSize(probed)) return probed;
+      if (probed && probed.href === entry.href) return probed.size;
       const files3 = state.manifest && typeof state.manifest.files === "object" ? state.manifest.files : null;
       const record = files3 && Object.prototype.hasOwnProperty.call(files3, id) ? files3[id] : null;
+      if (record?.href && entry.href && record.href !== entry.href) return void 0;
       const size = record ? record.size : null;
       return isKnownSize(size) ? size : void 0;
     }
@@ -7093,7 +7201,16 @@
       state.pendingRecords.push(record);
       scheduleFlush();
     }
+    let writing = Promise.resolve();
+    doc?.defaultView?.addEventListener("pagehide", flushRecords);
+    doc?.addEventListener?.("visibilitychange", () => {
+      if (doc.visibilityState === "hidden") void flushRecords();
+    });
     function scheduleFlush() {
+      if (state.pendingRecords.length >= 8) {
+        void flushRecords();
+        return;
+      }
       if (state.flushTimer) return;
       state.flushTimer = setTimeout(function() {
         state.flushTimer = 0;
@@ -7106,21 +7223,28 @@
         state.flushTimer = 0;
       }
       const records = state.pendingRecords;
-      if (!records.length) return state.manifest;
+      if (!records.length) {
+        await writing;
+        return state.manifest;
+      }
       state.pendingRecords = [];
       const now2 = Date.now();
+      let updated;
       try {
         if (updateRecords2) {
-          state.manifest = updateRecords2(state.manifest, state.batchPlans, records, now2) || state.manifest;
+          updated = updateRecords2(state.manifest, state.batchPlans, records, now2);
+          if (updated) state.manifest = updated;
         }
       } catch (err) {
       }
       if (!store) return state.manifest;
-      try {
-        if (typeof store.mergeFiles === "function") await store.mergeFiles(courseId, records);
-        else if (typeof store.saveManifest === "function") await store.saveManifest(courseId, state.manifest);
-      } catch (err) {
-      }
+      const snapshot = state.manifest;
+      const completed = records.map((record) => updated?.files?.[record.id] || record);
+      writing = writing.then(() => safeCall(() => {
+        if (typeof store.mergeFiles === "function") return store.mergeFiles(courseId, completed);
+        return store.saveManifest?.(courseId, snapshot);
+      }));
+      await writing;
       return state.manifest;
     }
     function pageTitle(doc2) {
@@ -7145,26 +7269,8 @@
         unchanged: nonNegCount2(summary.unchanged),
         unknown: nonNegCount2(summary.unknown),
         stale: nonNegCount2(summary.stale),
-        changedPaths: changedPathList(MAX_CHANGED_PATHS)
+        changedPaths: (state.skipResult?.changedPaths || []).slice(0, MAX_CHANGED_PATHS)
       };
-    }
-    function changedPathList(limit) {
-      const todo = state.skipResult && Array.isArray(state.skipResult.todo) ? state.skipResult.todo : [];
-      const out = [];
-      for (const plan of todo) {
-        if (out.length >= limit) break;
-        if (!plan || !plan.entry || plan.entry.id === null || plan.entry.id === void 0) continue;
-        const id = String(plan.entry.id);
-        if (!id) continue;
-        let path = "";
-        try {
-          path = relativePath(plan);
-        } catch (err) {
-          continue;
-        }
-        out.push({ id, path });
-      }
-      return out;
     }
     async function recordScan() {
       if (!appendScanHistory2) return state.manifest;
@@ -7332,7 +7438,7 @@
         const stale = !createdAt || now() - createdAt > INTENT_TTL_MS;
         const pendingIds = Array.isArray(intent.pendingIds) ? intent.pendingIds : [];
         const recorded = intent.courseId === null || intent.courseId === void 0 ? "" : String(intent.courseId);
-        if (stale || recorded !== String(courseId)) {
+        if (stale || recorded !== String(courseId) || String(intent.contentId) !== String(contentId)) {
           clearIntent();
           return null;
         }
@@ -7349,7 +7455,7 @@
         state.resumeHandle = handle;
         if (!state.entries.length) await startScan();
         if (!state.entries.length) return null;
-        silentResume = true;
+        silentResume = intent;
         try {
           return await startDownload();
         } finally {

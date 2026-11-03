@@ -107,6 +107,7 @@ export function updateRecords(manifest, plans, results, now) {
     courseId: source && source.courseId ? String(source.courseId) : '',
     version: MANIFEST_VERSION,
     updatedAt: stamp(now),
+    ...(Array.isArray(source?.scans) ? { scans: source.scans } : {}),
     files
   };
 }

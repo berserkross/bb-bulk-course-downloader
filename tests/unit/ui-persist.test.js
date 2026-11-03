@@ -298,3 +298,16 @@ test('panel：同一文件连续两次重试报「第 2 次」，文件结束后
   assert.doesNotMatch(line(), /token=SECRET/, 'URL query 绝不进 DOM');
   api.destroy();
 });
+
+test('并发重试按文件计数，ZIP 模式显示实际并发', () => {
+  setupDom();
+  const api = mountPanel({ settings: { downloadConcurrency: 4 } });
+  for (const entryId of ['a', 'b', 'a']) {
+    api.setDownloadProgress({ state: 'file-retry', entryId, currentPath: entryId + '/slides.pdf' });
+    if (entryId === 'b') assert.match(document.querySelector('.bbdl-progress__text').textContent, /第 1 次/);
+  }
+  assert.match(document.querySelector('.bbdl-progress__text').textContent, /第 2 次/);
+  api.setMode('zip');
+  assert.match(document.body.textContent, /ZIP 并发为 1/);
+  api.destroy();
+});

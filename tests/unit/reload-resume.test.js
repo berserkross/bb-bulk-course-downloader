@@ -165,7 +165,7 @@ function setup(over) {
     pickDirectory: async function () { picks.push('pickDirectory'); return null; },
     openSelectDialog: async function (entries) {
       dialogs.push(entries.length);
-      return { entries: entries, dirHandle: null, expectedBytes: 0, skipExisting: false };
+      return { entries: extra.selected || entries, dirHandle: extra.handle || null, expectedBytes: 0, skipExisting: false };
     },
     mountPanel: function (options) {
       panel.opts = options;
@@ -408,7 +408,7 @@ test('AC9：停机那一刻只打一行 console.info 停机诊断，且不出现
   }
 });
 
-test('intentStore 三个方法全抛 → 静默吞掉，批次照常走到重载，面板与进程都不炸', async () => {
+test('intentStore 三个方法全抛 → 静默吞掉，保留当前页等待手动继续', async () => {
   const boom = {
     read() { throw new Error('sessionStorage 被禁'); },
     write() { throw new Error('sessionStorage 被禁'); },
@@ -416,7 +416,8 @@ test('intentStore 三个方法全抛 → 静默吞掉，批次照常走到重载
   };
   const h = setup({ behave: alwaysHalt, intentStore: boom });
   await runBatch(h);
-  assert.equal(h.reloads.length, 1, '存不进意图也照样按契约重载（重载本身不依赖存储）');
+  assert.equal(h.reloads.length, 0, '保存不了勾选范围时留在当前页');
+  assert.ok(h.controller.getState().haltedPending.length > 0);
   assert.equal(h.panel.countOf('fail'), 0, '存储异常绝不许冒到面板');
 });
 
@@ -444,3 +445,34 @@ test('AC13：重载后续跑按清单 + 磁盘比对取待办 —— 盘上已�
   assert.equal(h.dialogs.length, 0, '仍然不许弹选择框');
 });
 
+
+test('重载恢复只下载原先勾选的文件，清除已消费的意图', async () => {
+  const h = setup({
+    handle: { name: 'courses' },
+    intent: { courseId: COURSE, contentId: CONTENT, selectedIds: ['e2','e4','e5'], pendingIds: ['e4'], createdAt: NOW, reloads: 1 },
+    behave(entries) { return { ok: entries, failed: [], aborted: false }; }
+  });
+  await h.controller.resumeIntent;
+  assert.deepEqual(h.rounds, [['e2','e4','e5']]);
+  assert.equal(h.intentStore.peek(), null);
+});
+
+test('用户选三项，首轮成功一项，重载后只请求剩余两项且摘要成功三项', async () => {
+  const selected = byIds(['e1','e3','e5']);
+  const handle = { name: 'courses' };
+  const first = setup({ selected, handle, behave(batch, api, round) {
+    return round === 1 ? haltedResult(batch.slice(0, 1), batch.slice(1)) : haltedResult([], batch);
+  } });
+  await runBatch(first);
+  const intent = first.intentStore.peek();
+  assert.deepEqual(intent.selectedIds, selected.map(e => e.id));
+  const second = setup({ handle, intent, planSkips, existing: new Map([['a.pdf', 10]]),
+    behave(batch) { return { ok: batch, failed: [], aborted: false }; }
+  });
+  await second.controller.resumeIntent;
+  assert.deepEqual(second.rounds, [['e3','e5']]);
+  assert.equal(second.panel.callsOf('showSummary')[0].args[0].ok.length, 3);
+  const rows = second.panel.callsOf('setFiles')[0].args[0];
+  assert.deepEqual(rows.map(e => e.id), ['e1','e3','e5']);
+  assert.equal(rows[0].status, 'done');
+});

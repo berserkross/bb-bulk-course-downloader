@@ -351,3 +351,20 @@ test('面板摘要：停机 pending 从失败清单里摘掉，其余真实失�
   assert.equal(shown.ok.length, 1);
   assert.equal(h.panel.texts('setNotice').some(function (text) { return text.includes('已暂停'); }), false, '关掉续跑不等于熔断');
 });
+
+test('跨轮摘要保留成功与失败，手动重试成功后清除旧失败', async () => {
+  const h = setup({
+    behave(entries, api, round) {
+      if (round === 1) return haltedResult(entries.slice(0, 2), [{ entry: entries[2] }], entries.slice(3));
+      return { ok: entries, failed: [], aborted: false };
+    }
+  });
+  await runFirstBatch(h);
+  const shown = h.panel.callsOf('showSummary')[0].args[0];
+  assert.deepEqual(shown.ok.map(e => e.id), ['e1', 'e2', 'e4', 'e5']);
+  assert.deepEqual(shown.failed.map(f => f.entry.id), ['e3']);
+  const retry = await h.controller.onRetryFailed([ENTRIES[2]]);
+  assert.equal(retry.batchOkCount, 5);
+  assert.deepEqual(retry.failed, []);
+  assert.equal(h.panel.countOf('setFiles'), 1);
+});

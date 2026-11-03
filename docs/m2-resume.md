@@ -99,7 +99,7 @@ export async function listExistingFiles(dirHandle, { signal, maxFiles = 5000, ma
 - `src/index.js`：mount 时 `store.loadHandle(courseId)` 与 `store.loadManifest(courseId)`；
   扫描完成后按「当前 plans + 清单 + 磁盘现状」算一次 `planSkips`，把结果交给对话框；
   下载时只把 `todo` 交给 sink；`onProgress` 见到 `file-done`/`file-failed` 时把
-  `{ id: entryId, status, size }` 合并进清单（节流 500ms 落库）。
+  `{ id: entryId, status, size }` 合并进清单（累计 8 条或经过 500 ms 即写入，按先到者触发）。
 - `src/ui/select.js`：新增复选框「跳过已存在的文件（N 个，磁盘 M / 清单 K）」默认勾选；
   勾选状态变化只影响真正提交的 todo 集合，不影响行渲染；行内给被跳过的文件一个灰色标记。
 - `src/ui/panel.js`：识别到上次的目录句柄时给一句「上次保存到「<目录名>」，可继续」，并提供
@@ -130,3 +130,7 @@ export async function listExistingFiles(dirHandle, { signal, maxFiles = 5000, ma
 - **`request:true` 的调用位置**：必须在用户点击的同一个同步栈里调用 `ensureDirectoryPermission`，
   不得先 `await` 别的异步再调，否则浏览器丢弃用户激活、授权必然失败。
 
+
+同一下载控制器串行提交写入。收尾、停机、自动续跑前等待已经发起的写入。页面转入后台或触发 pagehide 时尽力提交剩余记录，浏览器进程被强制结束时仍可能丢失尚未提交的事务。记录含版本 href 和实际落盘路径，合并时保留扫描历史。
+
+体积探测与版本 href 绑定。上游文件换版后，旧清单的大小不能用于新版本的截断校验。

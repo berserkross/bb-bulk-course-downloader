@@ -79,3 +79,5 @@
 4. degraded 不可枚举：既有 sinks/zip-sink 的 deepEqual 断言一字不改且全绿。
 5. index.js 的 notice 只在 result.degraded 非空时出现，且不含 URL。
 6. 全量 npm test 0 fail。
+
+三种 sink 在一次下载调用中共享连续可疑响应计数。成功完成一次文件请求重置计数；三次连续可疑响应暂停整批，返回 server-blocked 和尚未完成的条目。此原因只允许用户手动继续，不触发自动重试或重载。在途请求可收尾。

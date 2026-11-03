@@ -13,7 +13,7 @@ import {
   withDegraded,
   listPending
 } from './shared.js';
-import { StallError, withFileRetry, createMutex, DEFAULT_IDLE_MS, isSessionExpiredError } from './guard.js';
+import { StallError, withFileRetry, createSuspectBudget, ServerBlockedError, createMutex, DEFAULT_IDLE_MS, isSessionExpiredError } from './guard.js';
 
 /** 点击后延迟回收 blob URL：立刻 revoke 会在部分 Chrome 版本上打断下载。 */
 const REVOKE_DELAY_MS = 60000;
@@ -165,6 +165,7 @@ export function createDownloadSink({
     let aborted = false;
     // 疑似限流引发的降速记录（契约 §3.3）：{ from, to } | null，最终挂成不可枚举属性
     let degraded = null;
+    const budget = createSuspectBudget();
 
     // entryId 显式传参：并发文件共用一个 tracker，不能让 payload 取到别的文件的 id
     const emit = (state, path, entryId = '', force = false) =>
@@ -250,6 +251,7 @@ export function createDownloadSink({
               return attemptOnce(entry, deliver);
             },
             {
+              budget,
               attempts: 1 + fileRetries,
               // 只报状态，不改旧字段：'file-retry' 是新增字符串，UI 认识就显示、不认识就忽略
               onRetry: (info) => {
@@ -285,6 +287,10 @@ export function createDownloadSink({
           if ((signal && signal.aborted) || isAbort(err)) {
             aborted = true;
             emit('aborted', label, entryId, true);
+            return;
+          }
+          if (err instanceof ServerBlockedError) {
+            control.stop('server-blocked');
             return;
           }
           if (isSessionExpiredError(err)) {

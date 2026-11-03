@@ -159,14 +159,15 @@ test('failed + 一边大小已知（磁盘未知）→ 进 todo（防：只知�
   assert.equal(result.todo.length, 1);
 });
 
-test('partial + 磁盘大小与期望精确相等 → 仍 skip/disk（防：把「正向核实过大小」的合法跳过也一并砍掉，导致每次回来都全量重下）', () => {
-  const plans = [plan('a', [], 'a.pdf')];
-  const manifest = { courseId: 'c', version: 1, updatedAt: 1, files: { a: record('a', 'a.pdf', 100, 'partial') } };
-  const result = planSkips({ plans, manifest, existingPaths: new Map([['a.pdf', 100]]) });
-  assert.equal(result.todo.length, 0);
-  assert.equal(result.skip.length, 1);
-  assert.equal(result.skip[0].reason, 'disk');
-  assert.equal(result.skip[0].size, 100);
+test('partial 和 failed 即使磁盘大小相等也必须重新下载', () => {
+  for (const status of ['partial', 'failed']) {
+    const plans = [plan('a', [], 'a.pdf')];
+    const manifest = { files: { a: record('a', 'a.pdf', 100, status) } };
+    const result = planSkips({ plans, manifest, existingPaths: new Map([['a.pdf', 100]]) });
+    assert.deepEqual(result.todo, plans);
+    assert.deepEqual(result.skip, []);
+    assert.equal(result.diff.unknown, 1);
+  }
 });
 
 // ---------------------------------------------------------------- stale 与 diff

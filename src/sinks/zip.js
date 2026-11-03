@@ -14,7 +14,7 @@ import {
   withDegraded
 } from './shared.js';
 import { createControl, degradeForSuspect } from './pool.js';
-import { createIdleReader, withFileRetry, createMutex, isRetriableError, TruncatedError, DEFAULT_IDLE_MS } from './guard.js';
+import { createIdleReader, withFileRetry, createSuspectBudget, ServerBlockedError, createMutex, isRetriableError, TruncatedError, DEFAULT_IDLE_MS } from './guard.js';
 import {
   crc32Update,
   dosDateTime,
@@ -294,10 +294,23 @@ export function createZipSink({
     let aborted = false;
     let halted = null;
     let degraded = null;
+    const budget = createSuspectBudget();
     let cursor = 0;
 
     const emit = (state, path, entryId = '', force = false) =>
       report(progressPayload(progress, state, path, entryId), force);
+    // 包内 done 事件供列表即时显示。持久化用的 file-done 要等浏览器接到整个包。
+    const buffered = [];
+    async function deliver(pkg) {
+      const delivered = await flushPackage(pkg);
+      for (const { entry, label, entryId } of buffered) {
+        ok.push(entry);
+        progress.endFile(false);
+        emit('file-done', label, entryId, true);
+      }
+      buffered.length = 0;
+      return delivered;
+    }
     const stopNow = () => aborted || halted !== null;
 
     emit('start', '', '', true);
@@ -336,7 +349,7 @@ export function createZipSink({
         }
 
         if (shouldCut(pkg, plannedNameLength, known)) {
-          await flushPackage(pkg);
+          await deliver(pkg);
           pkg = newPackage(group.name);
           missing = 0;
         }
@@ -376,6 +389,7 @@ export function createZipSink({
               );
             },
             {
+              budget,
               attempts: 1 + fileRetries,
               // 会话过期永不重试：isRetriableError 对它返回 false（§2），这里显式传一遍让契约可见
               isRetriable: isRetriableError,
@@ -413,20 +427,18 @@ export function createZipSink({
           pkg.cdBytes += CENTRAL_HEADER_SIZE + nameLength;
           pkg.entries.push({ name, crc, size, offset, time: stamp.time, date: stamp.date });
 
-          ok.push(entry);
-          progress.endFile(false);
+          buffered.push({ entry, label, entryId });
           // 重试是把同一个文件重下一遍：size 是最后一次尝试真正落进包里的字节，不是各次累加
           emitFile({ type: 'done', entryId, path: label, name, bytes: size });
-          emit('file-done', label, entryId, true);
         } catch (err) {
           if ((signal && signal.aborted) || isAbort(err)) {
             aborted = true;
             emit('aborted', label, entryId, true);
             break;
           }
-          if (err && err.name === 'SessionExpiredError') {
+          if (err instanceof ServerBlockedError || err?.name === 'SessionExpiredError') {
             // §2：触发它的这个文件进 pending，不进 failed；此后不再启动任何新文件
-            halted = { reason: 'session-expired', pending: ordered.slice(cursor).map((item) => item.entry) };
+            halted = { reason: err instanceof ServerBlockedError ? 'server-blocked' : 'session-expired', pending: ordered.slice(cursor).map((item) => item.entry) };
             emit('halt', label, entryId, true); // 不是 file-failed：filesDone/filesFailed 都不该动
             break;
           }
@@ -445,7 +457,7 @@ export function createZipSink({
       // 封口：包里已经完整收下的条目照旧交出去（停机也不该丢掉前面下好的文件）。
       // 只有「包内有条目彻底失败」才算 partial seal —— 停机/取消时 missing 恒为 0，绝不产出条目。
       const savedCount = pkg.entries.length;
-      const delivered = await flushPackage(pkg); // 包里没有条目时返回 null，绝不交空包
+      const delivered = await deliver(pkg); // 包里没有条目时返回 null，绝不交空包
       if (delivered && savedCount > 0 && missing > 0) {
         partialPackages.push({ name: delivered.name, saved: savedCount, missing });
       }

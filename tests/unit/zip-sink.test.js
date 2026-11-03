@@ -818,3 +818,18 @@ test('zip sink：partial seal 交付先于下一包开始取字节（内存上�
   assert.deepEqual(result.failed.map((f) => f.entry.id), ['2']);
 });
 
+
+test('ZIP 交给浏览器之前不向清单报告文件已保存，交付失败不产生完成记录', async () => {
+  const contents = { a: utf8.encode('alpha') };
+  const list = [entry({ id: '1', url: 'a', name: 'a.txt' })];
+  for (const rejected of [false, true]) {
+    const { sink, clicks } = sinkWith(rejected ? { urlApi: { createObjectURL() { throw Error('cannot deliver'); } } } : {});
+    const reports = [];
+    const done = sink.download(list, makeFetcher(contents), { onProgress(p) {
+      if (p.state === 'file-done') reports.push(clicks.length);
+    } });
+    if (rejected) await assert.rejects(done, /cannot deliver/);
+    else await done;
+    assert.deepEqual(reports, rejected ? [] : [1]);
+  }
+});

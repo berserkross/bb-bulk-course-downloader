@@ -46,3 +46,19 @@ test('扫描真实入口页：根页只被抓取一次，Content 自链接不再
   assert.deepEqual(files.map((file) => file.folderPath), [[], [], [], [], []]);
   assert.deepEqual(scanner.failures, []);
 });
+
+test('多个目录指向同一文件时，目录响应先后不能改变落盘位置', async () => {
+  const rootUrl = ENTRY_URL + '&content_id=root';
+  const root = ['A','B'].map(id => '<a href="' + ENTRY_URL + '&content_id=' + id + '">' + id + '</a>').join('');
+  const file = '<a href="/bbcswebdav/pid-1-dt-content-rid-11_1/xid-11_1">slides.pdf</a>';
+  let releaseA;
+  const gate = new Promise(resolve => { releaseA = resolve; });
+  const fetcher = { async fetchOk(url) {
+    const id = new URL(url).searchParams.get('content_id');
+    if (id === 'A') await gate;
+    if (id === 'B') setImmediate(releaseA);
+    return { url, async text() { return id === 'root' ? root : file; } };
+  } };
+  const entries = await createScanner({ rootUrl, fetcher, minDelayMs: 0, maxDelayMs: 0 }).scan();
+  assert.deepEqual(entries.map(entry => entry.folderPath), [['A']]);
+});

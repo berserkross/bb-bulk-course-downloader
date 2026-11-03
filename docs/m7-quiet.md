@@ -36,7 +36,7 @@ src/store.js DEFAULTS 追加：
 
 键 bbdl:resume-intent:v1，值：
 
-    { courseId, contentId, pendingIds: string[], dirName: string, createdAt: number, reloads: number }
+    { courseId, contentId, pendingIds: string[], selectedIds: string[], completedIds: string[], dirName: string, createdAt: number, reloads: number }
 
 写：只在即将 location.reload() 之前写一次。读：mount 之后。清：任一批次以非停机状态收尾、用户取消、意图超过 30 分钟、reloads 撞上限。
 
@@ -55,7 +55,7 @@ src/store.js DEFAULTS 追加：
 
 mount 完成、panel 起来之后调用一处 consumeIntent()：
 
-1. 无意图 / 课程 id 不匹配 / createdAt 早于 30 分钟 → 清掉，什么都不做
+1. 无意图 / 课程或内容页 id 不匹配 / createdAt 早于 30 分钟 → 清掉，什么都不做
 2. 有意图且 settings.autoReload !== false：console.info('[bbdl] 重载后续跑', { pending: pendingIds.length, reloads })
 3. 取已保存句柄 store.loadHandle(courseId) 并 ensureDirectoryPermission(handle, { mode: 'readwrite', request: false })
    - granted → state.dirHandle = handle；若 state.entries 为空先 startScan()；再 startDownload()。全程不弹选择对话框、不调 showDirectoryPicker（重载后没有用户手势，调只会抛）
@@ -90,3 +90,4 @@ createController 的 config 增三个可选依赖，缺省取全局：deps.reloa
 - S26：src/index.js、src/store.js、tests/unit/reload-resume.test.js（新建）；可改 tests/unit/auto-resume-loop.test.js、auto-resume.test.js、wiring-m3.test.js 里的文案断言
 - S27：src/ui/panel.js、src/ui/styles.js、tests/unit/ui-quiet.test.js（新建）；可改 tests/unit/ui-files.test.js 里的文案断言
 - 任何一方都不许碰：src/bb/**、src/sinks/**、src/store/**（db/manifest/plan/permissions）、build.mjs、package.json、meta.js、其它测试
+v2.8.1 在原有 30 分钟意图里只增加文件 ID。重载后先按 selectedIds 限定选择范围，再比对磁盘和清单。completedIds 中本轮确认跳过的条目恢复为完成行。旧版意图缺少选择集合时沿用旧版的全页比对。意图写入失败时留在当前页，可手动继续。同一批次的面板摘要累计唯一成功文件和仍未解决的失败，重新选择批次才清零。

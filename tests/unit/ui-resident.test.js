@@ -229,6 +229,7 @@ function boot(over) {
     createSink: async () => ({ download: async () => extra.result || { ok: [], failed: [], aborted: false } }),
     planSkips: () => ({
       todo: plans,
+      changedPaths: [{ id: plans[0].entry.id, path: "第 1 周/文件 1.pdf" }],
       skip: [],
       stale: [],
       diff: { added: 2, changed: 1, moved: 1, unchanged: 4, stale: 1, unknown: 1, total: 3 }
@@ -296,7 +297,7 @@ test('接线：扫描后先 updateRecords 再 appendScanHistory 再 saveManifest
   assert.equal(scans.length, 1);
   assert.equal(scans[0].added, 2);
   assert.equal(scans[0].stale, 1);
-  assert.equal(scans[0].changedPaths.length, 2, '变更路径取自这轮要下发的计划');
+  assert.equal(scans[0].changedPaths.length, 1, '变更路径只取已经分类为 changed 的文件');
   assert.equal(scans[0].changedPaths[0].path, '第 1 周/文件 1.pdf');
 
   const rows = Array.from(document.querySelectorAll('.bbdl-history__row'));
