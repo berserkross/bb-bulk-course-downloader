@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BB 课件批量下载
 // @namespace    bb-bulk-course-downloader
-// @version      2.8.1
+// @version      2.8.3
 // @description  扫描 Blackboard 课程内容，勾选后按原始目录结构批量下载课件
 // @updateURL    https://raw.githubusercontent.com/berserkross/bb-bulk-course-downloader/main/bb-bulk-course-downloader.user.js
 // @downloadURL  https://raw.githubusercontent.com/berserkross/bb-bulk-course-downloader/main/bb-bulk-course-downloader.user.js
@@ -869,327 +869,6 @@
     }
   });
 
-  // src/bb/http.js
-  var RETRY_STATUS = /* @__PURE__ */ new Set([429, 500, 502, 503, 504]);
-  var MAX_ATTEMPTS = 3;
-  var BASE_DELAY_MS = 400;
-  var MAX_DELAY_MS = 8e3;
-  var SESSION_URL_RE = /login|relogin|sso/i;
-  var WEBDAV_RE = /\/bbcswebdav\//i;
-  var HttpError = class extends Error {
-    constructor(status, url, message) {
-      super(message || "HTTP " + status + (url ? " " + url : ""));
-      this.name = "HttpError";
-      this.status = status;
-      this.url = url;
-    }
-  };
-  var SessionExpiredError = class extends Error {
-    constructor(message, detail) {
-      super(message || "\u4F1A\u8BDD\u5DF2\u5931\u6548\uFF1A\u8BF7\u91CD\u65B0\u767B\u5F55\u540E\u518D\u8BD5\u3002");
-      this.name = "SessionExpiredError";
-      if (detail) Object.assign(this, detail);
-    }
-  };
-  var SuspectResponseError = class extends Error {
-    constructor(detail) {
-      const info = detail || {};
-      super("\u670D\u52A1\u5668\u8FD4\u56DE\u4E86\u5F02\u5E38\u9875\u9762\uFF08\u7591\u4F3C\u9650\u6D41\uFF09");
-      this.name = "SuspectResponseError";
-      this.htmlKind = info.htmlKind === "login" || info.htmlKind === "blocked" ? info.htmlKind : "other";
-      this.status = Number.isFinite(Number(info.status)) ? Number(info.status) : 0;
-      this.path = pathnameOnly(info.path);
-    }
-  };
-  var AbortError = class extends Error {
-    constructor(message) {
-      super(message || "\u64CD\u4F5C\u5DF2\u53D6\u6D88");
-      this.name = "AbortError";
-    }
-  };
-  function isAbortError(error) {
-    return !!error && (error instanceof AbortError || error.name === "AbortError");
-  }
-  function isSessionExpired(error) {
-    return !!error && (error instanceof SessionExpiredError || error.name === "SessionExpiredError");
-  }
-  function isSuspectResponse(error) {
-    return !!error && error.name === "SuspectResponseError";
-  }
-  function linkSignals() {
-    const list = [];
-    for (let i = 0; i < arguments.length; i += 1) {
-      const signal = arguments[i];
-      if (signal) list.push(signal);
-    }
-    if (!list.length) return void 0;
-    if (list.length === 1) return list[0];
-    const controller = new AbortController();
-    const onAbort = () => controller.abort();
-    for (const signal of list) {
-      if (signal.aborted) {
-        controller.abort();
-        break;
-      }
-      signal.addEventListener("abort", onAbort, { once: true });
-    }
-    return controller.signal;
-  }
-  function sleep(ms, signal) {
-    return new Promise((resolve, reject) => {
-      if (signal && signal.aborted) {
-        reject(new AbortError());
-        return;
-      }
-      const timer = setTimeout(() => {
-        cleanup();
-        resolve();
-      }, Math.max(0, ms));
-      function onAbort() {
-        cleanup();
-        reject(new AbortError());
-      }
-      function cleanup() {
-        clearTimeout(timer);
-        if (signal) signal.removeEventListener("abort", onAbort);
-      }
-      if (signal) signal.addEventListener("abort", onAbort, { once: true });
-    });
-  }
-  function parseRetryAfter(value) {
-    if (!value) return void 0;
-    const seconds = Number(value);
-    if (Number.isFinite(seconds) && seconds >= 0) return Math.min(MAX_DELAY_MS, Math.round(seconds * 1e3));
-    const at = Date.parse(value);
-    if (Number.isFinite(at)) return Math.min(MAX_DELAY_MS, Math.max(0, at - Date.now()));
-    return void 0;
-  }
-  function backoffDelay(attempt, response) {
-    const retryAfter = parseRetryAfter(response && response.headers ? response.headers.get("retry-after") : null);
-    if (retryAfter !== void 0) return retryAfter;
-    const base = Math.min(MAX_DELAY_MS, BASE_DELAY_MS * Math.pow(2, attempt - 1));
-    return Math.round(base + Math.random() * base * 0.5);
-  }
-  function discardBody(response) {
-    try {
-      const body = response && response.body;
-      if (body && typeof body.cancel === "function") {
-        const pending = body.cancel();
-        if (pending && typeof pending.catch === "function") pending.catch(() => {
-        });
-      }
-    } catch {
-    }
-  }
-  function pathnameOnly(value) {
-    const text = String(value == null ? "" : value);
-    if (!text) return "";
-    try {
-      return new URL(text).pathname || "";
-    } catch {
-      return text.split("#")[0].split("?")[0];
-    }
-  }
-  function htmlKindOf(text) {
-    const sample = String(text == null ? "" : text).slice(0, PROBE_HTML_LIMIT);
-    if (HTML_LOGIN_RE.test(sample)) return "login";
-    if (HTML_BLOCKED_RE.test(sample)) return "blocked";
-    return "other";
-  }
-  async function classifyHtmlKind(response) {
-    const body = response && response.body;
-    if (!body || typeof body.getReader !== "function") {
-      let text2 = "";
-      try {
-        text2 = await response.text();
-      } catch {
-        text2 = "";
-      }
-      return htmlKindOf(text2);
-    }
-    const reader = body.getReader();
-    const decoder = new TextDecoder();
-    let text = "";
-    try {
-      while (text.length < PROBE_HTML_LIMIT) {
-        const chunk = await reader.read();
-        if (!chunk || chunk.done) break;
-        text += decoder.decode(chunk.value, { stream: true });
-      }
-    } catch {
-    } finally {
-      try {
-        const pending = reader.cancel();
-        if (pending && typeof pending.catch === "function") pending.catch(() => {
-        });
-      } catch {
-      }
-    }
-    return htmlKindOf(text);
-  }
-  async function assertAlive(response, requestedUrl) {
-    const finalUrl = String(response && response.url || requestedUrl || "");
-    const type = String(response && response.headers && response.headers.get("content-type") || "").toLowerCase();
-    const wantsFile = WEBDAV_RE.test(requestedUrl || "") || WEBDAV_RE.test(finalUrl);
-    if (SESSION_URL_RE.test(finalUrl)) {
-      throw new SessionExpiredError("\u4F1A\u8BDD\u5DF2\u5931\u6548\uFF1A\u8BF7\u6C42\u88AB\u91CD\u5B9A\u5411\u5230\u767B\u5F55\u9875 " + finalUrl, { finalUrl });
-    }
-    if (!wantsFile || type.indexOf("text/html") === -1) return;
-    const htmlKind = await classifyHtmlKind(response);
-    if (htmlKind === "login") {
-      throw new SessionExpiredError("\u4F1A\u8BDD\u5DF2\u5931\u6548\uFF1A\u6587\u4EF6\u8BF7\u6C42\u8FD4\u56DE\u4E86 HTML \u9875\u9762 " + finalUrl, { finalUrl, contentType: type });
-    }
-    throw new SuspectResponseError({
-      htmlKind,
-      status: Number(response && response.status) || 0,
-      path: finalUrl || requestedUrl
-    });
-  }
-  function sizeFromHeaders(response) {
-    if (!response || !response.headers) return void 0;
-    const range = response.headers.get("content-range");
-    if (range) {
-      const match = /bytes\s+\d+-\d+\/(\d+)/i.exec(range);
-      if (match) {
-        const total = Number(match[1]);
-        if (Number.isFinite(total)) return total;
-      }
-    }
-    if (response.status === 200) {
-      const length = response.headers.get("content-length");
-      if (length) {
-        const total = Number(length);
-        if (Number.isFinite(total) && total >= 0) return total;
-      }
-    }
-    return void 0;
-  }
-  function createFetcher(options) {
-    const opts = options || {};
-    const outer = opts.signal;
-    async function request(url, init) {
-      const config = init || {};
-      const signal = linkSignals(outer, config.signal);
-      const requestedUrl = String(url);
-      for (let attempt = 1; ; attempt += 1) {
-        if (signal && signal.aborted) throw new AbortError();
-        let response;
-        try {
-          response = await fetch(requestedUrl, Object.assign({}, config, { credentials: "include", signal }));
-        } catch (error) {
-          if (isAbortError(error) || signal && signal.aborted) throw new AbortError();
-          if (attempt < MAX_ATTEMPTS) {
-            await sleep(backoffDelay(attempt), signal);
-            continue;
-          }
-          throw error;
-        }
-        try {
-          await assertAlive(response, requestedUrl);
-          if (!response.ok) throw new HttpError(response.status, response.url || requestedUrl);
-        } catch (error) {
-          discardBody(response);
-          if (error instanceof HttpError && RETRY_STATUS.has(error.status) && attempt < MAX_ATTEMPTS) {
-            await sleep(backoffDelay(attempt, response), signal);
-            continue;
-          }
-          throw error;
-        }
-        return response;
-      }
-    }
-    async function probeSize(url) {
-      const signal = linkSignals(outer);
-      let response;
-      try {
-        if (signal && signal.aborted) throw new AbortError();
-        response = await fetch(String(url), {
-          method: "GET",
-          headers: { Range: "bytes=0-0" },
-          credentials: "include",
-          signal
-        });
-        if (!response.ok && response.status !== 206) return void 0;
-        return sizeFromHeaders(response);
-      } catch (error) {
-        if (isAbortError(error) || signal && signal.aborted) throw new AbortError();
-        return void 0;
-      } finally {
-        if (response) discardBody(response);
-      }
-    }
-    return { fetchOk: request, probeSize };
-  }
-  var PROBE_HTML_LIMIT = 64 * 1024;
-  var HTML_LOGIN_RE = /sign in|login|password|统一身份|登录/i;
-  var HTML_BLOCKED_RE = /blocked|denied|forbidden|rate limit|too many requests|拦截|访问受限/i;
-  function createHeartbeat(options) {
-    const opts = options || {};
-    const fetcher = opts.fetcher || null;
-    const url = String(opts.url || "");
-    const intervalMs = Number.isFinite(opts.intervalMs) ? Math.max(0, opts.intervalMs) : 0;
-    const onTick = typeof opts.onTick === "function" ? opts.onTick : null;
-    const signal = opts.signal;
-    const schedule = typeof opts.setTimeoutFn === "function" ? opts.setTimeoutFn : setTimeout;
-    const unschedule = typeof opts.clearTimeoutFn === "function" ? opts.clearTimeoutFn : clearTimeout;
-    let timer = null;
-    let ticks = 0;
-    let running = false;
-    function stop() {
-      running = false;
-      if (timer !== null) {
-        try {
-          unschedule(timer);
-        } catch {
-        }
-        timer = null;
-      }
-    }
-    function arm() {
-      if (!running) return;
-      timer = schedule(function() {
-        timer = null;
-        void tick();
-      }, intervalMs);
-    }
-    async function tick() {
-      if (!running) return;
-      if (signal && signal.aborted) {
-        stop();
-        return;
-      }
-      ticks += 1;
-      let outcome = { ok: false };
-      try {
-        const response = await fetcher.fetchOk(url, { method: "GET", cache: "no-store" });
-        discardBody(response);
-        outcome = { ok: true };
-      } catch (error) {
-        outcome = isSessionExpired(error) ? { ok: false, sessionExpired: true } : { ok: false };
-      }
-      if (!running) return;
-      if (onTick) {
-        try {
-          onTick(outcome);
-        } catch {
-        }
-      }
-      arm();
-    }
-    function start() {
-      if (running) return;
-      if (!fetcher || typeof fetcher.fetchOk !== "function") return;
-      if (!url || !(intervalMs > 0)) return;
-      if (signal && signal.aborted) return;
-      running = true;
-      arm();
-    }
-    function count() {
-      return ticks;
-    }
-    return { start, stop, count };
-  }
-
   // src/bb/files.js
   var ILLEGAL_CHARS = /[\\/:*?"<>|\u0000-\u001f\u007f]/g;
   var TRAILING_JUNK = /[\s.]+$/u;
@@ -1379,16 +1058,359 @@
     return name;
   }
 
+  // src/bb/http.js
+  var RETRY_STATUS = /* @__PURE__ */ new Set([429, 500, 502, 503, 504]);
+  var MAX_ATTEMPTS = 3;
+  var BASE_DELAY_MS = 400;
+  var MAX_DELAY_MS = 8e3;
+  function isSessionEndpoint(url) {
+    try {
+      const target = new URL(url, "https://localhost/");
+      return /^(?:login|sso|relogin)\./i.test(target.hostname) || !WEBDAV_RE.test(target.pathname) && /\/(?:login|relogin|sso)(?:[/.;]|$)/i.test(target.pathname);
+    } catch {
+      return false;
+    }
+  }
+  var WEBDAV_RE = /\/bbcswebdav\//i;
+  var HttpError = class extends Error {
+    constructor(status, url, message) {
+      super(message || "HTTP " + status + (url ? " " + url : ""));
+      this.name = "HttpError";
+      this.status = status;
+      this.url = url;
+    }
+  };
+  var SessionExpiredError = class extends Error {
+    constructor(message, detail) {
+      super(message || "\u4F1A\u8BDD\u5DF2\u5931\u6548\uFF1A\u8BF7\u91CD\u65B0\u767B\u5F55\u540E\u518D\u8BD5\u3002");
+      this.name = "SessionExpiredError";
+      if (detail) Object.assign(this, detail);
+    }
+  };
+  var SuspectResponseError = class extends Error {
+    constructor(detail) {
+      const info = detail || {};
+      super("\u670D\u52A1\u5668\u8FD4\u56DE\u4E86\u5F02\u5E38\u9875\u9762\uFF08\u7591\u4F3C\u9650\u6D41\uFF09");
+      this.name = "SuspectResponseError";
+      this.htmlKind = info.htmlKind === "login" || info.htmlKind === "blocked" ? info.htmlKind : "other";
+      this.status = Number.isFinite(Number(info.status)) ? Number(info.status) : 0;
+      this.path = pathnameOnly(info.path);
+    }
+  };
+  var AbortError = class extends Error {
+    constructor(message) {
+      super(message || "\u64CD\u4F5C\u5DF2\u53D6\u6D88");
+      this.name = "AbortError";
+    }
+  };
+  function isAbortError(error) {
+    return !!error && (error instanceof AbortError || error.name === "AbortError");
+  }
+  function isSessionExpired(error) {
+    return !!error && (error instanceof SessionExpiredError || error.name === "SessionExpiredError");
+  }
+  function isSuspectResponse(error) {
+    return !!error && error.name === "SuspectResponseError";
+  }
+  function linkSignals() {
+    const list = [];
+    for (let i = 0; i < arguments.length; i += 1) {
+      const signal = arguments[i];
+      if (signal) list.push(signal);
+    }
+    if (!list.length) return void 0;
+    if (list.length === 1) return list[0];
+    const controller = new AbortController();
+    const onAbort = () => controller.abort();
+    for (const signal of list) {
+      if (signal.aborted) {
+        controller.abort();
+        break;
+      }
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+    return controller.signal;
+  }
+  function sleep(ms, signal) {
+    return new Promise((resolve, reject) => {
+      if (signal && signal.aborted) {
+        reject(new AbortError());
+        return;
+      }
+      const timer = setTimeout(() => {
+        cleanup();
+        resolve();
+      }, Math.max(0, ms));
+      function onAbort() {
+        cleanup();
+        reject(new AbortError());
+      }
+      function cleanup() {
+        clearTimeout(timer);
+        if (signal) signal.removeEventListener("abort", onAbort);
+      }
+      if (signal) signal.addEventListener("abort", onAbort, { once: true });
+    });
+  }
+  function parseRetryAfter(value) {
+    if (!value) return void 0;
+    const seconds = Number(value);
+    if (Number.isFinite(seconds) && seconds >= 0) return Math.min(MAX_DELAY_MS, Math.round(seconds * 1e3));
+    const at = Date.parse(value);
+    if (Number.isFinite(at)) return Math.min(MAX_DELAY_MS, Math.max(0, at - Date.now()));
+    return void 0;
+  }
+  function backoffDelay(attempt, response) {
+    const retryAfter = parseRetryAfter(response && response.headers ? response.headers.get("retry-after") : null);
+    if (retryAfter !== void 0) return retryAfter;
+    const base = Math.min(MAX_DELAY_MS, BASE_DELAY_MS * Math.pow(2, attempt - 1));
+    return Math.round(base + Math.random() * base * 0.5);
+  }
+  function discardBody(response) {
+    try {
+      const body = response && response.body;
+      if (body && typeof body.cancel === "function") {
+        const pending = body.cancel();
+        if (pending && typeof pending.catch === "function") pending.catch(() => {
+        });
+      }
+    } catch {
+    }
+  }
+  function pathnameOnly(value) {
+    const text = String(value == null ? "" : value);
+    if (!text) return "";
+    try {
+      return new URL(text).pathname || "";
+    } catch {
+      return text.split("#")[0].split("?")[0];
+    }
+  }
+  function htmlKindOf(text) {
+    const sample = String(text == null ? "" : text).slice(0, PROBE_HTML_LIMIT);
+    if (HTML_LOGIN_RE.test(sample)) return "login";
+    if (HTML_BLOCKED_RE.test(sample)) return "blocked";
+    return "other";
+  }
+  async function readHtmlSample(response) {
+    const body = response && response.body;
+    if (!body || typeof body.getReader !== "function") {
+      let text2 = "";
+      try {
+        text2 = await response.text();
+      } catch {
+        text2 = "";
+      }
+      return text2.slice(0, PROBE_HTML_LIMIT);
+    }
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let text = "";
+    try {
+      while (text.length < PROBE_HTML_LIMIT) {
+        const chunk = await reader.read();
+        if (!chunk || chunk.done) break;
+        text += decoder.decode(chunk.value.subarray(0, PROBE_HTML_LIMIT - text.length), { stream: true });
+      }
+    } catch {
+    } finally {
+      try {
+        const pending = reader.cancel();
+        if (pending && typeof pending.catch === "function") pending.catch(() => {
+        });
+      } catch {
+      }
+    }
+    return text.slice(0, PROBE_HTML_LIMIT);
+  }
+  async function assertAlive(response, requestedUrl, expectedName) {
+    const finalUrl = String(response && response.url || requestedUrl || "");
+    const type = String(response && response.headers && response.headers.get("content-type") || "").toLowerCase();
+    const wantsFile = WEBDAV_RE.test(requestedUrl || "") || WEBDAV_RE.test(finalUrl);
+    if (isSessionEndpoint(finalUrl)) {
+      throw new SessionExpiredError("\u8BF7\u6C42\u88AB\u91CD\u5B9A\u5411\u5230\u767B\u5F55\u9875");
+    }
+    if (!wantsFile || type.indexOf("text/html") === -1) return;
+    const disposition = response.headers.get("content-disposition") || "";
+    const serverName = resolveFileName({ disposition, finalUrl });
+    const isHtmlName = (name) => /\.html?$/i.test(name || "");
+    const candidate = response.ok && WEBDAV_RE.test(pathnameOnly(finalUrl)) && (isHtmlName(serverName) || isHtmlName(expectedName)) && typeof response.clone === "function";
+    const sample = await readHtmlSample(candidate ? response.clone() : response);
+    const markup = candidate ? sample.replace(/<(script|style)\b[^>]*>[\s\S]*?(?:<\/\1\s*>|$)/gi, "") : sample;
+    const htmlKind = htmlKindOf(markup);
+    if (candidate && htmlKind === "other") {
+      const title = /<title\b[^>]*>([^<]+)<\/title\s*>/i.exec(markup)?.[1].trim();
+      const matchesTitle = title && title.toLowerCase() === String(expectedName || "").replace(/\.html?$/i, "").trim().toLowerCase();
+      const errorTitle = /^(?:error\b|(?:401|403|404|429|500|503)\b|not found\b|access denied\b|错误|访问被拒绝)/i.test(title || "");
+      if (markup.trim() && !errorTitle && (isHtmlName(serverName) || matchesTitle)) return;
+    }
+    if (htmlKind === "login") {
+      throw new SessionExpiredError("\u6587\u4EF6\u8BF7\u6C42\u8FD4\u56DE\u4E86\u767B\u5F55\u9875");
+    }
+    throw new SuspectResponseError({
+      htmlKind,
+      status: Number(response && response.status) || 0,
+      path: finalUrl || requestedUrl
+    });
+  }
+  function sizeFromHeaders(response) {
+    if (!response || !response.headers) return void 0;
+    const range = response.headers.get("content-range");
+    if (range) {
+      const match = /bytes\s+\d+-\d+\/(\d+)/i.exec(range);
+      if (match) {
+        const total = Number(match[1]);
+        if (Number.isFinite(total)) return total;
+      }
+    }
+    if (response.status === 200) {
+      const length = response.headers.get("content-length");
+      if (length) {
+        const total = Number(length);
+        if (Number.isFinite(total) && total >= 0) return total;
+      }
+    }
+    return void 0;
+  }
+  function createFetcher(options) {
+    const opts = options || {};
+    const outer = opts.signal;
+    async function request(url, init, expectedName) {
+      const config = init || {};
+      const signal = linkSignals(outer, config.signal);
+      const requestedUrl = String(url);
+      for (let attempt = 1; ; attempt += 1) {
+        if (signal && signal.aborted) throw new AbortError();
+        let response;
+        try {
+          response = await fetch(requestedUrl, Object.assign({}, config, { credentials: "include", signal }));
+        } catch (error) {
+          if (isAbortError(error) || signal && signal.aborted) throw new AbortError();
+          if (attempt < MAX_ATTEMPTS) {
+            await sleep(backoffDelay(attempt), signal);
+            continue;
+          }
+          throw error;
+        }
+        try {
+          await assertAlive(response, requestedUrl, expectedName);
+          if (!response.ok) throw new HttpError(response.status, response.url || requestedUrl);
+        } catch (error) {
+          discardBody(response);
+          if (error instanceof HttpError && RETRY_STATUS.has(error.status) && attempt < MAX_ATTEMPTS) {
+            await sleep(backoffDelay(attempt, response), signal);
+            continue;
+          }
+          throw error;
+        }
+        return response;
+      }
+    }
+    async function probeSize(url) {
+      const signal = linkSignals(outer);
+      let response;
+      try {
+        if (signal && signal.aborted) throw new AbortError();
+        response = await fetch(String(url), {
+          method: "GET",
+          headers: { Range: "bytes=0-0" },
+          credentials: "include",
+          signal
+        });
+        if (!response.ok && response.status !== 206) return void 0;
+        return sizeFromHeaders(response);
+      } catch (error) {
+        if (isAbortError(error) || signal && signal.aborted) throw new AbortError();
+        return void 0;
+      } finally {
+        if (response) discardBody(response);
+      }
+    }
+    return { fetchOk: request, probeSize };
+  }
+  var PROBE_HTML_LIMIT = 64 * 1024;
+  var HTML_LOGIN_RE = /sign in|login|password|统一身份|登录/i;
+  var HTML_BLOCKED_RE = /blocked|denied|forbidden|rate limit|too many requests|拦截|访问受限/i;
+  function createHeartbeat(options) {
+    const opts = options || {};
+    const fetcher = opts.fetcher || null;
+    const url = String(opts.url || "");
+    const intervalMs = Number.isFinite(opts.intervalMs) ? Math.max(0, opts.intervalMs) : 0;
+    const onTick = typeof opts.onTick === "function" ? opts.onTick : null;
+    const signal = opts.signal;
+    const schedule = typeof opts.setTimeoutFn === "function" ? opts.setTimeoutFn : setTimeout;
+    const unschedule = typeof opts.clearTimeoutFn === "function" ? opts.clearTimeoutFn : clearTimeout;
+    let timer = null;
+    let ticks = 0;
+    let running = false;
+    function stop() {
+      running = false;
+      if (timer !== null) {
+        try {
+          unschedule(timer);
+        } catch {
+        }
+        timer = null;
+      }
+    }
+    function arm() {
+      if (!running) return;
+      timer = schedule(function() {
+        timer = null;
+        void tick();
+      }, intervalMs);
+    }
+    async function tick() {
+      if (!running) return;
+      if (signal && signal.aborted) {
+        stop();
+        return;
+      }
+      ticks += 1;
+      let outcome = { ok: false };
+      try {
+        const response = await fetcher.fetchOk(url, { method: "GET", cache: "no-store" });
+        discardBody(response);
+        outcome = { ok: true };
+      } catch (error) {
+        outcome = isSessionExpired(error) ? { ok: false, sessionExpired: true } : { ok: false };
+      }
+      if (!running) return;
+      if (onTick) {
+        try {
+          onTick(outcome);
+        } catch {
+        }
+      }
+      arm();
+    }
+    function start() {
+      if (running) return;
+      if (!fetcher || typeof fetcher.fetchOk !== "function") return;
+      if (!url || !(intervalMs > 0)) return;
+      if (signal && signal.aborted) return;
+      running = true;
+      arm();
+    }
+    function count() {
+      return ticks;
+    }
+    return { start, stop, count };
+  }
+
   // src/bb/dom.js
   var FILE_SELECTOR = 'a[href*="/bbcswebdav/"]';
   var FOLDER_SELECTOR = 'a[href*="listContent.jsp"]';
   var RID_RE = /dt-content-rid-(\d+)/i;
   var HARMLESS_PARAMS = /* @__PURE__ */ new Set(["mode", "list_display"]);
   var SELF_FORM_SELECTOR = 'form[name="contentForm"]';
-  function resolveUrl(raw, base) {
+  function resolveUrl(raw, base, pathPattern) {
     if (!raw) return "";
     try {
-      return new URL(raw, base || void 0).href;
+      const url = new URL(raw, base);
+      if (!/^https?:$/.test(url.protocol) || url.origin !== new URL(base).origin) return "";
+      if (pathPattern && !pathPattern.test(url.pathname)) return "";
+      return url.href;
     } catch {
       return "";
     }
@@ -1436,7 +1458,7 @@
     const seenFolders = /* @__PURE__ */ new Set();
     for (const anchor of doc.querySelectorAll(FILE_SELECTOR)) {
       const href = anchor.getAttribute("href") || "";
-      const url = resolveUrl(href, base);
+      const url = resolveUrl(href, base, /\/bbcswebdav\//i);
       if (!url || seenFiles.has(url)) continue;
       seenFiles.add(url);
       const text = (anchor.textContent || "").trim();
@@ -1453,7 +1475,7 @@
     for (const anchor of doc.querySelectorAll(FOLDER_SELECTOR)) {
       const href = (anchor.getAttribute("href") || "").trim();
       if (!href || href.charAt(0) === "#") continue;
-      const url = resolveUrl(href, base);
+      const url = resolveUrl(href, base, /\/listContent\.jsp$/i);
       if (!url || seenFolders.has(url)) continue;
       if (sameDocument(url, base)) continue;
       const id = contentIdOf(url);
@@ -2043,7 +2065,7 @@
       return dir;
     }
     async function writeAttempt(fetcher, entry, plan, onChunk, onName) {
-      const response = await fetcher.fetchOk(entry.url, { signal });
+      const response = await fetcher.fetchOk(entry.url, { signal }, entry.name);
       const body = response && response.body;
       if (!body || typeof body.getReader !== "function") {
         throw new Error("\u54CD\u5E94\u6CA1\u6709\u53EF\u8BFB\u4E3B\u4F53\uFF0C\u62D2\u7EDD\u5199\u5165\u7A7A\u6587\u4EF6");
@@ -2356,7 +2378,7 @@
         const local = new AbortController();
         const linked = linkSignals2(signal, local.signal);
         try {
-          const response = await fetcher.fetchOk(entry.url, { signal: linked.signal });
+          const response = await fetcher.fetchOk(entry.url, { signal: linked.signal }, entry.name);
           const sizes = [headerSize(response), lookupSize(entry)].filter((n) => n !== void 0);
           const known = sizes.length ? Math.max.apply(null, sizes) : void 0;
           const readAndHand = async () => {
@@ -2727,7 +2749,7 @@
       return sealedSize(pkg) + projectedGrowth(nameLength, expected) > chunkBytes;
     }
     async function readEntry(fetcher, entry, onBytes, onName) {
-      const response = await fetcher.fetchOk(entry.url, { signal });
+      const response = await fetcher.fetchOk(entry.url, { signal }, entry.name);
       const body = response && response.body;
       if (!body || typeof body.getReader !== "function") {
         throw new Error("\u54CD\u5E94\u6CA1\u6709\u53EF\u8BFB\u4E3B\u4F53\uFF0C\u62D2\u7EDD\u5199\u5165\u7A7A\u6587\u4EF6");
@@ -4321,6 +4343,8 @@
     let summaryState = { ok: 0, failed: [], aborted: false };
     let fileOrder = [];
     let fileMap = /* @__PURE__ */ new Map();
+    const deliveredIds = /* @__PURE__ */ new Set();
+    let batchProgress = false;
     let haltText = "";
     let haltPendingCount = 0;
     let recoveringAttempt = 0;
@@ -4522,6 +4546,10 @@
       if (next === "scanning" || next === "downloading") {
         summaryEl.hidden = true;
         summaryEl.textContent = "";
+        if (next === "downloading" && batchProgress) {
+          paintBatchProgress();
+          return;
+        }
         setBar(0);
         progressTextEl.textContent = next === "scanning" ? "\u51C6\u5907\u626B\u63CF\u2026" : "\u51C6\u5907\u4E0B\u8F7D\u2026";
       }
@@ -4642,9 +4670,29 @@
       const scope = queued ? done + " / " + queued : done + "\uFF08\u5DF2\u5B8C\u6210\uFF09";
       progressTextEl.textContent = "\u6587\u4EF6\u5939 " + scope + " \xB7 \u5DF2\u53D1\u73B0 " + files3 + " \u4E2A\u6587\u4EF6";
     }
+    function paintBatchProgress() {
+      const total = fileOrder.length;
+      const done = deliveredIds.size;
+      setBar(total ? done / total * 100 : 0);
+      downloadNote = "\u5DF2\u5B8C\u6210 " + done + " / " + total;
+      progressTextEl.textContent = downloadNote + " \u4E2A\u6587\u4EF6";
+      progressTextEl.title = progressTextEl.textContent;
+      refreshFabStatus();
+    }
+    function continueBatch() {
+      batchProgress = true;
+      clearHalted();
+      setNotice("");
+      paintBatchProgress();
+    }
     function setDownloadProgress(progress) {
       if (destroyed) return;
       const p = progress || {};
+      if (p.state === "file-done" && fileMap.has(String(p.entryId))) deliveredIds.add(String(p.entryId));
+      if (batchProgress) {
+        paintBatchProgress();
+        return;
+      }
       const filesDone = pickNumber(p, ["filesDone", "done"], 0);
       const filesTotal = pickNumber(p, ["filesTotal", "total"], 0);
       const bytesDone = pickNumber(p, ["bytesDone", "bytes"], 0);
@@ -4972,6 +5020,11 @@
         });
         nextOrder.push(id);
       }
+      deliveredIds.clear();
+      for (const record of nextMap.values()) {
+        if (record.status === "done") deliveredIds.add(record.id);
+      }
+      batchProgress = deliveredIds.size > 0;
       fileOrder = nextOrder;
       fileMap = nextMap;
       renderFiles();
@@ -5106,6 +5159,7 @@
       applyFileEvent,
       setHalted,
       clearHalted,
+      continueBatch,
       setRecovering,
       clearRecovering,
       showSummary,
@@ -7022,7 +7076,8 @@
           return await settle2(result);
         }
         console.info("[bbdl] \u81EA\u52A8\u91CD\u8F7D\u7EED\u8DD1", { reloads: attempt });
-        callPanel("setRecovering", { attempt });
+        if (panel.continueBatch) panel.continueBatch();
+        else callPanel("setRecovering", { attempt });
         reload();
         return new Promise(function() {
         });
@@ -7073,8 +7128,11 @@
         state.autoResumeUsed += 1;
         resumes += 1;
         const delay = autoResumeDelay(state.autoResumeUsed - 1);
-        notify2("\u6B63\u5728\u81EA\u52A8\u6062\u590D\uFF08\u7B2C " + resumes + " \u6B21\uFF09\u2026");
-        callPanel("setRecovering", { attempt: resumes });
+        if (panel.continueBatch) panel.continueBatch();
+        else {
+          notify2("\u6B63\u5728\u81EA\u52A8\u6062\u590D\uFF08\u7B2C " + resumes + " \u6B21\uFF09\u2026");
+          callPanel("setRecovering", { attempt: resumes });
+        }
         state.haltedPending = [];
         clearHaltedBanner();
         panel.setState("downloading");

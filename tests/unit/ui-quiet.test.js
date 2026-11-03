@@ -266,3 +266,22 @@ test('既有面板没有控制器可复用时：noop 表里也有 setRecovering 
   api.clearRecovering();
   assert.equal(document.querySelectorAll('.bbdl-panel').length, 1, '复用时绝不再建第二个面板');
 });
+
+test('批次续跑保留已交付计数，等待和下一轮启动不重置进度', () => {
+  setupDom();
+  const {api} = mount();
+  api.setFiles([{id:'a'}, {id:'b'}, {id:'c'}]);
+  api.setState('downloading');
+  api.setDownloadProgress({state:'file-done', entryId:'a'});
+  api.continueBatch();
+  api.setState('downloading');
+  api.setDownloadProgress({state:'start', filesDone:0, filesTotal:2});
+  const line = document.querySelector('.bbdl-progress__text');
+  assert.match(line.textContent, /1 \/ 3/);
+  api.setDownloadProgress({state:'file-done', entryId:'b'});
+  assert.match(line.textContent, /2 \/ 3/);
+  api.setHalted({reason:'session-expired', pendingCount:1});
+  api.showSummary({ok:[{},{}],failed:[]});
+  assert.match(statusLine(), /已暂停/);
+  api.destroy();
+});

@@ -10,10 +10,13 @@ const HARMLESS_PARAMS = new Set(['mode', 'list_display']);
 // listContent.jsp 用自己的 form action 声明当前文件夹身份：入口 URL 不带 content_id 时，仅此可查。
 const SELF_FORM_SELECTOR = 'form[name="contentForm"]';
 
-function resolveUrl(raw, base) {
+function resolveUrl(raw, base, pathPattern) {
   if (!raw) return '';
   try {
-    return new URL(raw, base || undefined).href;
+    const url = new URL(raw, base);
+    if (!/^https?:$/.test(url.protocol) || url.origin !== new URL(base).origin) return '';
+    if (pathPattern && !pathPattern.test(url.pathname)) return '';
+    return url.href;
   } catch {
     return '';
   }
@@ -78,7 +81,7 @@ export function parseContentList(doc, pageUrl) {
 
   for (const anchor of doc.querySelectorAll(FILE_SELECTOR)) {
     const href = anchor.getAttribute('href') || '';
-    const url = resolveUrl(href, base);
+    const url = resolveUrl(href, base, /\/bbcswebdav\//i);
     if (!url || seenFiles.has(url)) continue;
     seenFiles.add(url);
     const text = (anchor.textContent || '').trim();
@@ -97,7 +100,7 @@ export function parseContentList(doc, pageUrl) {
     const href = (anchor.getAttribute('href') || '').trim();
     // "#" / "#content" 这类锚点会被解析成当前页，必须先排除，否则会被误判成子文件夹
     if (!href || href.charAt(0) === '#') continue;
-    const url = resolveUrl(href, base);
+    const url = resolveUrl(href, base, /\/listContent\.jsp$/i);
     if (!url || seenFolders.has(url)) continue;
     if (sameDocument(url, base)) continue;
     const id = contentIdOf(url);

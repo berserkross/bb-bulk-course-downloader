@@ -94,7 +94,7 @@ export function createFsSink({ settings = {}, dirHandle, signal, total = 0, file
    * 任何一步失败都会 cancel reader + abort writable，半截文件绝不留在磁盘上被当成成功。
    */
   async function writeAttempt(fetcher, entry, plan, onChunk, onName) {
-    const response = await fetcher.fetchOk(entry.url, { signal });
+    const response = await fetcher.fetchOk(entry.url, { signal }, entry.name);
     const body = response && response.body;
     if (!body || typeof body.getReader !== 'function') {
       throw new Error('响应没有可读主体，拒绝写入空文件');

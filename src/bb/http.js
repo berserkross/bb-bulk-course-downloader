@@ -1,10 +1,18 @@
+import { resolveFileName } from './files.js';
+
 // 带会话检测与重试的 fetch 包装。所有请求都带 credentials: 'include' 且共用同一个 signal。
 
 const RETRY_STATUS = new Set([429, 500, 502, 503, 504]);
 const MAX_ATTEMPTS = 3;
 const BASE_DELAY_MS = 400;
 const MAX_DELAY_MS = 8000;
-const SESSION_URL_RE = /login|relogin|sso/i;
+function isSessionEndpoint(url) {
+  try {
+    const target = new URL(url, 'https://localhost/');
+    return /^(?:login|sso|relogin)\./i.test(target.hostname) ||
+      (!WEBDAV_RE.test(target.pathname) && /\/(?:login|relogin|sso)(?:[/.;]|$)/i.test(target.pathname));
+  } catch { return false; }
+}
 const WEBDAV_RE = /\/bbcswebdav\//i;
 
 export class HttpError extends Error {
@@ -150,7 +158,7 @@ function htmlKindOf(text) {
 }
 
 /** 读够 PROBE_HTML_LIMIT 个字符就停：够判类，又不把整页塞进内存。读不动就按已读到的部分判。 */
-async function classifyHtmlKind(response) {
+async function readHtmlSample(response) {
   const body = response && response.body;
   if (!body || typeof body.getReader !== 'function') {
     let text = '';
@@ -159,7 +167,7 @@ async function classifyHtmlKind(response) {
     } catch {
       text = '';
     }
-    return htmlKindOf(text);
+    return text.slice(0, PROBE_HTML_LIMIT);
   }
   const reader = body.getReader();
   const decoder = new TextDecoder();
@@ -168,7 +176,7 @@ async function classifyHtmlKind(response) {
     while (text.length < PROBE_HTML_LIMIT) {
       const chunk = await reader.read();
       if (!chunk || chunk.done) break;
-      text += decoder.decode(chunk.value, { stream: true });
+      text += decoder.decode(chunk.value.subarray(0, PROBE_HTML_LIMIT - text.length), { stream: true });
     }
   } catch {
     /* 读不动就按已读到的部分判类 */
@@ -180,7 +188,7 @@ async function classifyHtmlKind(response) {
       /* 丢掉主体失败无需处理 */
     }
   }
-  return htmlKindOf(text);
+  return text.slice(0, PROBE_HTML_LIMIT);
 }
 
 /**
@@ -190,17 +198,31 @@ async function classifyHtmlKind(response) {
  * - 文件请求回 text/html 且是被拦 / 读不懂的异常页 → 可疑响应，交给上层的可疑预算慢重试；
  * - 非 webdav 的 text/html 按现状不在这里判死（不改）。
  */
-async function assertAlive(response, requestedUrl) {
+async function assertAlive(response, requestedUrl, expectedName) {
   const finalUrl = String((response && response.url) || requestedUrl || '');
   const type = String((response && response.headers && response.headers.get('content-type')) || '').toLowerCase();
   const wantsFile = WEBDAV_RE.test(requestedUrl || '') || WEBDAV_RE.test(finalUrl);
-  if (SESSION_URL_RE.test(finalUrl)) {
-    throw new SessionExpiredError('会话已失效：请求被重定向到登录页 ' + finalUrl, { finalUrl });
+  if (isSessionEndpoint(finalUrl)) {
+    throw new SessionExpiredError('请求被重定向到登录页');
   }
   if (!wantsFile || type.indexOf('text/html') === -1) return;
-  const htmlKind = await classifyHtmlKind(response);
+  const disposition = response.headers.get('content-disposition') || '';
+  const serverName = resolveFileName({ disposition, finalUrl });
+  const isHtmlName = name => /\.html?$/i.test(name || '');
+  const candidate = response.ok && WEBDAV_RE.test(pathnameOnly(finalUrl)) &&
+    (isHtmlName(serverName) || isHtmlName(expectedName)) && typeof response.clone === 'function';
+  const sample = await readHtmlSample(candidate ? response.clone() : response);
+  // 课件常内嵌脚本和样式，其中的 password/login 字符串并非页面控件。
+  const markup = candidate ? sample.replace(/<(script|style)\b[^>]*>[\s\S]*?(?:<\/\1\s*>|$)/gi, '') : sample;
+  const htmlKind = htmlKindOf(markup);
+  if (candidate && htmlKind === 'other') {
+    const title = /<title\b[^>]*>([^<]+)<\/title\s*>/i.exec(markup)?.[1].trim();
+    const matchesTitle = title && title.toLowerCase() === String(expectedName || '').replace(/\.html?$/i, '').trim().toLowerCase();
+    const errorTitle = /^(?:error\b|(?:401|403|404|429|500|503)\b|not found\b|access denied\b|错误|访问被拒绝)/i.test(title || '');
+    if (markup.trim() && !errorTitle && (isHtmlName(serverName) || matchesTitle)) return;
+  }
   if (htmlKind === 'login') {
-    throw new SessionExpiredError('会话已失效：文件请求返回了 HTML 页面 ' + finalUrl, { finalUrl, contentType: type });
+    throw new SessionExpiredError('文件请求返回了登录页');
   }
   throw new SuspectResponseError({
     htmlKind,
@@ -237,7 +259,7 @@ export function createFetcher(options) {
   const opts = options || {};
   const outer = opts.signal;
 
-  async function request(url, init) {
+  async function request(url, init, expectedName) {
     const config = init || {};
     const signal = linkSignals(outer, config.signal);
     const requestedUrl = String(url);
@@ -255,7 +277,7 @@ export function createFetcher(options) {
         throw error;
       }
       try {
-        await assertAlive(response, requestedUrl);
+        await assertAlive(response, requestedUrl, expectedName);
         if (!response.ok) throw new HttpError(response.status, response.url || requestedUrl);
       } catch (error) {
         discardBody(response);
@@ -335,14 +357,7 @@ export async function probeAlive(options) {
     return result;
   }
   // 拿到 HTML 就归类（哪怕状态码本身就是 5xx）：alive 恒为 false，分类只用于诊断。
-  let text = '';
-  try {
-    text = await response.text();
-  } catch {
-    text = '';
-  }
-  text = String(text == null ? '' : text);
-  if (text.length > PROBE_HTML_LIMIT) text = text.slice(0, PROBE_HTML_LIMIT);
+  const text = await readHtmlSample(response);
   result.bytes = text.length;
   result.htmlKind = htmlKindOf(text);
   return result;

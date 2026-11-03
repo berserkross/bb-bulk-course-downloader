@@ -181,7 +181,7 @@ export function createDownloadSink({
       const local = new AbortController();
       const linked = linkSignals(signal, local.signal);
       try {
-        const response = await fetcher.fetchOk(entry.url, { signal: linked.signal });
+        const response = await fetcher.fetchOk(entry.url, { signal: linked.signal }, entry.name);
         const sizes = [headerSize(response), lookupSize(entry)].filter((n) => n !== undefined);
         const known = sizes.length ? Math.max.apply(null, sizes) : undefined;
 

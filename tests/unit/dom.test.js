@@ -124,3 +124,12 @@ test('parseContentList 是纯函数：不改动 DOM', () => {
   parseContentList(doc, PAGE_URL);
   assert.equal(doc.body.innerHTML, before);
 });
+
+test('扫描只接收课程站点的 HTTP(S) 链接，路径不能由查询字符串冒充', () => {
+  const result = parse('<a href="https://outside.example/bbcswebdav/x">outside</a>' +
+    '<a href="javascript:void(0)//bbcswebdav/x">script</a>' +
+    '<a href="/redirect?next=/bbcswebdav/x">redirect</a>' +
+    '<a href="//outside.example/listContent.jsp?content_id=x">folder</a>');
+  assert.deepEqual(result.files, []);
+  assert.deepEqual(result.folders, []);
+});

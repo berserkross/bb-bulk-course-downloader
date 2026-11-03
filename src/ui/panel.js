@@ -431,6 +431,8 @@ export function mountPanel(options) {
   /** 文件列表：fileOrder 决定行序，fileMap 存逐 entryId 的状态（重试计数也在这里，绝不跨行串台）。 */
   let fileOrder = [];
   let fileMap = new Map();
+  const deliveredIds = new Set();
+  let batchProgress = false;
   /** 停机横幅的当前文案；空串 = 没有停机。 */
   let haltText = '';
   /** 停机时没下载到的文件数（0 = 没停机）：顶部状态行与摘要头都靠它让位给「已暂停」。 */
@@ -681,6 +683,10 @@ export function mountPanel(options) {
     if (next === 'scanning' || next === 'downloading') {
       summaryEl.hidden = true;
       summaryEl.textContent = '';
+      if (next === 'downloading' && batchProgress) {
+        paintBatchProgress();
+        return;
+      }
       setBar(0);
       progressTextEl.textContent = next === 'scanning' ? '准备扫描…' : '准备下载…';
     }
@@ -823,9 +829,31 @@ export function mountPanel(options) {
     progressTextEl.textContent = '文件夹 ' + scope + ' · 已发现 ' + files + ' 个文件';
   }
 
+  function paintBatchProgress() {
+    const total = fileOrder.length;
+    const done = deliveredIds.size;
+    setBar(total ? done / total * 100 : 0);
+    downloadNote = '已完成 ' + done + ' / ' + total;
+    progressTextEl.textContent = downloadNote + ' 个文件';
+    progressTextEl.title = progressTextEl.textContent;
+    refreshFabStatus();
+  }
+
+  function continueBatch() {
+    batchProgress = true;
+    clearHalted();
+    setNotice('');
+    paintBatchProgress();
+  }
+
   function setDownloadProgress(progress) {
     if (destroyed) return;
     const p = progress || {};
+    if (p.state === 'file-done' && fileMap.has(String(p.entryId))) deliveredIds.add(String(p.entryId));
+    if (batchProgress) {
+      paintBatchProgress();
+      return;
+    }
     const filesDone = pickNumber(p, ['filesDone', 'done'], 0);
     const filesTotal = pickNumber(p, ['filesTotal', 'total'], 0);
     const bytesDone = pickNumber(p, ['bytesDone', 'bytes'], 0);
@@ -1212,6 +1240,11 @@ export function mountPanel(options) {
       });
       nextOrder.push(id);
     }
+    deliveredIds.clear();
+    for (const record of nextMap.values()) {
+      if (record.status === 'done') deliveredIds.add(record.id);
+    }
+    batchProgress = deliveredIds.size > 0;
     fileOrder = nextOrder;
     fileMap = nextMap;
     renderFiles();
@@ -1366,6 +1399,7 @@ export function mountPanel(options) {
     applyFileEvent: applyFileEvent,
     setHalted: setHalted,
     clearHalted: clearHalted,
+    continueBatch,
     setRecovering: setRecovering,
     clearRecovering: clearRecovering,
     showSummary: showSummary,

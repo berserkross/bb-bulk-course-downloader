@@ -1203,7 +1203,8 @@ export function createController(config) {
         return await settle(result);
       }
       console.info('[bbdl] 自动重载续跑', { reloads: attempt });
-      callPanel('setRecovering', { attempt: attempt });
+      if (panel.continueBatch) panel.continueBatch();
+      else callPanel('setRecovering', { attempt: attempt });
       reload();
       // 真浏览器里页面已经在卸载：收尾绝不走到 finish，这里给一个永不 resolve 的 Promise。
       return new Promise(function () {});
@@ -1262,9 +1263,11 @@ export function createController(config) {
       resumes += 1;
       const delay = autoResumeDelay(state.autoResumeUsed - 1);
       // 文案里只出现数字：绝不出现文件名、URL，也不再显性说「登录过期」。
-      notify('正在自动恢复（第 ' + resumes + ' 次）…');
-      // 恢复态交给面板（S27 的方法）：没有就跳过，绝不用旧文案顶替。
-      callPanel('setRecovering', { attempt: resumes });
+      if (panel.continueBatch) panel.continueBatch();
+      else {
+        notify('正在自动恢复（第 ' + resumes + ' 次）…');
+        callPanel('setRecovering', { attempt: resumes });
+      }
       // 撤横幅与切回 downloading 必须在等待之前：这段等待最长 20 秒，横幅不许和新 notice 同时挂着。
       state.haltedPending = [];
       clearHaltedBanner();

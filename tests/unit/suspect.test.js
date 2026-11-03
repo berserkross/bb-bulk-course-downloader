@@ -306,3 +306,16 @@ test('可疑重试尊重调用方传入的 isRetriable：返回 false 时一次�
   assert.equal(defaultCalls, 3, '默认判定（isRetriableError）下可疑必须重试到 SUSPECT_ATTEMPTS');
   console.log('  [证据] isRetriable 覆盖：自定义=' + calls + ' 次，默认=' + defaultCalls + ' 次');
 });
+
+test('HTML 课件保留完整响应流，实际表单与拦截页仍会被拒绝', async t => {
+  const name = 'Image compression with SVD.html';
+  const url = 'https://bb.cuhk.edu.cn/bbcswebdav/xid-123';
+  let body = '<title>Image compression with SVD</title><script>const password = "login";</script>' + 'x'.repeat(200000);
+  t.mock.method(globalThis, 'fetch', async () => new Response(body, { headers: { 'content-type': 'text/html' } }));
+  const get = () => createFetcher().fetchOk(url, {}, name);
+  assert.equal(await (await get()).text(), body);
+  body = '<form><input type="password"></form>';
+  await assert.rejects(get, SessionExpiredError);
+  body = '<title>Access denied</title>';
+  await assert.rejects(get, SuspectResponseError);
+});

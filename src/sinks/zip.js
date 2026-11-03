@@ -186,7 +186,7 @@ export function createZipSink({
 
   /** 一次完整的读文件：CRC 边读边算，字节攒在本次尝试自己的 parts 里（失败即整体丢弃）。 */
   async function readEntry(fetcher, entry, onBytes, onName) {
-    const response = await fetcher.fetchOk(entry.url, { signal });
+    const response = await fetcher.fetchOk(entry.url, { signal }, entry.name);
     const body = response && response.body;
     if (!body || typeof body.getReader !== 'function') {
       throw new Error('响应没有可读主体，拒绝写入空文件');
