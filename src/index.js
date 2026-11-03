@@ -71,10 +71,16 @@ const AUTO_RESUME_DELAYS = [3000, 8000, 20000];
 /** settings 里缺 keepAliveMs / autoResumeMax 时的兜底：与 store.js 的 DEFAULTS 同值。 */
 const DEFAULT_KEEP_ALIVE_MS = 90 * 1000;
 const DEFAULT_AUTO_RESUME_MAX = 3;
-/** 零进展熔断与整批续跑熔断共用的提示文案：绝不拼 URL / 文件名 / 秒数。 */
-const AUTO_RESUME_STOP_NOTICE = '自动重试已停止：连续两次没有任何进展。请刷新页面重新登录后点「刷新后继续」。';
 /** 整批允许累计自动续跑多少次就熔断：防「每几秒恢复一次」的无限乒乓。 */
 const AUTO_RESUME_MAX_TOTAL = 20;
+/** settings 里缺 autoReloadMax 时的兜底：与 store.js 的 DEFAULTS 同值（docs/m7-quiet.md §2）。 */
+const DEFAULT_AUTO_RELOAD_MAX = 2;
+/** 「停机 → 强制重载页面 → 重载后自动续跑」的意图：会话级存储，关掉标签页就该消失。 */
+const INTENT_KEY = 'bbdl:resume-intent:v1';
+/** 意图最长活 30 分钟：隔天开着的标签页不许自己跑起来。 */
+const INTENT_TTL_MS = 30 * 60 * 1000;
+/** 交回用户时的面板提示：只拼数字，绝不出现「登录 / 过期」等字样（§1 文案红线）。 */
+const PAUSED_NOTICE_PREFIX = '已暂停，未下载 ';
 
 /**
  * 该不该自动续跑：只认「会话过期」这一种停机，用户取消之后一次都不许再自己转。
@@ -101,6 +107,48 @@ export function autoResumeDelay(used) {
   const index = Number.isFinite(used) && used > 0 ? Math.floor(used) : 0;
   if (index >= AUTO_RESUME_DELAYS.length) return AUTO_RESUME_DELAYS[AUTO_RESUME_DELAYS.length - 1];
   return AUTO_RESUME_DELAYS[index];
+}
+
+/**
+ * 默认意图存储：包一层 sessionStorage。隐私模式下连 getItem 都会抛，所以读、写、清
+ * 三条路径各自静默 —— 存不住意图最多是「不自动续跑」，绝不许把下载本身拦下来。
+ * @returns {{ read: () => any, write: (value: any) => void, clear: () => void }}
+ */
+function sessionIntentStore() {
+  function bucket() {
+    try {
+      return typeof sessionStorage === 'undefined' ? null : sessionStorage;
+    } catch (err) {
+      return null;
+    }
+  }
+  return {
+    read() {
+      try {
+        const store = bucket();
+        const raw = store ? store.getItem(INTENT_KEY) : null;
+        return raw ? JSON.parse(raw) : null;
+      } catch (err) {
+        return null;
+      }
+    },
+    write(value) {
+      try {
+        const store = bucket();
+        if (store) store.setItem(INTENT_KEY, JSON.stringify(value));
+      } catch (err) {
+        /* 写不进就是这一次没有意图：不重载也绝不抛 */
+      }
+    },
+    clear() {
+      try {
+        const store = bucket();
+        if (store) store.removeItem(INTENT_KEY);
+      } catch (err) {
+        /* 同上：清不掉最多让下一次按 stale 再清一遍 */
+      }
+    }
+  };
 }
 
 /** 心跳地址要丢掉的查询参数：它们改的是服务端视图状态（mode=reset 会重置进度、list_display 换视图），保活不该带。 */
@@ -227,6 +275,16 @@ export function createController(config) {
   const mergeManifests = typeof deps.mergeManifests === 'function' ? deps.mergeManifests : null;
   /** 续跑等待可注入：单测注入瞬时实现，生产默认仍是可取消的 waitAbortable。 */
   const wait = typeof deps.wait === 'function' ? deps.wait : waitAbortable;
+  /** 强制重载可注入：单测换成 spy，绝不真的把测试进程重载掉（§3.4）。 */
+  const reload = typeof deps.reload === 'function'
+    ? deps.reload
+    : function () {
+        if (loc && typeof loc.reload === 'function') loc.reload();
+      };
+  /** 时钟可注入：意图的 createdAt / 30 分钟过期判定都读它，单测不必真等。 */
+  const now = typeof deps.now === 'function' ? deps.now : Date.now;
+  /** 意图存储可注入：默认是 sessionStorage，隐私模式下读写异常全部静默。 */
+  const intentStore = deps.intentStore && typeof deps.intentStore === 'object' ? deps.intentStore : sessionIntentStore();
   /** 下载边界可注入：测试里换成收集器，真实运行时才碰 a[download]。 */
   const writeDownload = typeof cfg.downloadTextFile === 'function' ? cfg.downloadTextFile : null;
 
@@ -307,6 +365,14 @@ export function createController(config) {
   const ready = hydrate().then(function (value) {
     pushHistory();
     return value;
+  });
+
+  /**
+   * 重载残留的续跑意图：等 ready（清单与句柄都就位）之后再消费，绝不在同步栈里抢跑（§3.3）。
+   * 挂在这里而不是 mount 里，是因为面板与落盘模块的接线两种入口都要覆盖到。
+   */
+  const resumeIntent = ready.then(function () {
+    return consumeIntent();
   });
 
   async function safeCall(fn) {
@@ -747,28 +813,41 @@ export function createController(config) {
     if (!summary) summary = await refreshSkips(null, null);
 
     let choice;
-    try {
-      choice = await openSelectDialog(state.entries, {
-        document: doc,
-        settings,
-        // 勾选记忆按 (courseId, pageId) 分桶：换课程不串台，同一门课来回切各自保留。
-        courseId: courseId,
-        pageId: contentId,
-        // 续接上次目录时不再弹选择器：直接把这个已授权的句柄交回去。
-        pickDirectory: state.resumeHandle ? function () { return state.resumeHandle; } : pickDirectory,
-        skipInfo: summary,
-        onProbeSizes: probeSizes,
-        // 选目录走回调：对话框只负责把点击原样转过来，用户手势不能跨 await。
-        onPickDirectory: pickDirectoryForDialog,
-        onRefreshSkips: refreshDialogSkips,
-        onClose: abortPick,
-        onSettingsChange(patch) {
-          Object.assign(settings, saveSettings(patch));
-        }
-      });
-    } catch (err) {
-      panel.fail(describe(err));
-      return null;
+    if (silentResume) {
+      // 重载后续跑（§3.3）：这次没有人能点选择框，等价于「对话框里全选、目录已选」。
+      silentResume = false;
+      // 重载之后没有人能勾选，按清单 + 磁盘比对取待办：盘上已有、清单说 done 的一律不重下。
+      // （skipExisting:false 会把整批重下一遍，同名文件还会被 dedupePaths 加上 (2) 后缀。）
+      choice = {
+        entries: state.entries,
+        dirHandle: state.resumeHandle || null,
+        expectedBytes: 0,
+        skipExisting: true
+      };
+    } else {
+      try {
+        choice = await openSelectDialog(state.entries, {
+          document: doc,
+          settings,
+          // 勾选记忆按 (courseId, pageId) 分桶：换课程不串台，同一门课来回切各自保留。
+          courseId: courseId,
+          pageId: contentId,
+          // 续接上次目录时不再弹选择器：直接把这个已授权的句柄交回去。
+          pickDirectory: state.resumeHandle ? function () { return state.resumeHandle; } : pickDirectory,
+          skipInfo: summary,
+          onProbeSizes: probeSizes,
+          // 选目录走回调：对话框只负责把点击原样转过来，用户手势不能跨 await。
+          onPickDirectory: pickDirectoryForDialog,
+          onRefreshSkips: refreshDialogSkips,
+          onClose: abortPick,
+          onSettingsChange(patch) {
+            Object.assign(settings, saveSettings(patch));
+          }
+        });
+      } catch (err) {
+        panel.fail(describe(err));
+        return null;
+      }
     }
     if (!choice || !Array.isArray(choice.entries) || !choice.entries.length) return null;
 
@@ -969,6 +1048,70 @@ export function createController(config) {
     return Math.floor(configured);
   }
 
+  /* ---------------- 强制重载续跑：意图与恢复态（§3） ---------------- */
+
+  function autoReloadLimit() {
+    const configured = settings ? settings.autoReloadMax : undefined;
+    if (!Number.isFinite(configured) || configured < 0) return DEFAULT_AUTO_RELOAD_MAX;
+    return Math.floor(configured);
+  }
+
+  /**
+   * 恢复态由面板自己渲染（S27 并行创建 setRecovering / clearRecovering）：
+   * 方法不存在就跳过，连调用抛错也只当没有 —— 恢复态是显示，绝不能拦住下载。
+   */
+  function callPanel(name, arg) {
+    try {
+      if (typeof panel[name] === 'function') panel[name](arg);
+    } catch (err) {
+      /* 面板不认这个方法 / 内部抛了：都不影响下载结果 */
+    }
+  }
+
+  /** 已暂停提示：只有数字，与「登录 / 过期」无关，绝不回显文件名或 URL。 */
+  function pausedNotice(count) {
+    return PAUSED_NOTICE_PREFIX + nonNegCount(count) + ' 个文件。';
+  }
+
+  /** 读意图：存储层怎么抛都只当「没有意图」。 */
+  function readIntent() {
+    try {
+      const value = typeof intentStore.read === 'function' ? intentStore.read() : null;
+      return value && typeof value === 'object' ? value : null;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  function writeIntent(value) {
+    try {
+      if (typeof intentStore.write === 'function') intentStore.write(value);
+    } catch (err) {
+      /* 写不进就是这一次没有意图：不重载也绝不抛 */
+    }
+  }
+
+  function clearIntent() {
+    try {
+      if (typeof intentStore.clear === 'function') intentStore.clear();
+    } catch (err) {
+      /* 清不掉最多让下一次按 stale 再清一遍 */
+    }
+  }
+
+  /**
+   * 重载续跑的一次性旁路：整页刚重载完，没有人能点选择框，所以这一次
+   * startDownload 直接按「整批 + 已授权句柄」开工。只由 consumeIntent 置位、
+   * 由 startDownload 读后立刻复位，其它任何路径都看不到它。
+   */
+  let silentResume = false;
+
+  /** 意图里的 reloads 归一化成非负整数：脏数据按 0 算，绝不让它绕过上限。 */
+  function intentReloads(intent) {
+    const n = intent ? intent.reloads : 0;
+    return Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 0;
+  }
+
   /**
    * 「一次 HTML 响应 = 整批停机」的解药：不再先探活（旧探活把 text/html 一律判死，
    * 用户遇到的「第 4 个文件停机、点一下就能接着下」正被它误杀），改成直接续跑 + 有界熔断：
@@ -992,17 +1135,70 @@ export function createController(config) {
     function notify(text) {
       if (typeof panel.setNotice === 'function') panel.setNotice(text);
     }
+    /** 收尾统一入口：先撤恢复态再走既有 finish（finish 的调用次数与参数都不变）。 */
+    async function settle(result) {
+      callPanel('clearRecovering');
+      return await finish(result);
+    }
+    /**
+     * 两个 give-up 点（连续零进展、整批 20 次闸门）共用的有界阶梯，顺序是契约（§3.2）：
+     * 用户取消 → 开关关闭 → 次数用尽 → 写意图并强制重载。取消永远优先；
+     * 重载次数只认上一次写下的意图，绝不在内存里自己加。
+     */
+    async function escalate(gate, pendingList, result) {
+      // 既有诊断一字不动：用户与既有测试都靠这一行判断「为什么停手」。
+      console.info('[bbdl] 自动重试熔断', gate);
+      if (signal && signal.aborted) {
+        clearIntent();
+        return await settle(result);
+      }
+      if (settings.autoReload === false) {
+        notify(pausedNotice(pendingList.length));
+        console.info('[bbdl] 自动重载已关闭');
+        return await settle(result);
+      }
+      const reloads = intentReloads(readIntent());
+      if (reloads >= autoReloadLimit()) {
+        notify(pausedNotice(pendingList.length));
+        console.info('[bbdl] 自动重载已达上限', { reloads: reloads });
+        clearIntent();
+        return await settle(result);
+      }
+      // 先落库再写意图：重载会把内存里的待写记录整个丢掉。
+      await flushRecords();
+      const attempt = reloads + 1;
+      writeIntent({
+        courseId: courseId,
+        contentId: contentId,
+        pendingIds: pendingList.map(entryIdOf).filter(function (id) { return Boolean(id); }),
+        dirName: dirHandle && dirHandle.name ? String(dirHandle.name) : '',
+        createdAt: now(),
+        reloads: attempt
+      });
+      console.info('[bbdl] 自动重载续跑', { reloads: attempt });
+      callPanel('setRecovering', { attempt: attempt });
+      reload();
+      // 真浏览器里页面已经在卸载：收尾绝不走到 finish，这里给一个永不 resolve 的 Promise。
+      return new Promise(function () {});
+    }
     for (;;) {
       const result = await runDownload(batch, dirHandle, signal, { seedFiles: seedFiles });
       const halted = result ? result.halted : null;
       const aborted = Boolean((signal && signal.aborted) || (result && result.aborted));
       const pending = halted && Array.isArray(halted.pending) ? halted.pending : [];
       const target = pending.length ? pendingUrl(pending[0]) : '';
+      // 停机那一刻只留一行诊断：面板文案里绝不出现「登录」（§1 文案红线）。
+      if (halted) console.info('[bbdl] 停机', { reason: halted.reason, pending: pending.length });
       // 没有 pending、拿不到地址、或不该续跑（用户取消 / 非会话过期 / 次数用尽）：走原来的收尾。
       if (!target || !shouldAutoResume({ halted: halted, aborted: aborted, used: state.autoResumeUsed, max: state.autoResumeMax })) {
-        return await finish(result);
+        // 用户取消、或这一批压根没停机（正常收尾）：意图作废，不许下次开页自己跑。
+        if (aborted || !halted) clearIntent();
+        return await settle(result);
       }
-      if (signal && signal.aborted) return await finish(result);
+      if (signal && signal.aborted) {
+        clearIntent();
+        return await settle(result);
+      }
       const ok = result && Array.isArray(result.ok) ? result.ok : [];
       if (ok.length > 0) {
         // 有进展就重置预算：历史次数不该连坐这一次能下的文件。
@@ -1010,32 +1206,31 @@ export function createController(config) {
         zeroProgress = 0;
       } else {
         zeroProgress += 1;
-        if (zeroProgress >= 2) {
-          // 连着两轮一个文件都没下成：这是真死，别再自动重试。
-          notify(AUTO_RESUME_STOP_NOTICE);
-          console.info('[bbdl] 自动重试熔断', { zeroProgress: zeroProgress, pending: pending.length });
-          return await finish(result);
-        }
+        // 连着两轮一个文件都没下成：这是真死，交 escalate 决定「暂停」还是「强制重载续跑」。
+        if (zeroProgress >= 2) return await escalate({ zeroProgress: zeroProgress, pending: pending.length }, pending, result);
       }
+      // 有进展但每隔几秒就停一次：整批续跑预算已撞满，同样交 escalate。
       if (resumes >= AUTO_RESUME_MAX_TOTAL) {
-        // 有进展但每隔几秒就停一次：整批续跑预算已撞满。
-        notify(AUTO_RESUME_STOP_NOTICE);
-        console.info('[bbdl] 自动重试熔断', { resumes: resumes });
-        return await finish(result);
+        return await escalate({ resumes: resumes, pending: pending.length }, pending, result);
       }
       // 先落库再续跑：待写记录不跨这一轮。
       await flushRecords();
       state.autoResumeUsed += 1;
       resumes += 1;
       const delay = autoResumeDelay(state.autoResumeUsed - 1);
-      // 文案里只出现数字：绝不出现文件名或 URL。
-      notify('疑似登录过期，' + Math.round(delay / 1000) + ' 秒后自动重试（第 ' + resumes + ' 次）…');
+      // 文案里只出现数字：绝不出现文件名、URL，也不再显性说「登录过期」。
+      notify('正在自动恢复（第 ' + resumes + ' 次）…');
+      // 恢复态交给面板（S27 的方法）：没有就跳过，绝不用旧文案顶替。
+      callPanel('setRecovering', { attempt: resumes });
       // 撤横幅与切回 downloading 必须在等待之前：这段等待最长 20 秒，横幅不许和新 notice 同时挂着。
       state.haltedPending = [];
       clearHaltedBanner();
       panel.setState('downloading');
       await wait(delay, signal);
-      if (signal && signal.aborted) return await finish(result);
+      if (signal && signal.aborted) {
+        clearIntent();
+        return await settle(result);
+      }
       // 下一轮就是刚才 pending 的那几条：不重种行、不重扫。
       batch = pending;
       seedFiles = false;
@@ -1510,6 +1705,54 @@ export function createController(config) {
     return startDownload();
   }
 
+  /* ---------------- 重载之后的自动续跑（§3.3） ---------------- */
+
+  /**
+   * 消费上一次留下的续跑意图。
+   * 铁律：整页重载之后没有用户手势，所以绝不重新选目录（showDirectoryPicker 必抛），
+   * 只认已经落库的句柄 + 一次 request:false 的权限查询。每一步失败都只 console.warn。
+   * @returns {Promise<any>} 没续跑就返回 null
+   */
+  async function consumeIntent() {
+    const intent = readIntent();
+    if (!intent) return null;
+    try {
+      const createdAt = Number.isFinite(intent.createdAt) ? intent.createdAt : 0;
+      const stale = !createdAt || now() - createdAt > INTENT_TTL_MS;
+      const pendingIds = Array.isArray(intent.pendingIds) ? intent.pendingIds : [];
+      const recorded = intent.courseId === null || intent.courseId === undefined ? '' : String(intent.courseId);
+      // 过期或不是这门课：清掉不做（用户可能把这个标签页换成了另一门课）。
+      if (stale || recorded !== String(courseId)) {
+        clearIntent();
+        return null;
+      }
+      if (settings.autoReload === false) return null;
+      const reloads = intentReloads(intent);
+      console.info('[bbdl] 重载后续跑', { pending: pendingIds.length, reloads: reloads });
+
+      const handle = await safeCall(() => (store ? store.loadHandle(courseId) : null));
+      const status = await ensurePermissionStatus(handle, false);
+      if (!handle || status !== 'granted') {
+        // 没句柄或权限没了：绝不自动跑，横幅交回用户点「继续」（request:false 只查询，不弹窗）。
+        callPanel('setHalted', { reason: 'session-expired', pendingCount: pendingIds.length });
+        return null;
+      }
+      state.dirHandle = handle;
+      state.resumeHandle = handle;
+      if (!state.entries.length) await startScan();
+      if (!state.entries.length) return null;
+      silentResume = true;
+      try {
+        return await startDownload();
+      } finally {
+        silentResume = false;
+      }
+    } catch (err) {
+      console.warn('[bbdl] 自动续跑失败', { reason: err && err.message ? err.message : String(err) });
+      return null;
+    }
+  }
+
   function getState() {
     return {
       courseId: courseId,
@@ -1542,6 +1785,8 @@ export function createController(config) {
     resumePending,
     getState,
     ready,
+    /** 重载后自动续跑的那一跳：ready 之后才 resolve，永不 reject。 */
+    resumeIntent,
     panel,
     flushRecords,
     exportManifest,

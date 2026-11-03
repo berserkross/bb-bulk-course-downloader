@@ -162,7 +162,8 @@ test('AC3/C：v2.7.1 起不再靠探活判断，连续两次零进展才停 —�
   let round = 0;
   let real = null;
   const h = harness({
-    settings: { preserveTree: true, downloadConcurrency: 2, autoResumeMax: 3 },
+    // autoReload:false：这条验的是「连续零进展就地暂停」，强制重载续跑在 reload-resume.test.js。
+    settings: { preserveTree: true, downloadConcurrency: 2, autoResumeMax: 3, autoReload: false },
     behave: async function (entries) {
       round += 1;
       if (round === 1) {
@@ -209,16 +210,16 @@ test('AC3/C：v2.7.1 起不再靠探活判断，连续两次零进展才停 —�
   assert.deepEqual(h.controller.getState().haltedPending.map(function (entry) { return entry.id; }), ['e2']);
 
   const notices = h.panel.texts('setNotice');
-  const stopNotices = notices.filter(function (text) { return text.includes('自动重试已停止'); });
-  assert.equal(stopNotices.length, 1, '熔断提示只出现一次');
+  const stopNotices = notices.filter(function (text) { return text.includes('已暂停，未下载'); });
+  assert.equal(stopNotices.length, 1, '暂停提示只出现一次');
   assert.equal(
     stopNotices[0],
-    '自动重试已停止：连续两次没有任何进展。请刷新页面重新登录后点「刷新后继续」。',
-    '熔断文案逐字照抄'
+    '已暂停，未下载 1 个文件。',
+    '暂停文案逐字照抄（面板上一律不许出现「登录」）'
   );
   assert.equal(/http|\?|\//.test(stopNotices[0]), false, '熔断文案里不许出现 URL / 查询串 / 路径');
   assert.equal(
-    notices.filter(function (text) { return text.includes('秒后自动重试'); }).length,
+    notices.filter(function (text) { return text.includes('正在自动恢复'); }).length,
     2,
     '有进展那一轮与之后零进展的第一轮各给一次续跑提示'
   );

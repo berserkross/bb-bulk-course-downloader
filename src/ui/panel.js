@@ -37,6 +37,28 @@ export function redactUrlText(value) {
  */
 const ABSOLUTE_URL_LOOSE = /(?:https?:)?\/\/[^\s?#]*(?:\?[^\s#]*)?(?:#[^\s]*)?/gi;
 
+/**
+ * §1 红线：面板 DOM 内的可见文本不许出现 登录 / 过期 / 会话失效 / 重新登录 / 认证。
+ * 命中敏感句时面板照旧有话说，只是换成中性句 —— 原因只留给 console。
+ */
+const QUIET_TEXT = /登录|过期|会话失效|重新登录|认证/;
+
+/** 长句场景（notice / 错误行 / 状态行）：整句换掉。 */
+export const QUIET_NOTICE_TEXT = '请求被拒绝，稍后会自动重试。';
+/** 短句场景（摘要里失败行的 reason）：一行位置塞不下长句。 */
+export const QUIET_REASON_TEXT = '请求被拒绝';
+
+function quietText(value) {
+  const text = String(value == null ? '' : value);
+  if (!text.trim()) return '';
+  return QUIET_TEXT.test(text) ? QUIET_NOTICE_TEXT : text;
+}
+
+function quietReasonText(value) {
+  const text = String(value == null ? '' : value);
+  return QUIET_TEXT.test(text) ? QUIET_REASON_TEXT : text;
+}
+
 export function stripUrlText(value) {
   const text = value == null ? '' : String(value);
   return text.replace(ABSOLUTE_URL_LOOSE, '').replace(/\s{2,}/g, ' ').trim();
@@ -361,12 +383,14 @@ function reusePanel(root, opts) {
     applyFileEvent: noop,
     setHalted: noop,
     clearHalted: noop,
+    setRecovering: noop,
+    clearRecovering: noop,
     showSummary: noop,
     setCourse: noop,
     setHistory: noop,
     rebind: noop,
     fail(message) {
-      if (statusEl) statusEl.textContent = '出错了：' + redactUrlText(message);
+      if (statusEl) statusEl.textContent = '出错了：' + quietText(redactUrlText(message));
       if (root) root.dataset.state = 'error';
     },
     destroy: noop
@@ -411,6 +435,8 @@ export function mountPanel(options) {
   let haltText = '';
   /** 停机时没下载到的文件数（0 = 没停机）：顶部状态行与摘要头都靠它让位给「已暂停」。 */
   let haltPendingCount = 0;
+  /** 自动恢复的轮次（0 = 没在恢复）：压过停机态，只报「正在自动恢复（第 N 次）」。 */
+  let recoveringAttempt = 0;
   /** 收起条上的下载进度短串（如「下载 12/132」）：setDownloadProgress 维护，render 不重算。 */
   let downloadNote = '';
 
@@ -505,6 +531,23 @@ export function mountPanel(options) {
   concInput.value = String(settings.downloadConcurrency || 4);
   concRow.appendChild(concInput);
   settingsEl.appendChild(concRow);
+  // 两行都只走既有 emitSettings(patch)；挂载时只读设置，绝不反写。
+  const expandRow = node('label', 'bbdl-settings__row');
+  const expandInput = node('input');
+  expandInput.type = 'checkbox';
+  expandInput.checked = settings.panelCollapsed === false;
+  expandRow.appendChild(expandInput);
+  expandRow.appendChild(node('span', null, '打开页面时展开面板'));
+  settingsEl.appendChild(expandRow);
+
+  const autoReloadRow = node('label', 'bbdl-settings__row');
+  const autoReloadInput = node('input');
+  autoReloadInput.type = 'checkbox';
+  autoReloadInput.checked = settings.autoReload !== false;
+  autoReloadRow.appendChild(autoReloadInput);
+  autoReloadRow.appendChild(node('span', null, '会话异常时自动重载续跑'));
+  settingsEl.appendChild(autoReloadRow);
+
   settingsEl.appendChild(node('p', 'bbdl-note', '目录结构开关在「选择并下载」对话框里。'));
 
   // 导出清单：纯本地动作（生成 Blob 下载），结果只走 notice 行，不弹窗。
@@ -603,15 +646,18 @@ export function mountPanel(options) {
     current = next;
     context = {
       entryCount: nextContext && typeof nextContext.entryCount === 'number' ? nextContext.entryCount : context.entryCount,
-      // 所有进 DOM 的错误文案都在这里过一遍脱敏，调用方不必记得这件事。
-      message: nextContext && nextContext.message ? redactUrlText(nextContext.message) : ''
+      // 所有进 DOM 的错误文案都在这里过一遍脱敏，调用方不必记得这件事；命中红线的整句不上屏。
+      message: nextContext && nextContext.message ? quietText(redactUrlText(nextContext.message)) : ''
     };
 
     root.dataset.state = next;
     const view = viewFor(next, context);
-    // 停机收尾时 viewFor 给的是「已完成」，与正上方的停机横幅打脸：这里把状态行换成暂停口径。
-    if (next === 'done' && haltPendingCount > 0) {
-      view.status = '已暂停，未下载 ' + haltPendingCount + ' 个文件。重新登录后再点「刷新后继续」。';
+    // 恢复态压过一切：状态行只说「正在自动恢复（第 N 次）」，原因一个字都不提。
+    if (recoveringAttempt > 0) {
+      view.status = '正在自动恢复（第 ' + recoveringAttempt + ' 次）…';
+    } else if (next === 'done' && haltPendingCount > 0) {
+      // 停机收尾时 viewFor 给的是「已完成」，与正上方的停机横幅打脸：这里把状态行换成暂停口径。
+      view.status = '已暂停，未下载 ' + haltPendingCount + ' 个文件。';
     }
 
     applyButton(scanBtn, view.scan);
@@ -664,7 +710,8 @@ export function mountPanel(options) {
   function refreshFabStatus() {
     if (destroyed) return;
     let text = '';
-    if (haltText) text = '已暂停';
+    if (recoveringAttempt > 0) text = '恢复中';
+    else if (haltText) text = '已暂停';
     else if (current === 'error') text = '出错';
     else if (current === 'downloading') text = downloadNote || '下载中';
     else if (current === 'scanning') text = '扫描中';
@@ -681,6 +728,14 @@ export function mountPanel(options) {
     const value = Number.isFinite(parsed) ? Math.max(1, Math.min(8, parsed)) : 4;
     concInput.value = String(value);
     emitSettings({ downloadConcurrency: value });
+  });
+
+  expandInput.addEventListener('change', function () {
+    emitSettings({ panelCollapsed: !expandInput.checked });
+  });
+
+  autoReloadInput.addEventListener('change', function () {
+    emitSettings({ autoReload: autoReloadInput.checked });
   });
 
   function requestCancel() {
@@ -742,6 +797,7 @@ export function mountPanel(options) {
     // 新一轮开始（扫描 / 下载）：上一批的停机数字与进度短串都不许泄漏进来。
     if (state === 'scanning' || state === 'downloading') {
       haltPendingCount = 0;
+      recoveringAttempt = 0;
       downloadNote = '';
     }
     const nextContext = {};
@@ -797,7 +853,7 @@ export function mountPanel(options) {
   /** 临时提示（降级说明、跳过结果）。与状态行分开：render() 会重写状态行，不该把提示冲掉。 */
   function setNotice(text) {
     if (destroyed) return;
-    const value = text == null ? '' : redactUrlText(String(text));
+    const value = text == null ? '' : quietText(redactUrlText(String(text)));
     noticeEl.textContent = value;
     noticeEl.hidden = !value;
     noticeEl.title = value;
@@ -973,7 +1029,7 @@ export function mountPanel(options) {
       nameEl.title = entry.name || '';
       const pathEl = node('span', 'bbdl-failed__path', path);
       pathEl.title = path;
-      const reasonEl = node('span', 'bbdl-failed__reason', stripUrlText((item && item.error) || '未知错误'));
+      const reasonEl = node('span', 'bbdl-failed__reason', quietReasonText(stripUrlText((item && item.error) || '未知错误')));
       reasonEl.title = reasonEl.textContent;
       li.appendChild(nameEl);
       li.appendChild(pathEl);
@@ -1167,7 +1223,8 @@ export function mountPanel(options) {
 
   function paintHalt() {
     haltEl.textContent = '';
-    if (!haltText) {
+    // 恢复中不播报停机：横幅整个收起（haltText 留着，clearRecovering 时原样回来）。
+    if (!haltText || recoveringAttempt > 0) {
       haltEl.hidden = true;
       return;
     }
@@ -1175,18 +1232,18 @@ export function mountPanel(options) {
     textEl.title = haltText;
     haltEl.appendChild(textEl);
     // 没有 onResumePending 就一个按钮都不渲染（不是禁用，是不存在）。
-    if (onResumePending) haltEl.appendChild(button('bbdl-btn bbdl-btn--small', 'resume-pending', '刷新后继续'));
+    if (onResumePending) haltEl.appendChild(button('bbdl-btn bbdl-btn--small', 'resume-pending', '继续'));
     haltEl.hidden = false;
   }
 
-  /** 停机横幅：文案固定，只有「N 个未下载」随 pendingCount 变。 */
+  /** 停机横幅：只说状态，只有「N 个未下载」随 pendingCount 变；原因一个字都不上屏。 */
   function setHalted(info) {
     if (destroyed) return;
     const i = info || {};
     const given = finiteNumber(i.pendingCount);
     const pending = given != null && given >= 0 ? Math.floor(given) : countPendingRows();
     haltPendingCount = pending;
-    haltText = '登录已过期，已暂停。刷新页面重新登录后再继续（' + pending + ' 个未下载）。';
+    haltText = '已暂停（' + pending + ' 个未下载）。';
     paintHalt();
     refreshFabStatus();
   }
@@ -1198,6 +1255,24 @@ export function mountPanel(options) {
     haltEl.textContent = '';
     haltEl.hidden = true;
     refreshFabStatus();
+  }
+
+  /** 自动恢复中：状态行报「第 N 次」、收起条报「恢复中」、横幅收起；与停机态并存，恢复态优先。 */
+  function setRecovering(info) {
+    if (destroyed) return;
+    const i = info || {};
+    const given = finiteNumber(i.attempt);
+    recoveringAttempt = given != null && given >= 1 ? Math.floor(given) : 1;
+    paintHalt();
+    render(current, context);
+  }
+
+  /** 恢复结束：回到调用前的状态（停机的话横幅与暂停口径的状态行原样回来）。 */
+  function clearRecovering() {
+    if (destroyed) return;
+    recoveringAttempt = 0;
+    paintHalt();
+    render(current, context);
   }
 
   /** 逐文件事件：只按 entryId 更新自己那一行，重试计数天然互不污染。 */
@@ -1248,6 +1323,8 @@ export function mountPanel(options) {
       settings = o.settings;
       probeInput.checked = settings.probeSizes !== false;
       concInput.value = String(settings.downloadConcurrency || 4);
+      expandInput.checked = settings.panelCollapsed === false;
+      autoReloadInput.checked = settings.autoReload !== false;
     }
     if (typeof o.onScan === 'function') onScan = o.onScan;
     if (typeof o.onDownload === 'function') onDownload = o.onDownload;
@@ -1285,6 +1362,8 @@ export function mountPanel(options) {
     applyFileEvent: applyFileEvent,
     setHalted: setHalted,
     clearHalted: clearHalted,
+    setRecovering: setRecovering,
+    clearRecovering: clearRecovering,
     showSummary: showSummary,
     setCourse: setCourse,
     setHistory: setHistory,

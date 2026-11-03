@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BB 课件批量下载
 // @namespace    bb-bulk-course-downloader
-// @version      2.7.1
+// @version      2.8.0
 // @description  扫描 Blackboard 课程内容，勾选后按原始目录结构批量下载课件
 // @updateURL    https://raw.githubusercontent.com/berserkross/bb-bulk-course-downloader/main/bb-bulk-course-downloader.user.js
 // @downloadURL  https://raw.githubusercontent.com/berserkross/bb-bulk-course-downloader/main/bb-bulk-course-downloader.user.js
@@ -3025,7 +3025,11 @@
     // 保活心跳间隔：门户会话闲置太久必死，下载期间定期回敲一次最省事的续命手段
     keepAliveMs: 90 * 1e3,
     // 自动续跑的连续零进展熔断阈值（次）：有进展即归零，撞满就交回用户，不再自己转圈
-    autoResumeMax: 3
+    autoResumeMax: 3,
+    // 自动续跑也救不回来时，强制重载页面再续跑（docs/m7-quiet.md §2）：默认开，用户可在面板关掉
+    autoReload: true,
+    // 同一次停机里最多重载几次（含当前这次）：撞满就暂停，交给用户点「继续」
+    autoReloadMax: 2
   };
   function loadSettings() {
     try {
@@ -3968,6 +3972,18 @@
     return text.replace(ABSOLUTE_URL, "$1").replace(RELATIVE_WITH_QUERY, "$1");
   }
   var ABSOLUTE_URL_LOOSE = /(?:https?:)?\/\/[^\s?#]*(?:\?[^\s#]*)?(?:#[^\s]*)?/gi;
+  var QUIET_TEXT = /登录|过期|会话失效|重新登录|认证/;
+  var QUIET_NOTICE_TEXT = "\u8BF7\u6C42\u88AB\u62D2\u7EDD\uFF0C\u7A0D\u540E\u4F1A\u81EA\u52A8\u91CD\u8BD5\u3002";
+  var QUIET_REASON_TEXT = "\u8BF7\u6C42\u88AB\u62D2\u7EDD";
+  function quietText(value) {
+    const text = String(value == null ? "" : value);
+    if (!text.trim()) return "";
+    return QUIET_TEXT.test(text) ? QUIET_NOTICE_TEXT : text;
+  }
+  function quietReasonText(value) {
+    const text = String(value == null ? "" : value);
+    return QUIET_TEXT.test(text) ? QUIET_REASON_TEXT : text;
+  }
   function stripUrlText(value) {
     const text = value == null ? "" : String(value);
     return text.replace(ABSOLUTE_URL_LOOSE, "").replace(/\s{2,}/g, " ").trim();
@@ -4204,12 +4220,14 @@
       applyFileEvent: noop,
       setHalted: noop,
       clearHalted: noop,
+      setRecovering: noop,
+      clearRecovering: noop,
       showSummary: noop,
       setCourse: noop,
       setHistory: noop,
       rebind: noop,
       fail(message) {
-        if (statusEl) statusEl.textContent = "\u51FA\u9519\u4E86\uFF1A" + redactUrlText(message);
+        if (statusEl) statusEl.textContent = "\u51FA\u9519\u4E86\uFF1A" + quietText(redactUrlText(message));
         if (root) root.dataset.state = "error";
       },
       destroy: noop
@@ -4242,6 +4260,7 @@
     let fileMap = /* @__PURE__ */ new Map();
     let haltText = "";
     let haltPendingCount = 0;
+    let recoveringAttempt = 0;
     let downloadNote = "";
     const root = node("div", "bbdl-panel");
     root.dataset.state = "idle";
@@ -4318,6 +4337,20 @@
     concInput.value = String(settings.downloadConcurrency || 4);
     concRow.appendChild(concInput);
     settingsEl.appendChild(concRow);
+    const expandRow = node("label", "bbdl-settings__row");
+    const expandInput = node("input");
+    expandInput.type = "checkbox";
+    expandInput.checked = settings.panelCollapsed === false;
+    expandRow.appendChild(expandInput);
+    expandRow.appendChild(node("span", null, "\u6253\u5F00\u9875\u9762\u65F6\u5C55\u5F00\u9762\u677F"));
+    settingsEl.appendChild(expandRow);
+    const autoReloadRow = node("label", "bbdl-settings__row");
+    const autoReloadInput = node("input");
+    autoReloadInput.type = "checkbox";
+    autoReloadInput.checked = settings.autoReload !== false;
+    autoReloadRow.appendChild(autoReloadInput);
+    autoReloadRow.appendChild(node("span", null, "\u4F1A\u8BDD\u5F02\u5E38\u65F6\u81EA\u52A8\u91CD\u8F7D\u7EED\u8DD1"));
+    settingsEl.appendChild(autoReloadRow);
     settingsEl.appendChild(node("p", "bbdl-note", "\u76EE\u5F55\u7ED3\u6784\u5F00\u5173\u5728\u300C\u9009\u62E9\u5E76\u4E0B\u8F7D\u300D\u5BF9\u8BDD\u6846\u91CC\u3002"));
     const exportRow = node("div", "bbdl-settings__row");
     const exportBtn = button("bbdl-btn bbdl-btn--small", "export-manifest", "\u5BFC\u51FA\u6E05\u5355");
@@ -4399,13 +4432,15 @@
       current = next;
       context = {
         entryCount: nextContext && typeof nextContext.entryCount === "number" ? nextContext.entryCount : context.entryCount,
-        // 所有进 DOM 的错误文案都在这里过一遍脱敏，调用方不必记得这件事。
-        message: nextContext && nextContext.message ? redactUrlText(nextContext.message) : ""
+        // 所有进 DOM 的错误文案都在这里过一遍脱敏，调用方不必记得这件事；命中红线的整句不上屏。
+        message: nextContext && nextContext.message ? quietText(redactUrlText(nextContext.message)) : ""
       };
       root.dataset.state = next;
       const view = viewFor(next, context);
-      if (next === "done" && haltPendingCount > 0) {
-        view.status = "\u5DF2\u6682\u505C\uFF0C\u672A\u4E0B\u8F7D " + haltPendingCount + " \u4E2A\u6587\u4EF6\u3002\u91CD\u65B0\u767B\u5F55\u540E\u518D\u70B9\u300C\u5237\u65B0\u540E\u7EE7\u7EED\u300D\u3002";
+      if (recoveringAttempt > 0) {
+        view.status = "\u6B63\u5728\u81EA\u52A8\u6062\u590D\uFF08\u7B2C " + recoveringAttempt + " \u6B21\uFF09\u2026";
+      } else if (next === "done" && haltPendingCount > 0) {
+        view.status = "\u5DF2\u6682\u505C\uFF0C\u672A\u4E0B\u8F7D " + haltPendingCount + " \u4E2A\u6587\u4EF6\u3002";
       }
       applyButton(scanBtn, view.scan);
       applyButton(downloadBtn, view.download);
@@ -4445,7 +4480,8 @@
     function refreshFabStatus() {
       if (destroyed) return;
       let text = "";
-      if (haltText) text = "\u5DF2\u6682\u505C";
+      if (recoveringAttempt > 0) text = "\u6062\u590D\u4E2D";
+      else if (haltText) text = "\u5DF2\u6682\u505C";
       else if (current === "error") text = "\u51FA\u9519";
       else if (current === "downloading") text = downloadNote || "\u4E0B\u8F7D\u4E2D";
       else if (current === "scanning") text = "\u626B\u63CF\u4E2D";
@@ -4460,6 +4496,12 @@
       const value = Number.isFinite(parsed) ? Math.max(1, Math.min(8, parsed)) : 4;
       concInput.value = String(value);
       emitSettings({ downloadConcurrency: value });
+    });
+    expandInput.addEventListener("change", function() {
+      emitSettings({ panelCollapsed: !expandInput.checked });
+    });
+    autoReloadInput.addEventListener("change", function() {
+      emitSettings({ autoReload: autoReloadInput.checked });
     });
     function requestCancel() {
       if (!onCancel) return;
@@ -4514,6 +4556,7 @@
       clearWatchdog();
       if (state === "scanning" || state === "downloading") {
         haltPendingCount = 0;
+        recoveringAttempt = 0;
         downloadNote = "";
       }
       const nextContext = {};
@@ -4560,7 +4603,7 @@
     }
     function setNotice(text) {
       if (destroyed) return;
-      const value = text == null ? "" : redactUrlText(String(text));
+      const value = text == null ? "" : quietText(redactUrlText(String(text)));
       noticeEl.textContent = value;
       noticeEl.hidden = !value;
       noticeEl.title = value;
@@ -4708,7 +4751,7 @@
         nameEl.title = entry.name || "";
         const pathEl = node("span", "bbdl-failed__path", path);
         pathEl.title = path;
-        const reasonEl = node("span", "bbdl-failed__reason", stripUrlText(item && item.error || "\u672A\u77E5\u9519\u8BEF"));
+        const reasonEl = node("span", "bbdl-failed__reason", quietReasonText(stripUrlText(item && item.error || "\u672A\u77E5\u9519\u8BEF")));
         reasonEl.title = reasonEl.textContent;
         li.appendChild(nameEl);
         li.appendChild(pathEl);
@@ -4875,14 +4918,14 @@
     }
     function paintHalt() {
       haltEl.textContent = "";
-      if (!haltText) {
+      if (!haltText || recoveringAttempt > 0) {
         haltEl.hidden = true;
         return;
       }
       const textEl = node("span", "bbdl-halt__text", haltText);
       textEl.title = haltText;
       haltEl.appendChild(textEl);
-      if (onResumePending) haltEl.appendChild(button("bbdl-btn bbdl-btn--small", "resume-pending", "\u5237\u65B0\u540E\u7EE7\u7EED"));
+      if (onResumePending) haltEl.appendChild(button("bbdl-btn bbdl-btn--small", "resume-pending", "\u7EE7\u7EED"));
       haltEl.hidden = false;
     }
     function setHalted(info) {
@@ -4891,7 +4934,7 @@
       const given = finiteNumber(i.pendingCount);
       const pending = given != null && given >= 0 ? Math.floor(given) : countPendingRows();
       haltPendingCount = pending;
-      haltText = "\u767B\u5F55\u5DF2\u8FC7\u671F\uFF0C\u5DF2\u6682\u505C\u3002\u5237\u65B0\u9875\u9762\u91CD\u65B0\u767B\u5F55\u540E\u518D\u7EE7\u7EED\uFF08" + pending + " \u4E2A\u672A\u4E0B\u8F7D\uFF09\u3002";
+      haltText = "\u5DF2\u6682\u505C\uFF08" + pending + " \u4E2A\u672A\u4E0B\u8F7D\uFF09\u3002";
       paintHalt();
       refreshFabStatus();
     }
@@ -4902,6 +4945,20 @@
       haltEl.textContent = "";
       haltEl.hidden = true;
       refreshFabStatus();
+    }
+    function setRecovering(info) {
+      if (destroyed) return;
+      const i = info || {};
+      const given = finiteNumber(i.attempt);
+      recoveringAttempt = given != null && given >= 1 ? Math.floor(given) : 1;
+      paintHalt();
+      render(current, context);
+    }
+    function clearRecovering() {
+      if (destroyed) return;
+      recoveringAttempt = 0;
+      paintHalt();
+      render(current, context);
     }
     function applyFileEvent(event) {
       if (destroyed) return;
@@ -4945,6 +5002,8 @@
         settings = o.settings;
         probeInput.checked = settings.probeSizes !== false;
         concInput.value = String(settings.downloadConcurrency || 4);
+        expandInput.checked = settings.panelCollapsed === false;
+        autoReloadInput.checked = settings.autoReload !== false;
       }
       if (typeof o.onScan === "function") onScan = o.onScan;
       if (typeof o.onDownload === "function") onDownload = o.onDownload;
@@ -4980,6 +5039,8 @@
       applyFileEvent,
       setHalted,
       clearHalted,
+      setRecovering,
+      clearRecovering,
       showSummary,
       setCourse,
       setHistory,
@@ -6029,8 +6090,11 @@
   var AUTO_RESUME_DELAYS = [3e3, 8e3, 2e4];
   var DEFAULT_KEEP_ALIVE_MS = 90 * 1e3;
   var DEFAULT_AUTO_RESUME_MAX = 3;
-  var AUTO_RESUME_STOP_NOTICE = "\u81EA\u52A8\u91CD\u8BD5\u5DF2\u505C\u6B62\uFF1A\u8FDE\u7EED\u4E24\u6B21\u6CA1\u6709\u4EFB\u4F55\u8FDB\u5C55\u3002\u8BF7\u5237\u65B0\u9875\u9762\u91CD\u65B0\u767B\u5F55\u540E\u70B9\u300C\u5237\u65B0\u540E\u7EE7\u7EED\u300D\u3002";
   var AUTO_RESUME_MAX_TOTAL = 20;
+  var DEFAULT_AUTO_RELOAD_MAX = 2;
+  var INTENT_KEY = "bbdl:resume-intent:v1";
+  var INTENT_TTL_MS = 30 * 60 * 1e3;
+  var PAUSED_NOTICE_PREFIX = "\u5DF2\u6682\u505C\uFF0C\u672A\u4E0B\u8F7D ";
   function shouldAutoResume(input) {
     const opts = input || {};
     const halted = opts.halted || null;
@@ -6044,6 +6108,40 @@
     const index = Number.isFinite(used) && used > 0 ? Math.floor(used) : 0;
     if (index >= AUTO_RESUME_DELAYS.length) return AUTO_RESUME_DELAYS[AUTO_RESUME_DELAYS.length - 1];
     return AUTO_RESUME_DELAYS[index];
+  }
+  function sessionIntentStore() {
+    function bucket() {
+      try {
+        return typeof sessionStorage === "undefined" ? null : sessionStorage;
+      } catch (err) {
+        return null;
+      }
+    }
+    return {
+      read() {
+        try {
+          const store = bucket();
+          const raw = store ? store.getItem(INTENT_KEY) : null;
+          return raw ? JSON.parse(raw) : null;
+        } catch (err) {
+          return null;
+        }
+      },
+      write(value) {
+        try {
+          const store = bucket();
+          if (store) store.setItem(INTENT_KEY, JSON.stringify(value));
+        } catch (err) {
+        }
+      },
+      clear() {
+        try {
+          const store = bucket();
+          if (store) store.removeItem(INTENT_KEY);
+        } catch (err) {
+        }
+      }
+    };
   }
   var KEEP_ALIVE_DROP_PARAMS = ["mode", "list_display", "pagelinks"];
   function keepAliveUrl(href) {
@@ -6137,6 +6235,11 @@
     const importManifestPack2 = typeof deps.importManifestPack === "function" ? deps.importManifestPack : null;
     const mergeManifests2 = typeof deps.mergeManifests === "function" ? deps.mergeManifests : null;
     const wait = typeof deps.wait === "function" ? deps.wait : waitAbortable;
+    const reload = typeof deps.reload === "function" ? deps.reload : function() {
+      if (loc && typeof loc.reload === "function") loc.reload();
+    };
+    const now = typeof deps.now === "function" ? deps.now : Date.now;
+    const intentStore = deps.intentStore && typeof deps.intentStore === "object" ? deps.intentStore : sessionIntentStore();
     const writeDownload = typeof cfg.downloadTextFile === "function" ? cfg.downloadTextFile : null;
     const listExistingFiles2 = typeof cfg.listExistingFiles === "function" ? cfg.listExistingFiles : listExistingFiles;
     const pickDirectory2 = typeof cfg.pickDirectory === "function" ? cfg.pickDirectory : pickDirectory;
@@ -6207,6 +6310,9 @@
     const ready = hydrate().then(function(value) {
       pushHistory();
       return value;
+    });
+    const resumeIntent = ready.then(function() {
+      return consumeIntent();
     });
     async function safeCall(fn) {
       try {
@@ -6543,30 +6649,40 @@
       let summary = state.skipSummary;
       if (!summary) summary = await refreshSkips(null, null);
       let choice;
-      try {
-        choice = await openSelectDialog2(state.entries, {
-          document: doc,
-          settings,
-          // 勾选记忆按 (courseId, pageId) 分桶：换课程不串台，同一门课来回切各自保留。
-          courseId,
-          pageId: contentId,
-          // 续接上次目录时不再弹选择器：直接把这个已授权的句柄交回去。
-          pickDirectory: state.resumeHandle ? function() {
-            return state.resumeHandle;
-          } : pickDirectory2,
-          skipInfo: summary,
-          onProbeSizes: probeSizes,
-          // 选目录走回调：对话框只负责把点击原样转过来，用户手势不能跨 await。
-          onPickDirectory: pickDirectoryForDialog,
-          onRefreshSkips: refreshDialogSkips,
-          onClose: abortPick,
-          onSettingsChange(patch) {
-            Object.assign(settings, saveSettings(patch));
-          }
-        });
-      } catch (err) {
-        panel.fail(describe(err));
-        return null;
+      if (silentResume) {
+        silentResume = false;
+        choice = {
+          entries: state.entries,
+          dirHandle: state.resumeHandle || null,
+          expectedBytes: 0,
+          skipExisting: true
+        };
+      } else {
+        try {
+          choice = await openSelectDialog2(state.entries, {
+            document: doc,
+            settings,
+            // 勾选记忆按 (courseId, pageId) 分桶：换课程不串台，同一门课来回切各自保留。
+            courseId,
+            pageId: contentId,
+            // 续接上次目录时不再弹选择器：直接把这个已授权的句柄交回去。
+            pickDirectory: state.resumeHandle ? function() {
+              return state.resumeHandle;
+            } : pickDirectory2,
+            skipInfo: summary,
+            onProbeSizes: probeSizes,
+            // 选目录走回调：对话框只负责把点击原样转过来，用户手势不能跨 await。
+            onPickDirectory: pickDirectoryForDialog,
+            onRefreshSkips: refreshDialogSkips,
+            onClose: abortPick,
+            onSettingsChange(patch) {
+              Object.assign(settings, saveSettings(patch));
+            }
+          });
+        } catch (err) {
+          panel.fail(describe(err));
+          return null;
+        }
       }
       if (!choice || !Array.isArray(choice.entries) || !choice.entries.length) return null;
       const dirHandle = choice.dirHandle || null;
@@ -6723,6 +6839,45 @@
       if (!Number.isFinite(configured) || configured < 0) return DEFAULT_AUTO_RESUME_MAX;
       return Math.floor(configured);
     }
+    function autoReloadLimit() {
+      const configured = settings ? settings.autoReloadMax : void 0;
+      if (!Number.isFinite(configured) || configured < 0) return DEFAULT_AUTO_RELOAD_MAX;
+      return Math.floor(configured);
+    }
+    function callPanel(name, arg) {
+      try {
+        if (typeof panel[name] === "function") panel[name](arg);
+      } catch (err) {
+      }
+    }
+    function pausedNotice(count) {
+      return PAUSED_NOTICE_PREFIX + nonNegCount2(count) + " \u4E2A\u6587\u4EF6\u3002";
+    }
+    function readIntent() {
+      try {
+        const value = typeof intentStore.read === "function" ? intentStore.read() : null;
+        return value && typeof value === "object" ? value : null;
+      } catch (err) {
+        return null;
+      }
+    }
+    function writeIntent(value) {
+      try {
+        if (typeof intentStore.write === "function") intentStore.write(value);
+      } catch (err) {
+      }
+    }
+    function clearIntent() {
+      try {
+        if (typeof intentStore.clear === "function") intentStore.clear();
+      } catch (err) {
+      }
+    }
+    let silentResume = false;
+    function intentReloads(intent) {
+      const n = intent ? intent.reloads : 0;
+      return Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 0;
+    }
     async function runBatchWithAutoResume(entries, dirHandle, signal, options) {
       const opts = options || {};
       const finish = typeof opts.finish === "function" ? opts.finish : finishDownload;
@@ -6733,43 +6888,86 @@
       function notify2(text) {
         if (typeof panel.setNotice === "function") panel.setNotice(text);
       }
+      async function settle2(result) {
+        callPanel("clearRecovering");
+        return await finish(result);
+      }
+      async function escalate(gate, pendingList, result) {
+        console.info("[bbdl] \u81EA\u52A8\u91CD\u8BD5\u7194\u65AD", gate);
+        if (signal && signal.aborted) {
+          clearIntent();
+          return await settle2(result);
+        }
+        if (settings.autoReload === false) {
+          notify2(pausedNotice(pendingList.length));
+          console.info("[bbdl] \u81EA\u52A8\u91CD\u8F7D\u5DF2\u5173\u95ED");
+          return await settle2(result);
+        }
+        const reloads = intentReloads(readIntent());
+        if (reloads >= autoReloadLimit()) {
+          notify2(pausedNotice(pendingList.length));
+          console.info("[bbdl] \u81EA\u52A8\u91CD\u8F7D\u5DF2\u8FBE\u4E0A\u9650", { reloads });
+          clearIntent();
+          return await settle2(result);
+        }
+        await flushRecords();
+        const attempt = reloads + 1;
+        writeIntent({
+          courseId,
+          contentId,
+          pendingIds: pendingList.map(entryIdOf2).filter(function(id) {
+            return Boolean(id);
+          }),
+          dirName: dirHandle && dirHandle.name ? String(dirHandle.name) : "",
+          createdAt: now(),
+          reloads: attempt
+        });
+        console.info("[bbdl] \u81EA\u52A8\u91CD\u8F7D\u7EED\u8DD1", { reloads: attempt });
+        callPanel("setRecovering", { attempt });
+        reload();
+        return new Promise(function() {
+        });
+      }
       for (; ; ) {
         const result = await runDownload(batch, dirHandle, signal, { seedFiles });
         const halted = result ? result.halted : null;
         const aborted = Boolean(signal && signal.aborted || result && result.aborted);
         const pending = halted && Array.isArray(halted.pending) ? halted.pending : [];
         const target = pending.length ? pendingUrl(pending[0]) : "";
+        if (halted) console.info("[bbdl] \u505C\u673A", { reason: halted.reason, pending: pending.length });
         if (!target || !shouldAutoResume({ halted, aborted, used: state.autoResumeUsed, max: state.autoResumeMax })) {
-          return await finish(result);
+          if (aborted || !halted) clearIntent();
+          return await settle2(result);
         }
-        if (signal && signal.aborted) return await finish(result);
+        if (signal && signal.aborted) {
+          clearIntent();
+          return await settle2(result);
+        }
         const ok = result && Array.isArray(result.ok) ? result.ok : [];
         if (ok.length > 0) {
           state.autoResumeUsed = 0;
           zeroProgress = 0;
         } else {
           zeroProgress += 1;
-          if (zeroProgress >= 2) {
-            notify2(AUTO_RESUME_STOP_NOTICE);
-            console.info("[bbdl] \u81EA\u52A8\u91CD\u8BD5\u7194\u65AD", { zeroProgress, pending: pending.length });
-            return await finish(result);
-          }
+          if (zeroProgress >= 2) return await escalate({ zeroProgress, pending: pending.length }, pending, result);
         }
         if (resumes >= AUTO_RESUME_MAX_TOTAL) {
-          notify2(AUTO_RESUME_STOP_NOTICE);
-          console.info("[bbdl] \u81EA\u52A8\u91CD\u8BD5\u7194\u65AD", { resumes });
-          return await finish(result);
+          return await escalate({ resumes, pending: pending.length }, pending, result);
         }
         await flushRecords();
         state.autoResumeUsed += 1;
         resumes += 1;
         const delay = autoResumeDelay(state.autoResumeUsed - 1);
-        notify2("\u7591\u4F3C\u767B\u5F55\u8FC7\u671F\uFF0C" + Math.round(delay / 1e3) + " \u79D2\u540E\u81EA\u52A8\u91CD\u8BD5\uFF08\u7B2C " + resumes + " \u6B21\uFF09\u2026");
+        notify2("\u6B63\u5728\u81EA\u52A8\u6062\u590D\uFF08\u7B2C " + resumes + " \u6B21\uFF09\u2026");
+        callPanel("setRecovering", { attempt: resumes });
         state.haltedPending = [];
         clearHaltedBanner();
         panel.setState("downloading");
         await wait(delay, signal);
-        if (signal && signal.aborted) return await finish(result);
+        if (signal && signal.aborted) {
+          clearIntent();
+          return await settle2(result);
+        }
         batch = pending;
         seedFiles = false;
       }
@@ -6910,10 +7108,10 @@
       const records = state.pendingRecords;
       if (!records.length) return state.manifest;
       state.pendingRecords = [];
-      const now = Date.now();
+      const now2 = Date.now();
       try {
         if (updateRecords2) {
-          state.manifest = updateRecords2(state.manifest, state.batchPlans, records, now) || state.manifest;
+          state.manifest = updateRecords2(state.manifest, state.batchPlans, records, now2) || state.manifest;
         }
       } catch (err) {
       }
@@ -6971,9 +7169,9 @@
     async function recordScan() {
       if (!appendScanHistory2) return state.manifest;
       try {
-        const now = Date.now();
+        const now2 = Date.now();
         let manifest = state.manifest;
-        if (updateRecords2) manifest = updateRecords2(manifest, [], [], now) || manifest;
+        if (updateRecords2) manifest = updateRecords2(manifest, [], [], now2) || manifest;
         state.manifest = appendScanHistory2(manifest, scanSnapshot(), MAX_SCAN_HISTORY) || manifest;
       } catch (err) {
         return state.manifest;
@@ -7126,6 +7324,42 @@
       if (!state.entries.length) return null;
       return startDownload();
     }
+    async function consumeIntent() {
+      const intent = readIntent();
+      if (!intent) return null;
+      try {
+        const createdAt = Number.isFinite(intent.createdAt) ? intent.createdAt : 0;
+        const stale = !createdAt || now() - createdAt > INTENT_TTL_MS;
+        const pendingIds = Array.isArray(intent.pendingIds) ? intent.pendingIds : [];
+        const recorded = intent.courseId === null || intent.courseId === void 0 ? "" : String(intent.courseId);
+        if (stale || recorded !== String(courseId)) {
+          clearIntent();
+          return null;
+        }
+        if (settings.autoReload === false) return null;
+        const reloads = intentReloads(intent);
+        console.info("[bbdl] \u91CD\u8F7D\u540E\u7EED\u8DD1", { pending: pendingIds.length, reloads });
+        const handle = await safeCall(() => store ? store.loadHandle(courseId) : null);
+        const status = await ensurePermissionStatus(handle, false);
+        if (!handle || status !== "granted") {
+          callPanel("setHalted", { reason: "session-expired", pendingCount: pendingIds.length });
+          return null;
+        }
+        state.dirHandle = handle;
+        state.resumeHandle = handle;
+        if (!state.entries.length) await startScan();
+        if (!state.entries.length) return null;
+        silentResume = true;
+        try {
+          return await startDownload();
+        } finally {
+          silentResume = false;
+        }
+      } catch (err) {
+        console.warn("[bbdl] \u81EA\u52A8\u7EED\u8DD1\u5931\u8D25", { reason: err && err.message ? err.message : String(err) });
+        return null;
+      }
+    }
     function getState() {
       return {
         courseId,
@@ -7157,6 +7391,8 @@
       resumePending,
       getState,
       ready,
+      /** 重载后自动续跑的那一跳：ready 之后才 resolve，永不 reject。 */
+      resumeIntent,
       panel,
       flushRecords,
       exportManifest,

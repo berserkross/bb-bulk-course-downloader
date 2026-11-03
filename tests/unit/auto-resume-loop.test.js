@@ -13,7 +13,9 @@ const ENTRIES = [
   { id: 'e5', name: 'e.pdf', size: 50, folderPath: [], url: 'https://bb.example.edu/f/5' }
 ];
 
-const STOP_NOTICE = '自动重试已停止：连续两次没有任何进展。请刷新页面重新登录后点「刷新后继续」。';
+// v2.8.0 文案变更（docs/m7-quiet.md §1）：熔断不再谈「重试 / 登录」，改成「已暂停，未下载 N 个文件。」
+// —— 本文件所有用例都注入 autoReload:false，验的是「就地暂停」这条分支，不含强制重载。
+const STOP_NOTICE = '已暂停，未下载 5 个文件。';
 
 function makePanel() {
   const calls = [];
@@ -88,7 +90,9 @@ function setup(over) {
       panel.opts = options;
       return panel;
     },
-    settings: Object.assign({ preserveTree: true, downloadConcurrency: 2 }, extra.settings || {}),
+    // autoReload:false 是注入而非断言：本文件验的是「熔断后就地暂停」（重载与续跑在 reload-resume.test.js），
+    // 不关掉的话这些用例会走真实重载分支、永远不返回。
+    settings: Object.assign({ preserveTree: true, downloadConcurrency: 2, autoReload: false }, extra.settings || {}),
     location: { href: HREF },
     document: null,
     deps: {
@@ -165,9 +169,9 @@ test('AC1/AC4：死会话（每轮零 ok）只自动续跑 1 轮就熔断，atte
   assert.deepEqual(h.delays, [3000], '零进展的第一轮只等第一档 3 秒，第二轮就熔断');
   assert.equal(h.probeCalls.length, 0, '探活一次都不许调用');
 
-  const stop = h.panel.texts('setNotice').filter(function (text) { return text.includes('自动重试已停止'); });
-  assert.equal(stop.length, 1, '熔断提示只出现一次');
-  assert.equal(stop[0], STOP_NOTICE, '熔断文案逐字照抄');
+  const stop = h.panel.texts('setNotice').filter(function (text) { return text.includes('已暂停，未下载'); });
+  assert.equal(stop.length, 1, '暂停提示只出现一次');
+  assert.equal(stop[0], STOP_NOTICE, '暂停文案逐字照抄');
   assert.equal(/http|\?|\//.test(stop[0]), false, '熔断文案里不许出现协议、查询串或路径');
 
   assert.equal(h.panel.countOf('showSummary'), 1, 'finish 只收尾一次');
@@ -180,7 +184,7 @@ test('AC1/AC4：死会话（每轮零 ok）只自动续跑 1 轮就熔断，atte
   assert.deepEqual(capture.lines[0], { zeroProgress: 2, pending: ENTRIES.length }, '日志字段只有 zeroProgress 与 pending 数');
 });
 
-test('AC2：假死 —— 第 1 轮 3 done 后停机、第 2 轮全成功：续跑后 pending 清空、notice 出现「疑似登录过期」', async () => {
+test('AC2：假死 —— 第 1 轮 3 done 后停机、第 2 轮全成功：续跑后 pending 清空、notice 出现「正在自动恢复」', async () => {
   const h = setup({
     settings: { autoResumeMax: 3 },
     behave: async function (entries, api, round) {
@@ -201,8 +205,8 @@ test('AC2：假死 —— 第 1 轮 3 done 后停机、第 2 轮全成功：续�
   assert.equal(h.probeCalls.length, 0, '探活一次都不许调用');
 
   const notices = h.panel.texts('setNotice');
-  assert.equal(notices.some(function (text) { return text.includes('疑似登录过期'); }), true, '续跑前必须给出疑似登录过期的提示');
-  assert.equal(notices.some(function (text) { return text.includes('自动重试已停止'); }), false, '这一批没有熔断');
+  assert.equal(notices.some(function (text) { return text.includes('正在自动恢复'); }), true, '续跑前必须给出「正在自动恢复」提示（面板上一律不许出现「登录」）');
+  assert.equal(notices.some(function (text) { return text.includes('已暂停，未下载'); }), false, '这一批没有暂停');
   assert.equal(h.panel.countOf('showSummary'), 1, 'finish 只收尾一次');
   assert.equal(h.panel.countOf('setHalted'), 0, '两轮跑完都没停机，横幅不许竖起来');
   assert.deepEqual(h.controller.getState().haltedPending, [], 'pending 已清空');
@@ -226,8 +230,8 @@ test('AC3：有进展就重置预算 —— 第 2 轮 2 done 后再次停机、�
   assert.equal(h.probeCalls.length, 0, '探活一次都不许调用');
 
   const notices = h.panel.texts('setNotice');
-  assert.equal(notices.some(function (text) { return text.includes('自动重试已停止'); }), false, '有进展就不许熔断');
-  assert.equal(notices.filter(function (text) { return text.includes('秒后自动重试'); }).length, 2);
+  assert.equal(notices.some(function (text) { return text.includes('已暂停，未下载'); }), false, '有进展就不许暂停');
+  assert.equal(notices.filter(function (text) { return text.includes('正在自动恢复'); }).length, 2);
   assert.equal(h.panel.countOf('showSummary'), 1, 'finish 只收尾一次');
   assert.deepEqual(h.controller.getState().haltedPending, []);
   assert.equal(result.halted == null, true);
@@ -247,7 +251,7 @@ test('AC1 补充：退避阶梯 —— 有进展一轮后连续两轮零进展�
   assert.equal(h.rounds.length, 3, '连续两轮零进展就停手，绝不许无限续跑');
   assert.deepEqual(h.delays, [3000, 8000], '等待时间由 autoResumeDelay 算出：3 秒 → 8 秒');
   assert.equal(h.probeCalls.length, 0, '探活一次都不许调用');
-  assert.equal(h.panel.texts('setNotice').filter(function (text) { return text.includes('自动重试已停止'); }).length, 1);
+  assert.equal(h.panel.texts('setNotice').filter(function (text) { return text.includes('已暂停，未下载'); }).length, 1);
 });
 
 test('AC5：取消优先 —— 已 abort / 等待中 abort 都不续跑，探活从未调用、finish 只一次、无续跑提示', async () => {
@@ -265,7 +269,7 @@ test('AC5：取消优先 —— 已 abort / 等待中 abort 都不续跑，探�
   assert.deepEqual(early.delays, [], '连等待都不许发生');
   assert.equal(early.probeCalls.length, 0, '探活一次都不许调用');
   assert.equal(early.panel.countOf('showSummary'), 1, 'finish 只收尾一次');
-  assert.equal(early.panel.texts('setNotice').some(function (text) { return text.includes('秒后自动重试'); }), false, '取消后不许再给续跑提示');
+  assert.equal(early.panel.texts('setNotice').some(function (text) { return text.includes('正在自动恢复'); }), false, '取消后不许再给续跑提示');
   assert.equal(earlyResult.halted.reason, 'session-expired', '取消不动停机结果：照样交回');
 
   // (2) 等待期间用户点了取消：立刻收尾，下一批一次都不跑
@@ -288,6 +292,8 @@ test('AC5：取消优先 —— 已 abort / 等待中 abort 都不续跑，探�
   assert.deepEqual(during.controller.getState().haltedPending.map(function (entry) { return entry.id; }), ['e2', 'e3', 'e4', 'e5'], '取消后停机快照留着，用户还能手动续跑');
 });
 
+// 可见文案报「当轮还没下到的文件数」（halted.pending.length），轮数只在 console 里：
+// 各轮 pending 会重复出现同一个文件，相加等于把一个人数很多遍。
 test('全局闸门：整批累计续跑撞满 20 次就熔断（每次都有进展也不许无限乒乓）', async () => {
   const many = [];
   for (let i = 1; i <= 25; i += 1) {
@@ -312,11 +318,12 @@ test('全局闸门：整批累计续跑撞满 20 次就熔断（每次都有进�
   assert.equal(h.rounds.length, 21, '20 次续跑 + 熔断那一轮');
   assert.deepEqual(new Set(h.delays), new Set([3000]), '每轮都有进展，阶梯一直在第一档');
   assert.equal(h.probeCalls.length, 0, '探活一次都不许调用');
-  const stop = h.panel.texts('setNotice').filter(function (text) { return text.includes('自动重试已停止'); });
+  const stop = h.panel.texts('setNotice').filter(function (text) { return text.includes('已暂停，未下载'); });
   assert.equal(stop.length, 1);
-  assert.equal(stop[0], STOP_NOTICE, '同一个熔断文案');
+  // 第 21 轮 batch 只剩 5 条、pending 4 条：报 24 会把早下掉的 20 个再数一遍。
+  assert.equal(stop[0], '已暂停，未下载 4 个文件。', '同一个暂停文案：撞满闸门那当轮还剩几个就报几个');
   assert.equal(h.panel.countOf('showSummary'), 1, 'finish 只收尾一次');
-  assert.deepEqual(capture.lines, [{ resumes: 20 }], '日志字段只有 resumes：20');
+  assert.deepEqual(capture.lines, [{ resumes: 20, pending: 4 }], '诊断带轮数与当轮剩几个：20 轮、还剩 4 个');
 });
 
 test('面板摘要：停机 pending 从失败清单里摘掉，其余真实失败照旧保留（闸门关闭时不自动续跑）', async () => {
@@ -342,5 +349,5 @@ test('面板摘要：停机 pending 从失败清单里摘掉，其余真实失�
   const shown = h.panel.callsOf('showSummary')[0].args[0];
   assert.deepEqual(shown.failed.map(function (item) { return item.entry.id; }), ['e3'], 'pending 的 e2 摘掉，e3 的 404 留着');
   assert.equal(shown.ok.length, 1);
-  assert.equal(h.panel.texts('setNotice').some(function (text) { return text.includes('自动重试已停止'); }), false, '关掉续跑不等于熔断');
+  assert.equal(h.panel.texts('setNotice').some(function (text) { return text.includes('已暂停'); }), false, '关掉续跑不等于熔断');
 });

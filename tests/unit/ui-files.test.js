@@ -142,10 +142,8 @@ test('done 事件写回状态与字节；halt 事件出横幅且 pending 数字�
   api.applyFileEvent({ type: 'halt', entryId: 'e3', reason: 'session-expired', pending: 2 });
   const halt = document.querySelector('.bbdl-halt');
   assert.equal(halt.hidden, false, 'halt 事件后必须出现停机横幅');
-  assert.equal(
-    halt.querySelector('.bbdl-halt__text').textContent,
-    '登录已过期，已暂停。刷新页面重新登录后再继续（2 个未下载）。'
-  );
+  // v2.8.0 文案（docs/m7-quiet.md §1）：横幅只描述状态，原因只进 console。
+  assert.equal(halt.querySelector('.bbdl-halt__text').textContent, '已暂停（2 个未下载）。');
   assert.equal(cellOf('e2', 'bbdl-files__status'), '等待', '停机后在飞的文件不许一直停在「下载中」');
   api.destroy();
 });
@@ -163,7 +161,7 @@ test('setHalted → 点横幅按钮只调 1 次 onResumePending；clearHalted �
   api.setHalted({ reason: 'session-expired', pendingCount: 3 });
   const halt = document.querySelector('.bbdl-halt');
   assert.equal(halt.hidden, false);
-  assert.match(halt.textContent, /登录已过期，已暂停。刷新页面重新登录后再继续（3 个未下载）。/);
+  assert.match(halt.textContent, /已暂停（3 个未下载）。/);
 
   const btn = halt.querySelector('[data-act="resume-pending"]');
   assert.ok(btn, '给了 onResumePending 就必须渲染按钮');

@@ -172,7 +172,7 @@ test('keepAliveUrl：无查询串 / 只有 hash / 全被删光 / 非法输入都
 
 /* ---------------- T3：自动续跑期间的 UI 顺序 ---------------- */
 
-// v2.7.1 文案变更：续跑提示由「已自动重试」改为「疑似登录过期，N 秒后自动重试（第 K 次）…」，
+// v2.8.0 文案变更（docs/m7-quiet.md §1）：续跑提示改为「正在自动恢复（第 K 次）…」（面板不许出现「登录」），
 // 本用例只跟着换标记串，逻辑与断言不变。
 test('自动续跑：撤横幅与 setState(downloading) 先于等待；等待中取消立刻收尾，下一批一次都不跑', async () => {
   const { createController } = await import('../../src/index.js');
@@ -194,7 +194,7 @@ test('自动续跑：撤横幅与 setState(downloading) 先于等待；等待中
   for (const name of names) {
     panel[name] = function (arg) {
       panel.calls.push({ name: name, arg: arg });
-      if (name === 'setNotice' && String(arg).includes('秒后自动重试')) log.push('notice');
+      if (name === 'setNotice' && String(arg).includes('正在自动恢复')) log.push('notice');
       // 只关心自动续跑开始之后的那次 setState('downloading')：批次开头的那次不算证据
       if (name === 'setState' && arg === 'downloading' && log.indexOf('notice') >= 0) log.push('setState:downloading');
       if (name === 'showSummary') log.push('showSummaryAt:' + Date.now());
@@ -276,7 +276,7 @@ test('自动续跑：撤横幅与 setState(downloading) 先于等待；等待中
 
   assert.deepEqual(rounds, [['e1', 'e2']], '取消之后不许再跑下一批');
   assert.equal(log.length, 5, 'notice → 撤横幅 → 切 downloading → 收尾，一步都不许多（实际：' + log.join(' | ') + '）');
-  assert.equal(log[0], 'notice', '先给「秒后自动重试」提示（used+1 之后）');
+  assert.equal(log[0], 'notice', '先给「正在自动恢复」提示（used+1 之后）');
   assert.equal(log[1], 'clearHalted:pending=0', '撤横幅之前停机快照已经清空');
   assert.equal(log[2].startsWith('clearHaltedAt:'), true, '撤横幅发生在等待之前');
   assert.equal(log[3], 'setState:downloading', '撤横幅与切回 downloading 都在等待之前');
@@ -292,7 +292,7 @@ test('自动续跑：撤横幅与 setState(downloading) 先于等待；等待中
     '取消后停机快照仍然留着：用户还能点「刷新后继续」'
   );
   const haltAt = panel.calls.findIndex(function (call) { return call.name === 'setHalted'; });
-  const noticeAt = panel.calls.findIndex(function (call) { return call.name === 'setNotice' && String(call.arg).includes('秒后自动重试'); });
+  const noticeAt = panel.calls.findIndex(function (call) { return call.name === 'setNotice' && String(call.arg).includes('正在自动恢复'); });
   const clearAt2 = panel.calls.findIndex(function (call, i) { return call.name === 'clearHalted' && i > haltAt; });
   assert.ok(haltAt >= 0 && haltAt < noticeAt, '前提：横幅先竖起来，新 notice 才可能出现自相矛盾');
   assert.ok(clearAt2 > noticeAt, 'notice 之后立刻撤横幅（旧顺序里这中间夹着 3 秒）');

@@ -14,7 +14,11 @@ export const DEFAULTS = {
   // 保活心跳间隔：门户会话闲置太久必死，下载期间定期回敲一次最省事的续命手段
   keepAliveMs: 90 * 1000,
   // 自动续跑的连续零进展熔断阈值（次）：有进展即归零，撞满就交回用户，不再自己转圈
-  autoResumeMax: 3
+  autoResumeMax: 3,
+  // 自动续跑也救不回来时，强制重载页面再续跑（docs/m7-quiet.md §2）：默认开，用户可在面板关掉
+  autoReload: true,
+  // 同一次停机里最多重载几次（含当前这次）：撞满就暂停，交给用户点「继续」
+  autoReloadMax: 2
 };
 
 export function loadSettings() {
