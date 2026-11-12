@@ -127,6 +127,25 @@ export function createFsSink({ settings = {}, dirHandle, signal, total = 0, file
       }
 
       await writable.close();
+
+      // close() 是提交点：提交之后再回读一次元数据，确认「写进去的字节」与「磁盘上的大小」一致。
+      // 拿不到元数据就跳过这一层（宁可少一层证据，也不把好文件判成坏文件）。
+      let committedSize = null;
+      try {
+        const committed = typeof fileHandle.getFile === 'function' ? await fileHandle.getFile() : null;
+        if (committed && Number.isFinite(committed.size)) committedSize = committed.size;
+      } catch {
+        /* 元数据不可读：放弃这一层校验 */
+      }
+      if (committedSize !== null && committedSize !== written) {
+        // 磁盘上已经是一个坏文件了：删掉它，让「这里什么都没有」成为唯一事实。
+        try {
+          await dir.removeEntry(plan.fileName);
+        } catch {
+          /* 删不掉也必须抛错，绝不静默留下半截文件 */
+        }
+        throw new TruncatedError(written, committedSize);
+      }
     } catch (err) {
       try {
         await reader.cancel(err);

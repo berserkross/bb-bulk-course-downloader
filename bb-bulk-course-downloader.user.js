@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BB 课件批量下载
 // @namespace    bb-bulk-course-downloader
-// @version      2.8.3
+// @version      2.8.4
 // @description  扫描 Blackboard 课程内容，勾选后按原始目录结构批量下载课件
 // @updateURL    https://raw.githubusercontent.com/berserkross/bb-bulk-course-downloader/main/bb-bulk-course-downloader.user.js
 // @downloadURL  https://raw.githubusercontent.com/berserkross/bb-bulk-course-downloader/main/bb-bulk-course-downloader.user.js
@@ -1112,6 +1112,24 @@
   function isSuspectResponse(error) {
     return !!error && error.name === "SuspectResponseError";
   }
+  function errorHint(error) {
+    if (!error) return "";
+    const status = Number(error.status);
+    if (Number.isFinite(status)) {
+      if (status === 401 || status === 403) return "\u6CA1\u6709\u6743\u9650\u8BFB\u53D6\u8FD9\u4E2A\u6587\u4EF6\uFF0C\u8BF7\u786E\u8BA4\u767B\u5F55\u72B6\u6001\u540E\u91CD\u8BD5";
+      if (status === 404) return "\u670D\u52A1\u5668\u4E0A\u627E\u4E0D\u5230\u8FD9\u4E2A\u6587\u4EF6\uFF0C\u53EF\u80FD\u5DF2\u88AB\u79FB\u9664";
+      if (status === 429) return "\u8BF7\u6C42\u592A\u9891\u7E41\uFF0C\u5DF2\u88AB\u670D\u52A1\u5668\u9650\u6D41\uFF0C\u7A0D\u540E\u518D\u8BD5";
+      if (status >= 500) return "\u5B66\u6821\u670D\u52A1\u5668\u6682\u65F6\u4E0D\u53EF\u7528\uFF0C\u7A0D\u540E\u91CD\u8BD5";
+      return "\u8BF7\u6C42\u5931\u8D25\uFF08HTTP " + status + "\uFF09";
+    }
+    const name = String(error.name || "");
+    if (name === "StallError") return "\u8FDE\u63A5\u957F\u65F6\u95F4\u6CA1\u6709\u65B0\u6570\u636E\uFF0C\u53EF\u80FD\u662F\u7F51\u7EDC\u4E2D\u65AD";
+    if (name === "TruncatedError") return "\u6587\u4EF6\u6CA1\u6709\u4E0B\u8F7D\u5B8C\u6574\uFF0C\u5DF2\u91CD\u65B0\u6392\u961F";
+    if (name === "TypeError" || /failed to fetch|networkerror|network error/i.test(String(error.message || ""))) {
+      return "\u7F51\u7EDC\u8FDE\u63A5\u4E2D\u65AD\uFF0C\u68C0\u67E5\u7F51\u7EDC\u6216\u6821\u56ED\u7F51\u540E\u91CD\u8BD5";
+    }
+    return "";
+  }
   function linkSignals() {
     const list = [];
     for (let i = 0; i < arguments.length; i += 1) {
@@ -2090,6 +2108,19 @@
           throw new TruncatedError(expected, written);
         }
         await writable.close();
+        let committedSize = null;
+        try {
+          const committed = typeof fileHandle.getFile === "function" ? await fileHandle.getFile() : null;
+          if (committed && Number.isFinite(committed.size)) committedSize = committed.size;
+        } catch {
+        }
+        if (committedSize !== null && committedSize !== written) {
+          try {
+            await dir.removeEntry(plan.fileName);
+          } catch {
+          }
+          throw new TruncatedError(written, committedSize);
+        }
       } catch (err) {
         try {
           await reader.cancel(err);
@@ -6206,7 +6237,9 @@
   }
   function describe(err) {
     if (err instanceof SessionExpiredError) return "\u4F1A\u8BDD\u5DF2\u5931\u6548\uFF1A\u8BF7\u91CD\u65B0\u767B\u5F55 Blackboard\uFF0C\u7136\u540E\u5237\u65B0\u672C\u9875\u518D\u8BD5\u3002";
-    return err && err.message || String(err);
+    const hint = errorHint(err);
+    if (hint) return hint;
+    return redactUrls(err && err.message || String(err));
   }
   var AUTO_RESUME_DELAYS = [3e3, 8e3, 2e4];
   var DEFAULT_KEEP_ALIVE_MS = 90 * 1e3;

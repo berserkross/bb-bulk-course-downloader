@@ -68,6 +68,29 @@ export function isSuspectResponse(error) {
   return !!error && error.name === 'SuspectResponseError';
 }
 
+/**
+ * 失败提示：给一句「用户能做什么」，而不是把 err.message 原样抛到面板上。
+ * 这里绝不拼 URL、路径或文件名 —— 面板文案红线（docs/m7-quiet.md §1）同样适用。
+ */
+export function errorHint(error) {
+  if (!error) return '';
+  const status = Number(error.status);
+  if (Number.isFinite(status)) {
+    if (status === 401 || status === 403) return '没有权限读取这个文件，请确认登录状态后重试';
+    if (status === 404) return '服务器上找不到这个文件，可能已被移除';
+    if (status === 429) return '请求太频繁，已被服务器限流，稍后再试';
+    if (status >= 500) return '学校服务器暂时不可用，稍后重试';
+    return '请求失败（HTTP ' + status + '）';
+  }
+  const name = String(error.name || '');
+  if (name === 'StallError') return '连接长时间没有新数据，可能是网络中断';
+  if (name === 'TruncatedError') return '文件没有下载完整，已重新排队';
+  if (name === 'TypeError' || /failed to fetch|networkerror|network error/i.test(String(error.message || ''))) {
+    return '网络连接中断，检查网络或校园网后重试';
+  }
+  return '';
+}
+
 function linkSignals() {
   const list = [];
   for (let i = 0; i < arguments.length; i += 1) {

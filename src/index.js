@@ -1,6 +1,7 @@
 import {
   createFetcher as defaultCreateFetcher,
   createHeartbeat,
+  errorHint,
   SessionExpiredError
 } from './bb/http.js';
 import { createScanner as defaultCreateScanner } from './bb/scan.js';
@@ -58,7 +59,10 @@ export function currentIds(loc) {
 
 function describe(err) {
   if (err instanceof SessionExpiredError) return '会话已失效：请重新登录 Blackboard，然后刷新本页再试。';
-  return (err && err.message) || String(err);
+  // 先给「用户能做什么」；没有结论时才退回原始消息，并且必须过一遍 URL 脱敏。
+  const hint = errorHint(err);
+  if (hint) return hint;
+  return redactUrls((err && err.message) || String(err));
 }
 
 /**
