@@ -91,7 +91,13 @@ v2.8.3 发布检查共 500 项测试。构建生成 `dist/bb-bulk-course-downloa
 
 本仓库 fork 自 [JesperroO/bb-bulk-course-downloader](https://github.com/JesperroO/bb-bulk-course-downloader)。原作者那份单文件脚本（`blackboard-download.user.js`，v2.1）至今仍在原仓库的 [core 分支](https://github.com/JesperroO/bb-bulk-course-downloader/tree/core) 上，也是这件事真正的起点：递归扫描子文件夹、用服务器响应里的真实文件名而不是 `xid-XXXX` 占位名、小并发加重试——这三条思路都由它先跑通。
 
-fork 之后，`main` 分支逐步换成了模块化实现：目录树落盘、断点续传与增量判断、逐文件事件、ZIP 降级、会话异常自愈。安装方式与「只访问你有权限的文件」这条底线没有变。感谢 JesperroO 把这份工具开源出来。
+fork 之后，`main` 分支逐步换成了模块化实现：目录树落盘、断点续传与增量判断、逐文件事件、ZIP 降级、会话异常自愈。安装方式与「只访问你有权限的文件」这条底线没有变。感谢 JesperroO 把这套思路和原始脚本公开出来。
+
+## 许可
+
+`main` 分支的代码、文档与构建工具以 MIT 许可发布，见 [LICENSE](LICENSE)。
+
+本仓库由 fork 而来，`core` 分支保留上游 JesperroO 的原始脚本；上游未声明许可证，那部分材料不在本仓库的 MIT 授权范围内，详见 [NOTICE](NOTICE)。
 
 本仓库的默认分支是 `main`。`core` 分支是 fork 之后又改过两次打包逻辑的历史快照（242 行，仍是「整门课打进一个压缩包」的旧做法，且不校验响应码），只作对照保留，**不要安装**。两条分支没有共同祖先。
 

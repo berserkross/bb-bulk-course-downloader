@@ -1,0 +1,17 @@
+NOTICE — scope of the MIT license
+=================================
+
+This repository is a fork of:
+  https://github.com/JesperroO/bb-bulk-course-downloader
+
+The MIT license in LICENSE applies to material authored by Terry Yang:
+the modular rewrite and its documentation / build tooling on the main
+branch.
+
+The core branch — and the upstream repository it came from — contains the
+original single-file userscript by JesperroO. The upstream project did not
+declare a license for that material, so it is NOT covered by this
+repository's MIT grant and remains subject to its original author's terms.
+
+The bundled userscript's `@license MIT` header refers to the main-branch
+rewrite described above.
