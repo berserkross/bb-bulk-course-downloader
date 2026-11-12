@@ -6,7 +6,7 @@
 
 ## 安装
 
-以下以桌面版 Chrome 为例。使用 Edge 时，在 Tampermonkey 官网切换到 Edge，再进入对应的扩展商店。**已经装好 Tampermonkey 的用户可以从第 2 步开始。**
+以下以 Chrome 为例。使用 Chrome 时，在 Tampermonkey 官网切换到 Chrome，再进入对应的扩展商店。**已经装好 Tampermonkey 的用户可以从第 2 步开始。**
 
 1. **安装扩展。** 打开 [Tampermonkey 中文官网](https://www.tampermonkey.net/index.php?browser=chrome&locale=zh_CN)，选择正式版（不要测试版）进入浏览器扩展商店——官网上的入口名称和位置会变，认准正式版即可。在商店点击「添加至 Chrome」（Edge 为「获取」），按浏览器提示确认。
 2. **允许扩展运行用户脚本。** 在 Chrome 的扩展管理页找到 Tampermonkey，进入「详情」，确认扩展已启用。若浏览器要求先「允许用户脚本」才肯执行，请在该扩展的「详情」里打开对应开关。不同浏览器与版本的入口不一样，以 Tampermonkey 官方说明为准：[允许用户脚本的权限说明与截图](https://www.tampermonkey.net/faq.php?locale=zh_CN&q=Q209)。
