@@ -58,6 +58,8 @@ CI 会跑同样的构建与测试，并额外执行两件事：`node scripts/che
 
 v2.8.3 发布检查共 500 项测试。构建生成 `dist/bb-bulk-course-downloader.user.js`，并复制到根目录。根目录副本供安装及自动更新使用。发布时应同时提交源码、版本号和重建的根目录脚本，核对公开安装链接的版本与 SHA-256。
 
+设计取舍与不变量写在 `docs/` 下 9 份契约文档里；改行为先改文档，再改实现与测试。仓库根目录那份产物约 295 KB、`src/` 约 9700 行——GitHub 的语言统计会把打包产物判为 generated 而排除，页面上显示的体量不代表实际规模。
+
 ## 迭代记录
 
 | 版本 / 里程碑 | 提交 | 主题 |
@@ -90,4 +92,6 @@ v2.8.3 发布检查共 500 项测试。构建生成 `dist/bb-bulk-course-downloa
 本仓库 fork 自 [JesperroO/bb-bulk-course-downloader](https://github.com/JesperroO/bb-bulk-course-downloader)。原作者那份单文件脚本（`blackboard-download.user.js`，v2.1）至今仍在原仓库的 [core 分支](https://github.com/JesperroO/bb-bulk-course-downloader/tree/core) 上，也是这件事真正的起点：递归扫描子文件夹、用服务器响应里的真实文件名而不是 `xid-XXXX` 占位名、小并发加重试——这三条思路都由它先跑通。
 
 fork 之后，`main` 分支逐步换成了模块化实现：目录树落盘、断点续传与增量判断、逐文件事件、ZIP 降级、会话异常自愈。安装方式与「只访问你有权限的文件」这条底线没有变。感谢 JesperroO 把这份工具开源出来。
+
+本仓库的默认分支是 `main`。`core` 分支是 fork 之后又改过两次打包逻辑的历史快照（242 行，仍是「整门课打进一个压缩包」的旧做法，且不校验响应码），只作对照保留，**不要安装**。两条分支没有共同祖先。
 
