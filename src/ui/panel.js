@@ -550,6 +550,14 @@ export function mountPanel(options) {
   autoReloadRow.appendChild(node('span', null, '会话异常时自动重载续跑'));
   settingsEl.appendChild(autoReloadRow);
 
+  const examRow = node('label', 'bbdl-settings__row');
+  const examInput = node('input');
+  examInput.type = 'checkbox';
+  examInput.checked = settings.separateExams === true;
+  examRow.appendChild(examInput);
+  examRow.appendChild(node('span', null, '把往年卷额外复制一份到 _exams/'));
+  settingsEl.appendChild(examRow);
+
   settingsEl.appendChild(node('p', 'bbdl-note', '目录结构开关在「选择并下载」对话框里。'));
 
   // 导出清单：纯本地动作（生成 Blob 下载），结果只走 notice 行，不弹窗。
@@ -727,6 +735,10 @@ export function mountPanel(options) {
 
   probeInput.addEventListener('change', function () {
     emitSettings({ probeSizes: probeInput.checked });
+  });
+
+  examInput.addEventListener('change', function () {
+    emitSettings({ separateExams: examInput.checked });
   });
 
   concInput.addEventListener('change', function () {
@@ -1362,6 +1374,7 @@ export function mountPanel(options) {
       concInput.value = String(settings.downloadConcurrency || 4);
       expandInput.checked = settings.panelCollapsed === false;
       autoReloadInput.checked = settings.autoReload !== false;
+      examInput.checked = settings.separateExams === true;
     }
     if (typeof o.onScan === 'function') onScan = o.onScan;
     if (typeof o.onDownload === 'function') onDownload = o.onDownload;

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BB 课件批量下载
 // @namespace    bb-bulk-course-downloader
-// @version      2.8.4
+// @version      2.9.0
 // @description  扫描 Blackboard 课程内容，勾选后按原始目录结构批量下载课件
 // @updateURL    https://raw.githubusercontent.com/berserkross/bb-bulk-course-downloader/main/bb-bulk-course-downloader.user.js
 // @downloadURL  https://raw.githubusercontent.com/berserkross/bb-bulk-course-downloader/main/bb-bulk-course-downloader.user.js
@@ -999,6 +999,12 @@
     ["image/gif", ".gif"],
     ["application/octet-stream", ""]
   ]);
+  var EXAM_RE = /(^|[^a-z])(exam|midterm|final)([^a-z]|$)|真题|试卷|期末|期中|往年|考试/i;
+  function isExamLike(name) {
+    const text = String(name == null ? "" : name).trim();
+    if (!text) return false;
+    return EXAM_RE.test(text);
+  }
   function extensionForMime(mime) {
     if (typeof mime !== "string") return "";
     const key = mime.trim().toLowerCase();
@@ -2121,6 +2127,9 @@
           }
           throw new TruncatedError(written, committedSize);
         }
+        if (settings.separateExams === true && (isExamLike(plan.fileName) || plan.segments.some(isExamLike))) {
+          await copyToExamsDir(fileHandle, plan.fileName);
+        }
       } catch (err) {
         try {
           await reader.cancel(err);
@@ -2133,6 +2142,39 @@
         throw err;
       }
       return written;
+    }
+    async function copyToExamsDir(fileHandle, fileName) {
+      try {
+        const examsDir = await dirHandle.getDirectoryHandle("_exams", { create: true });
+        let exists = true;
+        try {
+          await examsDir.getFileHandle(fileName);
+        } catch {
+          exists = false;
+        }
+        if (exists) return false;
+        const source = typeof fileHandle.getFile === "function" ? await fileHandle.getFile() : null;
+        if (!source) return false;
+        const target = await examsDir.getFileHandle(fileName, { create: true });
+        const writable = await target.createWritable();
+        try {
+          await writable.write(source);
+          await writable.close();
+        } catch {
+          try {
+            await writable.abort();
+          } catch {
+          }
+          try {
+            await examsDir.removeEntry(fileName);
+          } catch {
+          }
+          return false;
+        }
+        return true;
+      } catch {
+        return false;
+      }
     }
     function writeEntry(fetcher, entry, plan, onChunk, { budget, onRetry, onAttempt, onFileRetry, rollback, onName } = {}) {
       let attemptBytes = 0;
@@ -3134,6 +3176,8 @@
     minDelayMs: 150,
     maxDelayMs: 400,
     probeSizes: true,
+    // 往年卷单独归类（默认关）：命中关键词的文件会额外复制一份到课程根目录的 _exams/，原路径与清单都不动
+    separateExams: false,
     // 面板默认收起：首次安装只留左下角一条，不把第三方页面挡住。
     panelCollapsed: true,
     // ZIP 降级落盘的单包上限（200 MiB）：一个包装满就封口交给浏览器，内存上界就是一个包
@@ -4469,6 +4513,13 @@
     autoReloadRow.appendChild(autoReloadInput);
     autoReloadRow.appendChild(node("span", null, "\u4F1A\u8BDD\u5F02\u5E38\u65F6\u81EA\u52A8\u91CD\u8F7D\u7EED\u8DD1"));
     settingsEl.appendChild(autoReloadRow);
+    const examRow = node("label", "bbdl-settings__row");
+    const examInput = node("input");
+    examInput.type = "checkbox";
+    examInput.checked = settings.separateExams === true;
+    examRow.appendChild(examInput);
+    examRow.appendChild(node("span", null, "\u628A\u5F80\u5E74\u5377\u989D\u5916\u590D\u5236\u4E00\u4EFD\u5230 _exams/"));
+    settingsEl.appendChild(examRow);
     settingsEl.appendChild(node("p", "bbdl-note", "\u76EE\u5F55\u7ED3\u6784\u5F00\u5173\u5728\u300C\u9009\u62E9\u5E76\u4E0B\u8F7D\u300D\u5BF9\u8BDD\u6846\u91CC\u3002"));
     const exportRow = node("div", "bbdl-settings__row");
     const exportBtn = button("bbdl-btn bbdl-btn--small", "export-manifest", "\u5BFC\u51FA\u6E05\u5355");
@@ -4612,6 +4663,9 @@
     }
     probeInput.addEventListener("change", function() {
       emitSettings({ probeSizes: probeInput.checked });
+    });
+    examInput.addEventListener("change", function() {
+      emitSettings({ separateExams: examInput.checked });
     });
     concInput.addEventListener("change", function() {
       const parsed = Math.round(Number(concInput.value));
@@ -5155,6 +5209,7 @@
         concInput.value = String(settings.downloadConcurrency || 4);
         expandInput.checked = settings.panelCollapsed === false;
         autoReloadInput.checked = settings.autoReload !== false;
+        examInput.checked = settings.separateExams === true;
       }
       if (typeof o.onScan === "function") onScan = o.onScan;
       if (typeof o.onDownload === "function") onDownload = o.onDownload;

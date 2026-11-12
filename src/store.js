@@ -7,6 +7,8 @@ export const DEFAULTS = {
   minDelayMs: 150,
   maxDelayMs: 400,
   probeSizes: true,
+  // 往年卷单独归类（默认关）：命中关键词的文件会额外复制一份到课程根目录的 _exams/，原路径与清单都不动
+  separateExams: false,
   // 面板默认收起：首次安装只留左下角一条，不把第三方页面挡住。
   panelCollapsed: true,
   // ZIP 降级落盘的单包上限（200 MiB）：一个包装满就封口交给浏览器，内存上界就是一个包

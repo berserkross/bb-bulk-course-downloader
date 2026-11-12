@@ -181,6 +181,16 @@ const MIME_EXTENSIONS = new Map([
  * @param {string} mime content-type 去掉 charset 之后的小写 MIME
  * @returns {string}
  */
+/** 往年卷关键词：只在「文件名或所在文件夹」命中时才算，宁可漏判也不误判。 */
+const EXAM_RE = /(^|[^a-z])(exam|midterm|final)([^a-z]|$)|真题|试卷|期末|期中|往年|考试/i;
+
+/** 是否为「往年卷/试题」类文件：判定只看名字，不读内容（内容哈希不在本项目的取舍之内）。 */
+export function isExamLike(name) {
+  const text = String(name == null ? '' : name).trim();
+  if (!text) return false;
+  return EXAM_RE.test(text);
+}
+
 export function extensionForMime(mime) {
   if (typeof mime !== 'string') return '';
   const key = mime.trim().toLowerCase();

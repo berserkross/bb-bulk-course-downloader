@@ -1,5 +1,5 @@
 import { runPool, createControl, degradeForSuspect } from './pool.js';
-import { resolveFileName } from '../bb/files.js';
+import { isExamLike, resolveFileName } from '../bb/files.js';
 import {
   planBatch,
   createReporter,
@@ -146,6 +146,12 @@ export function createFsSink({ settings = {}, dirHandle, signal, total = 0, file
         }
         throw new TruncatedError(written, committedSize);
       }
+
+      // 往年卷归类（settings.separateExams，默认关）：只复制一份到课程根目录的 _exams/，
+      // 原路径与清单都不动 —— 判错了也只是多一份副本，绝不会让文件「消失」或触发重下。
+      if (settings.separateExams === true && (isExamLike(plan.fileName) || plan.segments.some(isExamLike))) {
+        await copyToExamsDir(fileHandle, plan.fileName);
+      }
     } catch (err) {
       try {
         await reader.cancel(err);
@@ -161,6 +167,47 @@ export function createFsSink({ settings = {}, dirHandle, signal, total = 0, file
     }
 
     return written;
+  }
+
+
+  /**
+   * 把刚落盘的文件再复制一份到 <课程根>/_exams/。
+   * 三条纪律：不移动原件、已存在就跳过、失败绝不影响本次下载结果。
+   */
+  async function copyToExamsDir(fileHandle, fileName) {
+    try {
+      const examsDir = await dirHandle.getDirectoryHandle('_exams', { create: true });
+      let exists = true;
+      try {
+        await examsDir.getFileHandle(fileName);
+      } catch {
+        exists = false;
+      }
+      if (exists) return false;
+      const source = typeof fileHandle.getFile === 'function' ? await fileHandle.getFile() : null;
+      if (!source) return false;
+      const target = await examsDir.getFileHandle(fileName, { create: true });
+      const writable = await target.createWritable();
+      try {
+        await writable.write(source);
+        await writable.close();
+      } catch {
+        try {
+          await writable.abort();
+        } catch {
+          /* 已经关了 */
+        }
+        try {
+          await examsDir.removeEntry(fileName);
+        } catch {
+          /* 尽力清理 */
+        }
+        return false;
+      }
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /**
