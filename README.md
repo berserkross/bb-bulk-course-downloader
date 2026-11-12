@@ -54,6 +54,8 @@ npm run build
 npm test
 ```
 
+CI 会跑同样的构建与测试，并额外执行两件事：`node scripts/check-docs.mjs`（README 的版本、测试数、路径与命令必须与仓库一致）和产物一致性检查（重建后仓库根脚本的 `git diff` 必须为空）。
+
 v2.8.3 发布检查共 500 项测试。构建生成 `dist/bb-bulk-course-downloader.user.js`，并复制到根目录。根目录副本供安装及自动更新使用。发布时应同时提交源码、版本号和重建的根目录脚本，核对公开安装链接的版本与 SHA-256。
 
 ## 迭代记录

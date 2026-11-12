@@ -1,0 +1,29 @@
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Build userscript
+        run: npm run build
+      # 仓库根产物是安装与自动更新的入口，必须与源码构建结果逐字节一致。
+      - name: Bundled userscript is up to date
+        run: git diff --exit-code -- bb-bulk-course-downloader.user.js
+      # 文档漂移闸：README 里的版本、测试数、路径与 npm 命令必须与仓库一致。
+      - name: Docs consistency
+        run: node scripts/check-docs.mjs
+      - name: Tests
+        run: npm test
